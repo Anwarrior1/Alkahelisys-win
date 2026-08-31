@@ -5,9 +5,22 @@ import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const requiredFonts = [
-  ['Public/fonts1/ArbFONTS-22326-alarabiyafont.ttf', 'dist/fonts1/ArbFONTS-22326-alarabiyafont.ttf'],
-  ['Public/fonts1/ArbFONTS-4_C6.ttf', 'dist/fonts1/ArbFONTS-4_C6.ttf'],
-  ['Public/fonts1/ArbFONTS-Alarabiya Normal Font.ttf', 'dist/fonts1/ArbFONTS-Alarabiya Normal Font.ttf'],
+  {
+    source: 'Public/fonts2/ArbFONTS-Cairo-Regular-4.ttf',
+    built: 'dist/fonts2/ArbFONTS-Cairo-Regular-4.ttf',
+    family: 'Cairo',
+    style: 'Regular',
+    postScriptName: 'Cairo-Regular',
+    weight: 400,
+  },
+  {
+    source: 'Public/fonts2/ArbFONTS-Cairo-SemiBold-3.ttf',
+    built: 'dist/fonts2/ArbFONTS-Cairo-SemiBold-3.ttf',
+    family: 'Cairo SemiBold',
+    style: 'Regular',
+    postScriptName: 'Cairo-SemiBold',
+    weight: 600,
+  },
 ];
 
 const representativeArabic = [
@@ -92,6 +105,7 @@ function inspectTrueType(contents) {
   return {
     family: names.get(1),
     style: names.get(2),
+    postScriptName: names.get(6),
     weightClass: uint16(os2.offset + 4),
     macStyle: uint16(head.offset + 44),
     hasArabicShaping: tables.has('GSUB'),
@@ -101,28 +115,30 @@ function inspectTrueType(contents) {
 
 const digest = (contents) => createHash('sha256').update(contents).digest('hex');
 
-for (const [sourceRelative, builtRelative] of requiredFonts) {
-  const source = await readFile(resolve(repositoryRoot, sourceRelative));
-  const built = await readFile(resolve(repositoryRoot, builtRelative));
+for (const expected of requiredFonts) {
+  const source = await readFile(resolve(repositoryRoot, expected.source));
+  const built = await readFile(resolve(repositoryRoot, expected.built));
   if (digest(source) !== digest(built)) {
-    throw new Error(`Production font differs from its source asset: ${builtRelative}`);
+    throw new Error(`Production font differs from its source asset: ${expected.built}`);
   }
 
   const metadata = inspectTrueType(source);
-  if (metadata.family !== 'Alarabiya Font' || metadata.style !== 'Normal') {
-    throw new Error(`Unexpected font identity in ${sourceRelative}`);
+  if (
+    metadata.family !== expected.family
+    || metadata.style !== expected.style
+    || metadata.postScriptName !== expected.postScriptName
+  ) {
+    throw new Error(`Unexpected font identity in ${expected.source}`);
   }
-  // These files carry a malformed OS/2 weight value of 5, but their name and
-  // style records identify a non-bold Normal face. CSS normalizes that face to 400.
-  if (metadata.weightClass !== 5 || metadata.macStyle !== 0) {
-    throw new Error(`Unexpected font style metadata in ${sourceRelative}`);
+  if (metadata.weightClass !== expected.weight || metadata.macStyle !== 0) {
+    throw new Error(`Unexpected font style metadata in ${expected.source}`);
   }
   if (!metadata.hasArabicShaping) {
-    throw new Error(`Arabic GSUB shaping data is missing from ${sourceRelative}`);
+    throw new Error(`Arabic GSUB shaping data is missing from ${expected.source}`);
   }
-  for (const character of `${representativeArabic}0123456789`) {
+  for (const character of `${representativeArabic}0123456789.,د.ل`) {
     if (character !== ' ' && !metadata.codepoints.has(character.codePointAt(0))) {
-      throw new Error(`Required character ${character} is missing from ${sourceRelative}`);
+      throw new Error(`Required character ${character} is missing from ${expected.source}`);
     }
   }
 }
@@ -134,20 +150,19 @@ const productionCss = (
 ).join('\n');
 
 const requiredCss = [
-  '/fonts1/ArbFONTS-Alarabiya%20Normal%20Font.ttf',
-  'font-family:Alarabiya Font',
-  'font-family:Alkaheli Numerals,Alarabiya Font,Segoe UI,Tahoma,Arial,sans-serif',
-  'font-family:Alkaheli Numerals',
-  'src:local("Segoe UI"),local("Arial")',
-  'src:local("Segoe UI Bold"),local("Arial Bold")',
-  'unicode-range:U+0030-0039',
+  '/fonts2/ArbFONTS-Cairo-Regular-4.ttf',
+  '/fonts2/ArbFONTS-Cairo-SemiBold-3.ttf',
+  'font-family:Cairo Local',
+  'font-family:Cairo Local,Segoe UI,Tahoma,Arial,sans-serif',
   'font-weight:400',
-  'font-weight:700',
+  'font-weight:600',
   'font-display:swap',
   'font-synthesis:none',
   'font-feature-settings:normal',
   'font-variant-ligatures:common-ligatures contextual',
-  ':lang(ar){letter-spacing:normal;word-spacing:normal}',
+  'font-variant-numeric:lining-nums tabular-nums',
+  'line-height:1.55',
+  'html:lang(ar) body *{letter-spacing:normal;word-spacing:normal}',
 ];
 
 for (const declaration of requiredCss) {
@@ -156,8 +171,10 @@ for (const declaration of requiredCss) {
   }
 }
 
-if (/\/fonts\/(?:beIN|GE-SS)|font-family:(?:"Alkaheli UI"|Alkaheli UI)/.test(productionCss)) {
+if (
+  /\/fonts1\/|font-family:(?:"?(?:Alarabiya Font|Alkaheli Numerals|Alkaheli UI)"?)/.test(productionCss)
+) {
   throw new Error('Production CSS still references the previous primary font.');
 }
 
-console.log('Verified Arabic font files and declarations in the production frontend bundle.');
+console.log('Verified Cairo font files, weights, glyph coverage, and production CSS declarations.');
