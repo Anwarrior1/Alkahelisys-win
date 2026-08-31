@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "مركز الكحيلي لغسيل السيارات",
+  "version": "1.0.0",
+  "identifier": "ly.alkaheli.carwash",
+  "mainBinaryName": "Alkahelisys",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "beforeBuildCommand": "npm run build:web",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "مركز الكحيلي لغسيل السيارات",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1080,
+        "minHeight": 720,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:8787 http://localhost:8787; connect-src 'self' http://127.0.0.1:8787 http://localhost:8787; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset:; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "targets": ["nsis", "msi"],
+    "publisher": "Alkaheli",
+    "copyright": "Copyright © 2026 Alkaheli",
+    "windows": {
+      "webviewInstallMode": { "type": "offlineInstaller" },
+      "wix": { "language": ["ar-SA"] },
+      "nsis": {
+        "displayLanguageSelector": true,
+        "languages": ["Arabic", "English"],
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "startMenuFolder": "Alkahelisys ERP"
+      }
+    },
+    "category": "Business",
+    "shortDescription": "نظام إدارة مركز الكحيلي لغسيل السيارات",
+    "longDescription": "نظام إدارة عمليات غسيل السيارات والعمال والحسابات لمركز الكحيلي لغسيل السيارات."
+  }
+}

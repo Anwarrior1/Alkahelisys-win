@@ -1,0 +1,37 @@
+{
+  "name": "alkaheli-car-wash-erp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"cargo run --manifest-path src-tauri/Cargo.toml --bin carwash-api\" \"vite\"",
+    "dev:web": "npm run dev",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "build:web": "tsc -b && vite build",
+    "build": "tauri build --bundles nsis,msi",
+    "dist:win": "tauri build --ci --bundles nsis --target x86_64-pc-windows-msvc && node scripts/stage-windows-installer.mjs",
+    "test:api": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "npm run test:api && npm run build:web",
+    "lint": "tsc -b --noEmit"
+  },
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
