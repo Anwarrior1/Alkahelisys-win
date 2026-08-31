@@ -93,7 +93,6 @@ function mapUser(raw: unknown): AuthUser {
   const value = record(raw);
   return {
     id: text(value.id),
-    worker_id: value.workerId === null || value.workerId === undefined ? null : text(value.workerId),
     full_name: text(value.fullName),
     username: text(value.username),
     role: text(value.roleCode, 'employee'),
@@ -677,7 +676,7 @@ class ApiClient {
 
   async users(): Promise<AuthUser[]> { return records(await this.get('/users')).map(mapUser); }
   async createUser(data: Record<string, unknown>): Promise<AuthUser> {
-    const saved = record(await this.post('/users', { fullName: data.full_name, username: data.username, password: data.password, roleCode: data.role, workerId: data.worker_id || undefined, isActive: true }));
+    const saved = record(await this.post('/users', { fullName: data.full_name, username: data.username, password: data.password, roleCode: data.role, isActive: true }));
     return (await this.users()).find((user) => user.id === text(saved.id)) ?? { id: text(saved.id), full_name: text(data.full_name), username: text(data.username), role: text(data.role, 'employee'), status: 'active' };
   }
   async updateUser(id: string, data: Record<string, unknown>): Promise<AuthUser> {
@@ -687,7 +686,6 @@ class ApiClient {
     if (data.username) payload.username = data.username;
     if (data.password) payload.password = data.password;
     if (data.role) payload.roleCode = data.role;
-    if (data.worker_id) payload.workerId = data.worker_id;
     await this.patch(`/users/${encodeURIComponent(id)}`, payload);
     return (await this.users()).find((user) => user.id === id) ?? { id, full_name: '', username: '', role: 'employee' };
   }

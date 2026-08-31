@@ -1001,11 +1001,12 @@ async fn manager_created_wash_uses_default_fifty_percent_commission() {
 }
 
 #[tokio::test]
-async fn employee_gets_full_own_worker_profile_without_global_financial_access() {
+async fn employee_account_is_independent_from_workers_and_financial_access() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
-    let worker_id = create_worker(&test_app.router, &manager_token, "أحمد العامل").await;
-    create_cash_wash(&test_app.router, &manager_token, &worker_id, "80").await;
+    let worker_a = create_worker(&test_app.router, &manager_token, "أحمد العامل").await;
+    let worker_b = create_worker(&test_app.router, &manager_token, "سالم العامل").await;
+    create_cash_wash(&test_app.router, &manager_token, &worker_a, "80").await;
 
     let (status, payload) = request_json(
         &test_app.router,
@@ -1017,15 +1018,44 @@ async fn employee_gets_full_own_worker_profile_without_global_financial_access()
             "username": "employee.test",
             "password": EMPLOYEE_PASSWORD,
             "roleCode": "employee",
-            "workerId": worker_id,
+            "workerId": worker_a,
             "isActive": true,
         })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["data"]["id"].is_string());
+    let employee_id = payload["data"]["id"].as_str().unwrap();
 
     let employee_token = login(&test_app.router, "employee.test", EMPLOYEE_PASSWORD).await;
+
+    let (status, me) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&employee_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(me["data"].get("workerId").is_none());
+
+    let (status, users) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/users",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let employee = users["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["id"] == employee_id)
+        .unwrap();
+    assert!(employee.get("workerId").is_none());
 
     let financial_paths = vec![
         "/api/finance/overview".to_owned(),
@@ -1036,6 +1066,7 @@ async fn employee_gets_full_own_worker_profile_without_global_financial_access()
         "/api/audit-logs".to_owned(),
         "/api/backups".to_owned(),
         "/api/showrooms/no-such-showroom/financial".to_owned(),
+        format!("/api/workers/{worker_a}/financial?date=2026-08-29"),
     ];
     for path in financial_paths {
         let (status, _) = request_json(
@@ -1066,21 +1097,22 @@ async fn employee_gets_full_own_worker_profile_without_global_financial_access()
         assert_no_sensitive_financial_keys(&payload["data"]);
     }
 
-    let (status, own_workers) = request_json(&test_app.router, Method::GET, "/api/workers?date=2026-08-29", Some(&employee_token), None).await;
+    let (status, workers) = request_json(&test_app.router, Method::GET, "/api/workers?date=2026-08-29", Some(&employee_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(own_workers["data"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(own_workers["data"]["items"][0]["id"], worker_id);
-    assert_eq!(own_workers["data"]["items"][0]["financial"]["grossCommissionMilli"], 40_000);
+    assert_eq!(workers["data"]["items"].as_array().unwrap().len(), 2);
+    for worker in workers["data"]["items"].as_array().unwrap() {
+        assert!(worker.get("financial").is_none());
+    }
 
-    let (status, own_detail) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_id}?date=2026-08-29"), Some(&employee_token), None).await;
+    let (status, worker_a_detail) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_a}?date=2026-08-29"), Some(&employee_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(own_detail["data"]["history"].as_array().unwrap().len(), 1);
-    assert_eq!(own_detail["data"]["history"][0]["priceMilli"], 80_000);
-    assert!(own_detail["data"].get("dailyValue").is_some());
+    assert_eq!(worker_a_detail["data"]["history"].as_array().unwrap().len(), 1);
+    assert_eq!(worker_a_detail["data"]["history"][0]["priceMilli"], 80_000);
+    assert!(worker_a_detail["data"].get("dailyValue").is_some());
 
-    let (status, own_financial) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_id}/financial?date=2026-08-29"), Some(&employee_token), None).await;
+    let (status, worker_b_detail) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_b}?date=2026-08-29"), Some(&employee_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(own_financial["data"]["grossCommissionMilli"], 40_000);
+    assert!(worker_b_detail["data"]["history"].as_array().unwrap().is_empty());
 
     test_app.cleanup();
 }
@@ -1250,7 +1282,7 @@ async fn worker_daily_value_is_permission_scoped_and_stored_per_worker_and_date(
 
     let (status, created) = request_json(
         &test_app.router, Method::POST, "/api/users", Some(&manager_token),
-        Some(json!({"fullName":"موظف القيمة اليومية","username":"daily.value.employee","password":EMPLOYEE_PASSWORD,"roleCode":"employee","workerId":worker_a,"isActive":true})),
+        Some(json!({"fullName":"موظف القيمة اليومية","username":"daily.value.employee","password":EMPLOYEE_PASSWORD,"roleCode":"employee","isActive":true})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let employee_id = created["data"]["id"].as_str().unwrap();
@@ -1266,7 +1298,9 @@ async fn worker_daily_value_is_permission_scoped_and_stored_per_worker_and_date(
     let (_, employee_after) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_a}"), Some(&employee_token), None).await;
     assert_eq!(employee_after["data"]["dailyValue"]["amountMilli"], 100_000);
     let (status, _) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_b}"), Some(&employee_token), None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(&test_app.router, Method::PUT, &format!("/api/workers/{worker_b}/daily-value"), Some(&employee_token), Some(json!({"valueDate":today,"amount":"150"}))).await;
+    assert_eq!(status, StatusCode::OK);
     let (status, _) = request_json(&test_app.router, Method::PUT, &format!("/api/workers/{worker_a}/daily-value"), Some(&employee_token), Some(json!({"valueDate":tomorrow,"amount":"200"}))).await;
     assert_eq!(status, StatusCode::OK);
     let (_, manager_after) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_a}"), Some(&manager_token), None).await;

@@ -304,57 +304,6 @@ impl Database {
         self.ensure_column("workers", "deactivated_at", "deactivated_at TEXT")?;
         self.ensure_column("workers", "deactivated_by", "deactivated_by TEXT")?;
         self.ensure_column(
-            "users",
-            "worker_id",
-            "worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL",
-        )?;
-        // Older installations did not explicitly associate an employee login with a
-        // worker. Preserve existing data while making the safest deterministic links:
-        // first by an exact account/worker name, then by a single worker previously
-        // used by that account's recorded wash operations.
-        self.conn.execute(
-            "UPDATE users
-             SET worker_id=(
-                 SELECT w.id FROM workers w
-                 WHERE lower(trim(w.full_name)) IN (lower(trim(users.full_name)), lower(trim(users.username_norm)))
-                 ORDER BY w.id LIMIT 1
-             )
-             WHERE worker_id IS NULL
-               AND EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=users.id AND r.code='employee')",
-            [],
-        )?;
-        self.conn.execute(
-            "UPDATE users
-             SET worker_id=(
-                 SELECT w.id FROM workers w
-                 WHERE w.is_active=1
-                   AND (lower(trim(users.full_name)) LIKE lower(trim(w.full_name)) || '%'
-                        OR lower(trim(users.username_norm)) LIKE lower(trim(w.full_name)) || '%')
-                   AND (abs(length(trim(users.full_name))-length(trim(w.full_name))) <= 1
-                        OR abs(length(trim(users.username_norm))-length(trim(w.full_name))) <= 1)
-                 ORDER BY w.id LIMIT 1
-             )
-             WHERE worker_id IS NULL
-               AND (SELECT COUNT(*) FROM workers w
-                    WHERE w.is_active=1
-                      AND (lower(trim(users.full_name)) LIKE lower(trim(w.full_name)) || '%'
-                           OR lower(trim(users.username_norm)) LIKE lower(trim(w.full_name)) || '%')
-                      AND (abs(length(trim(users.full_name))-length(trim(w.full_name))) <= 1
-                           OR abs(length(trim(users.username_norm))-length(trim(w.full_name))) <= 1))=1
-               AND EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=users.id AND r.code='employee')",
-            [],
-        )?;
-        self.conn.execute(
-            "UPDATE users
-             SET worker_id=(SELECT MIN(wash.worker_id) FROM wash_operations wash WHERE wash.created_by=users.id)
-             WHERE worker_id IS NULL
-               AND (SELECT COUNT(DISTINCT wash.worker_id) FROM wash_operations wash WHERE wash.created_by=users.id)=1
-               AND EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=users.id AND r.code='employee')",
-            [],
-        )?;
-        self.conn
-            .execute_batch("CREATE INDEX IF NOT EXISTS idx_users_worker ON users(worker_id);")?;
-        self.ensure_column(
             "wash_operations",
             "revision",
             "revision INTEGER NOT NULL DEFAULT 1",
@@ -580,6 +529,31 @@ impl Database {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(13, ?1)",
             [now()],
         )?;
+        let user_worker_link_removed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=14",
+            [],
+            |row| row.get(0),
+        )?;
+        if user_worker_link_removed == 0 {
+            let has_worker_id = {
+                let mut statement = self.conn.prepare("PRAGMA table_info(users)")?;
+                let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+                columns
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .any(|column| column == "worker_id")
+            };
+            let tx = self.conn.transaction()?;
+            tx.execute_batch("DROP INDEX IF EXISTS idx_users_worker;")?;
+            if has_worker_id {
+                tx.execute_batch("ALTER TABLE users DROP COLUMN worker_id;")?;
+            }
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -720,4 +694,73 @@ pub fn default_commission_bps(conn: &Connection) -> Result<i64> {
         |row| row.get(0),
     )?;
     Ok(serde_json::from_str(&raw).unwrap_or(DEFAULT_COMMISSION_BPS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_removes_user_worker_link_without_touching_workers() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-user-worker-migration-tests")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&data_dir).unwrap();
+        let database_path = data_dir.join("carwash.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE workers (
+                id TEXT PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                phone TEXT,
+                notes TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                commission_bps_override INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username_norm TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE INDEX idx_users_worker ON users(worker_id);
+             INSERT INTO workers(id,full_name,is_active,created_at,updated_at)
+             VALUES('worker-existing','عامل محفوظ',1,'2026-08-01','2026-08-01');
+             INSERT INTO users(id,full_name,username_norm,password_hash,is_active,worker_id,created_at,updated_at)
+             VALUES('user-existing','مستخدم محفوظ','existing.user','hash',1,'worker-existing','2026-08-01','2026-08-01');",
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::open(&data_dir).unwrap();
+        let worker: (String, String) = database
+            .conn
+            .query_row(
+                "SELECT id,full_name FROM workers WHERE id='worker-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(worker, ("worker-existing".to_owned(), "عامل محفوظ".to_owned()));
+        let has_worker_id: bool = {
+            let mut statement = database.conn.prepare("PRAGMA table_info(users)").unwrap();
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap();
+            columns
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+                .iter()
+                .any(|column| column == "worker_id")
+        };
+        assert!(!has_worker_id);
+        drop(database);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
 }

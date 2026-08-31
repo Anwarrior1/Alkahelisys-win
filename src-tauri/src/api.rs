@@ -36,7 +36,6 @@ struct Principal {
     id: String,
     full_name: String,
     username: String,
-    worker_id: Option<String>,
     role_code: String,
     role_name: String,
     theme: String,
@@ -278,7 +277,7 @@ fn principal_from_headers(state: &AppState, headers: &HeaderMap) -> Result<Princ
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let row = db.conn.query_row(
-        "SELECT u.id, u.full_name, u.username_norm, u.worker_id, r.code, r.name_ar, COALESCE(p.theme, 'light'), s.expires_at
+        "SELECT u.id, u.full_name, u.username_norm, r.code, r.name_ar, COALESCE(p.theme, 'light'), s.expires_at
          FROM sessions s
          JOIN users u ON u.id=s.user_id
          JOIN user_roles ur ON ur.user_id=u.id
@@ -289,9 +288,9 @@ fn principal_from_headers(state: &AppState, headers: &HeaderMap) -> Result<Princ
         [hash],
         |row| Ok((
             Principal {
-                id: row.get(0)?, full_name: row.get(1)?, username: row.get(2)?, worker_id: row.get(3)?, role_code: row.get(4)?, role_name: row.get(5)?, theme: row.get(6)?, permissions: Vec::new(),
+                id: row.get(0)?, full_name: row.get(1)?, username: row.get(2)?, role_code: row.get(3)?, role_name: row.get(4)?, theme: row.get(5)?, permissions: Vec::new(),
             },
-            row.get::<_, String>(7)?,
+            row.get::<_, String>(6)?,
         )),
     ).optional().map_err(ApiError::internal)?;
     let (mut principal, expires_at) = row.ok_or_else(ApiError::unauthorized)?;
@@ -348,14 +347,6 @@ fn manager(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError>
         return Err(ApiError::forbidden());
     }
     Ok(principal)
-}
-
-fn ensure_worker_access(principal: &Principal, worker_id: &str) -> Result<(), ApiError> {
-    if principal.is_manager() || principal.worker_id.as_deref() == Some(worker_id) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden())
-    }
 }
 
 fn create_session(conn: &Connection, user_id: &str) -> Result<String, ApiError> {
@@ -516,7 +507,7 @@ async fn login(State(state): State<AppState>, Json(input): Json<LoginInput>) -> 
 
 fn principal_for_user(conn: &Connection, user_id: &str) -> Result<Principal, ApiError> {
     let mut principal = conn.query_row(
-        "SELECT u.id, u.full_name, u.username_norm, u.worker_id, r.code, r.name_ar, COALESCE(p.theme,'light')
+        "SELECT u.id, u.full_name, u.username_norm, r.code, r.name_ar, COALESCE(p.theme,'light')
          FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id
          LEFT JOIN user_preferences p ON p.user_id=u.id WHERE u.id=?1
          ORDER BY CASE r.code WHEN 'manager' THEN 0 ELSE 1 END LIMIT 1",
@@ -526,10 +517,9 @@ fn principal_for_user(conn: &Connection, user_id: &str) -> Result<Principal, Api
                 id: row.get(0)?,
                 full_name: row.get(1)?,
                 username: row.get(2)?,
-                worker_id: row.get(3)?,
-                role_code: row.get(4)?,
-                role_name: row.get(5)?,
-                theme: row.get(6)?,
+                role_code: row.get(3)?,
+                role_name: row.get(4)?,
+                theme: row.get(5)?,
                 permissions: Vec::new(),
             })
         },
@@ -1869,23 +1859,26 @@ async fn list_workers(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let mut items = Vec::new();
-    let own_worker_id = principal.worker_id.clone().unwrap_or_default();
+    let can_view_financial = principal.has_permission("financial.manage");
     let mut statement = db.conn.prepare(
         "SELECT w.id,w.full_name,w.phone,w.notes,w.is_active,w.commission_bps_override,
                 COUNT(CASE WHEN wash.status='posted' AND wash.occurred_at BETWEEN ?1 AND ?2 THEN 1 END),
                 COALESCE(SUM(CASE WHEN wash.status='posted' AND wash.occurred_at BETWEEN ?1 AND ?2 THEN wash.commission_milli ELSE 0 END),0),
                 COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE ea.worker_id=w.id AND e.occurred_at BETWEEN ?1 AND ?2),0)
          FROM workers w LEFT JOIN wash_operations wash ON wash.worker_id=w.id
-         WHERE w.is_active=1 AND (?3=1 OR w.id=?4)
+         WHERE w.is_active=1
          GROUP BY w.id ORDER BY w.full_name",
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![from, to, if principal.is_manager() { 1 } else { 0 }, own_worker_id], |row| {
+    let rows = statement.query_map(params![from, to], |row| {
         let gross: i64 = row.get(7)?; let deductions: i64 = row.get(8)?;
-        Ok(json!({
+        let mut item = json!({
             "id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,
-            "isActive":row.get::<_,i64>(4)? == 1,"commissionBpsOverride":row.get::<_,Option<i64>>(5)?,"washCount":row.get::<_,i64>(6)?,
-            "financial":{"grossCommissionMilli":gross,"deductionsMilli":deductions,"paidMilli":0,"remainingMilli":(gross-deductions).max(0)}
-        }))
+            "isActive":row.get::<_,i64>(4)? == 1,"commissionBpsOverride":row.get::<_,Option<i64>>(5)?,"washCount":row.get::<_,i64>(6)?
+        });
+        if can_view_financial {
+            item["financial"] = json!({"grossCommissionMilli":gross,"deductionsMilli":deductions,"paidMilli":0,"remainingMilli":(gross-deductions).max(0)});
+        }
+        Ok(item)
     }).map_err(ApiError::internal)?;
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
@@ -1947,7 +1940,6 @@ async fn update_worker(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    ensure_worker_access(&principal, &id)?;
     let previous_active = db
         .conn
         .query_row(
@@ -2036,13 +2028,12 @@ async fn worker_detail(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let _principal = authorize(&state, &headers, "operational.read")?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    ensure_worker_access(&principal, &id)?;
     let worker: Option<Value> = db.conn.query_row("SELECT id,full_name,phone,notes,is_active FROM workers WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,"isActive":row.get::<_,i64>(4)?==1}))).optional().map_err(ApiError::internal)?;
     let worker = worker.ok_or_else(ApiError::not_found)?;
     let value_date = selected_business_date(&query)?
@@ -2101,7 +2092,6 @@ async fn update_worker_daily_value(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    ensure_worker_access(&principal, &worker_id)?;
     let exists: Option<String> = db
         .conn
         .query_row(
@@ -2132,13 +2122,12 @@ async fn worker_financial(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let _principal = authorize(&state, &headers, "financial.manage")?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    ensure_worker_access(&principal, &id)?;
     let exists: Option<String> = db
         .conn
         .query_row("SELECT id FROM workers WHERE id=?1", [id.clone()], |row| {
@@ -4170,7 +4159,6 @@ struct UserInput {
     password: String,
     role_code: String,
     is_active: Option<bool>,
-    worker_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4181,7 +4169,6 @@ struct UserUpdateInput {
     password: Option<String>,
     role_code: Option<String>,
     is_active: Option<bool>,
-    worker_id: Option<String>,
 }
 
 fn role_id_for(conn: &Connection, role_code: &str) -> Result<String, ApiError> {
@@ -4201,8 +4188,8 @@ async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT u.id,u.full_name,u.username_norm,u.is_active,u.created_at,r.code,r.name_ar,COALESCE(p.theme,'light'),u.worker_id FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id LEFT JOIN user_preferences p ON p.user_id=u.id WHERE u.deleted_at IS NULL ORDER BY u.created_at").map_err(ApiError::internal)?;
-    let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"username":row.get::<_,String>(2)?,"isActive":row.get::<_,i64>(3)?==1,"createdAt":row.get::<_,String>(4)?,"roleCode":row.get::<_,String>(5)?,"roleName":row.get::<_,String>(6)?,"theme":row.get::<_,String>(7)?,"workerId":row.get::<_,Option<String>>(8)?})))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT u.id,u.full_name,u.username_norm,u.is_active,u.created_at,r.code,r.name_ar,COALESCE(p.theme,'light') FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id LEFT JOIN user_preferences p ON p.user_id=u.id WHERE u.deleted_at IS NULL ORDER BY u.created_at").map_err(ApiError::internal)?;
+    let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"username":row.get::<_,String>(2)?,"isActive":row.get::<_,i64>(3)?==1,"createdAt":row.get::<_,String>(4)?,"roleCode":row.get::<_,String>(5)?,"roleName":row.get::<_,String>(6)?,"theme":row.get::<_,String>(7)?})))).map_err(ApiError::internal)?;
     for row in rows {
         let (user_id, mut item) = row.map_err(ApiError::internal)?;
         item["permissions"] = json!(permission_codes_for_user(&db.conn, &user_id)?);
@@ -4229,34 +4216,9 @@ async fn create_user(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let role_id = role_id_for(&db.conn, &input.role_code)?;
-    let worker_id = if input.role_code == "employee" {
-        if let Some(worker_id) = input
-            .worker_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let exists: bool = db
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workers WHERE id=?1 AND is_active=1)",
-                    [worker_id],
-                    |row| row.get(0),
-                )
-                .map_err(ApiError::internal)?;
-            if !exists {
-                return Err(ApiError::bad("العامل المرتبط غير صالح"));
-            }
-            Some(worker_id.to_owned())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
     let id = new_id();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
-    tx.execute("INSERT INTO users(id,full_name,username_norm,password_hash,is_active,worker_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id,full_name,username,hash,if input.is_active.unwrap_or(true){1}else{0},worker_id,now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المستخدم: {error}")))?;
+    tx.execute("INSERT INTO users(id,full_name,username_norm,password_hash,is_active,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6)",params![id,full_name,username,hash,if input.is_active.unwrap_or(true){1}else{0},now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المستخدم: {error}")))?;
     tx.execute(
         "INSERT INTO user_roles(user_id,role_id) VALUES(?1,?2)",
         params![id, role_id],
@@ -4341,36 +4303,6 @@ async fn update_user(
         Some(code) => Some(role_id_for(&db.conn, code)?),
         None => None,
     };
-    let requested_role = input.role_code.as_deref().unwrap_or(&existing_role);
-    let worker_id = if requested_role == "manager" {
-        None
-    } else if let Some(value) = input
-        .worker_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let exists: bool = db
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM workers WHERE id=?1 AND is_active=1)",
-                [value],
-                |row| row.get(0),
-            )
-            .map_err(ApiError::internal)?;
-        if !exists {
-            return Err(ApiError::bad("العامل المرتبط غير صالح"));
-        }
-        Some(value.to_owned())
-    } else {
-        db.conn
-            .query_row(
-                "SELECT worker_id FROM users WHERE id=?1",
-                [id.clone()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(ApiError::internal)?
-    };
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     if let Some(value) = full_name {
         tx.execute(
@@ -4414,11 +4346,6 @@ async fn update_user(
         )
         .map_err(ApiError::internal)?;
     }
-    tx.execute(
-        "UPDATE users SET worker_id=?1,updated_at=?2 WHERE id=?3",
-        params![worker_id, now(), id],
-    )
-    .map_err(ApiError::internal)?;
     let action = if input.is_active == Some(false) {
         "USER_DISABLED"
     } else if input.role_code.is_some() {

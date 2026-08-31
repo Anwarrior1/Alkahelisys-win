@@ -2,7 +2,6 @@ export type RoleKey = 'manager' | 'employee' | string;
 
 export interface AuthUser {
   id: string;
-  worker_id?: string | null;
   full_name: string;
   username: string;
   email?: string | null;
