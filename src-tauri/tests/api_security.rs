@@ -25,9 +25,201 @@ struct TestApp {
 }
 
 #[tokio::test]
-async fn payroll_can_create_manual_employee_without_system_user_and_calculate_remaining() {
+async fn wash_type_is_created_listed_edited_and_persisted_after_restart() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل اختبار نوع الغسيل").await;
+    let occurred_at = "2026-09-01T10:00:00Z";
+
+    let (status, created) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota",
+            "vehicleModel":"Camry",
+            "washType":"Inside Only",
+            "price":"50",
+            "workerId":worker_id,
+            "paymentType":"cash",
+            "occurredAt":occurred_at,
+            "clientRequestId":"wash-type-persistence-test"
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let wash_id = created["data"]["wash"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["data"]["wash"]["washType"], "Inside Only");
+    assert_eq!(created["data"]["wash"]["priceMilli"], 50_000);
+    assert_eq!(created["data"]["wash"]["commissionMilli"], 25_000);
+
+    let list_endpoint = "/api/washes?from=2026-09-01T00:00:00Z&to=2026-09-01T23:59:59Z";
+    let (status, listed) = request_json(
+        &test_app.router,
+        Method::GET,
+        list_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["data"]["items"][0]["vehicleMake"], "Toyota");
+    assert_eq!(listed["data"]["items"][0]["vehicleModel"], "Camry");
+    assert_eq!(listed["data"]["items"][0]["washType"], "Inside Only");
+
+    let paid_status_endpoint = all_time_endpoint(&format!("/api/washes/{wash_id}/paid"));
+    let (status, paid) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &paid_status_endpoint,
+        Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(paid["data"]["wash"]["washType"], "Inside Only");
+
+    let paid_cars_endpoint = all_time_endpoint("/api/paid-cars");
+    let (status, completed) = request_json(
+        &test_app.router,
+        Method::GET,
+        &paid_cars_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(completed["data"]["items"][0]["id"], wash_id);
+    assert_eq!(completed["data"]["items"][0]["washType"], "Inside Only");
+
+    let (status, overnight_marked) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{wash_id}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota",
+            "vehicleModel":"Camry",
+            "washType":"Inside Only",
+            "price":"50",
+            "workerId":worker_id,
+            "paymentType":"cash",
+            "occurredAt":occurred_at,
+            "markAsOvernight":true
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overnight_marked["data"]["wash"]["washType"], "Inside Only");
+
+    let overnight_endpoint = all_time_endpoint("/api/overnight-cars");
+    let (status, overnight) = request_json(
+        &test_app.router,
+        Method::GET,
+        &overnight_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overnight["data"]["items"][0]["wash"]["id"], wash_id);
+    assert_eq!(overnight["data"]["items"][0]["wash"]["washType"], "Inside Only");
+
+    let (status, updated) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{wash_id}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota",
+            "vehicleModel":"Camry",
+            "washType":"Inside Only Updated",
+            "price":"50",
+            "workerId":worker_id,
+            "paymentType":"cash",
+            "occurredAt":occurred_at,
+            "markAsOvernight":true
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["data"]["wash"]["washType"], "Inside Only Updated");
+    assert_eq!(updated["data"]["wash"]["commissionMilli"], 25_000);
+
+    let (_, completed_after_edit) = request_json(
+        &test_app.router,
+        Method::GET,
+        &paid_cars_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(completed_after_edit["data"]["items"][0]["washType"], "Inside Only Updated");
+    let (_, overnight_after_edit) = request_json(
+        &test_app.router,
+        Method::GET,
+        &overnight_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(overnight_after_edit["data"]["items"][0]["wash"]["washType"], "Inside Only Updated");
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened = build_router(create_state(data_dir.clone()).expect("wash type database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, completed_after_restart) = request_json(
+        &reopened,
+        Method::GET,
+        &paid_cars_endpoint,
+        Some(&reopened_token),
+        None,
+    ).await;
+    assert_eq!(completed_after_restart["data"]["items"][0]["washType"], "Inside Only Updated");
+    let (_, overnight_after_restart) = request_json(
+        &reopened,
+        Method::GET,
+        &overnight_endpoint,
+        Some(&reopened_token),
+        None,
+    ).await;
+    assert_eq!(overnight_after_restart["data"]["items"][0]["wash"]["washType"], "Inside Only Updated");
+    drop(reopened);
+
+    let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+    let stored: Option<String> = connection.query_row(
+        "SELECT wash_type FROM wash_operations WHERE id=?1",
+        [&wash_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored.as_deref(), Some("Inside Only Updated"));
+    assert_eq!(connection.query_row(
+        "SELECT COUNT(*) FROM overnight_cars WHERE wash_id=?1",
+        [&wash_id],
+        |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    assert_eq!(connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('overnight_cars') WHERE name='wash_type'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap(), 0);
+    assert_eq!(connection.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version=19",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    drop(connection);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn workers_and_payroll_employees_are_independent_and_persist_after_restart() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل مستقل عن المرتبات").await;
+
+    let (_, empty_payroll) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
+    assert!(empty_payroll["data"]["employees"].as_array().unwrap().is_empty(), "creating a worker must not create or expose a payroll employee");
+    let (_, workers) = request_json(&test_app.router, Method::GET, "/api/workers", Some(&manager_token), None).await;
+    assert!(workers["data"]["items"].as_array().unwrap().iter().any(|worker| worker["id"] == worker_id));
+
+    create_cash_wash(&test_app.router, &manager_token, &worker_id, "50").await;
+    let (_, worker_financial) = request_json(&test_app.router, Method::GET, &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")), Some(&manager_token), None).await;
+    assert_eq!(worker_financial["data"]["grossCommissionMilli"], 25_000);
+
     let (status, created) = request_json(
         &test_app.router,
         Method::POST,
@@ -36,36 +228,55 @@ async fn payroll_can_create_manual_employee_without_system_user_and_calculate_re
         Some(json!({"fullName":"موظف مرتبات يدوي","month":"2026-08","salary":"900"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
-    let worker_id = created["data"]["worker"]["id"].as_str().unwrap().to_owned();
+    let employee_id = created["data"]["employee"]["id"].as_str().unwrap().to_owned();
 
     let (_, payroll) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     let employee = payroll["data"]["employees"].as_array().unwrap().iter()
-        .find(|item| item["worker"]["id"] == worker_id).unwrap();
-    assert_eq!(employee["worker"]["fullName"], "موظف مرتبات يدوي");
+        .find(|item| item["employee"]["id"] == employee_id).unwrap();
+    assert_eq!(employee["employee"]["fullName"], "موظف مرتبات يدوي");
     assert_eq!(employee["salaryMilli"], 900_000);
     assert_eq!(employee["totalWithdrawalsMilli"], 0);
     assert_eq!(employee["remainingSalaryMilli"], 900_000);
+    assert!(!payroll["data"]["employees"].as_array().unwrap().iter().any(|item| item["employee"]["id"] == worker_id));
+    let (_, workers_after_employee) = request_json(&test_app.router, Method::GET, "/api/workers", Some(&manager_token), None).await;
+    assert!(!workers_after_employee["data"]["items"].as_array().unwrap().iter().any(|worker| worker["id"] == employee_id), "creating a payroll employee must not create a worker");
+
+    let (status, _) = request_json(
+        &test_app.router, Method::PATCH, &format!("/api/workers/{worker_id}"), Some(&manager_token),
+        Some(json!({"fullName":"عامل مستقل معدل","phone":"0920000000","isActive":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, payroll_after_worker_edit) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
+    assert_eq!(payroll_after_worker_edit["data"]["employees"][0]["employee"]["fullName"], "موظف مرتبات يدوي");
+
+    let (status, _) = request_json(
+        &test_app.router, Method::PUT, &format!("/api/payroll/employees/{employee_id}/salary"), Some(&manager_token),
+        Some(json!({"month":"2026-08","salary":"950"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, worker_after_salary_edit) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_id}"), Some(&manager_token), None).await;
+    assert_eq!(worker_after_salary_edit["data"]["worker"]["fullName"], "عامل مستقل معدل");
 
     let (status, _) = request_json(
         &test_app.router,
         Method::POST,
         "/api/payroll/withdrawals",
         Some(&manager_token),
-        Some(json!({"workerId":worker_id,"amount":"125","withdrawnAt":"2026-08-15T12:00:00Z","notes":"سلفة"})),
+        Some(json!({"employeeId":employee_id,"amount":"125","withdrawnAt":"2026-08-15T12:00:00Z","notes":"سلفة"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let (_, payroll_after_withdrawal) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     let employee = payroll_after_withdrawal["data"]["employees"].as_array().unwrap().iter()
-        .find(|item| item["worker"]["id"] == worker_id).unwrap();
+        .find(|item| item["employee"]["id"] == employee_id).unwrap();
     assert_eq!(employee["totalWithdrawalsMilli"], 125_000);
-    assert_eq!(employee["remainingSalaryMilli"], 775_000);
+    assert_eq!(employee["remainingSalaryMilli"], 825_000);
 
     let (status, created_deduction) = request_json(
         &test_app.router,
         Method::POST,
         "/api/payroll/deductions",
         Some(&manager_token),
-        Some(json!({"workerId":worker_id,"amount":"75","deductedAt":"2026-08-18T12:00:00Z","notes":"تأخير"})),
+        Some(json!({"employeeId":employee_id,"amount":"75","deductedAt":"2026-08-18T12:00:00Z","notes":"تأخير"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let deduction_id = created_deduction["data"]["id"].as_str().unwrap().to_owned();
@@ -75,42 +286,63 @@ async fn payroll_can_create_manual_employee_without_system_user_and_calculate_re
     assert_eq!(history["data"]["items"][0]["notes"], "تأخير");
     let (_, payroll_after_deduction) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     let employee = payroll_after_deduction["data"]["employees"].as_array().unwrap().iter()
-        .find(|item| item["worker"]["id"] == worker_id).unwrap();
+        .find(|item| item["employee"]["id"] == employee_id).unwrap();
     assert_eq!(employee["totalWithdrawalsMilli"], 125_000);
     assert_eq!(employee["totalDeductionsMilli"], 75_000);
-    assert_eq!(employee["remainingSalaryMilli"], 700_000);
+    assert_eq!(employee["remainingSalaryMilli"], 750_000);
 
     let (status, _) = request_json(
         &test_app.router,
         Method::PATCH,
         &format!("/api/payroll/deductions/{deduction_id}"),
         Some(&manager_token),
-        Some(json!({"workerId":worker_id,"amount":"90","deductedAt":"2026-08-20T12:00:00Z","notes":"تأخير معدل"})),
+        Some(json!({"employeeId":employee_id,"amount":"90","deductedAt":"2026-08-20T12:00:00Z","notes":"تأخير معدل"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let (_, payroll_after_edit) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     let employee = payroll_after_edit["data"]["employees"].as_array().unwrap().iter()
-        .find(|item| item["worker"]["id"] == worker_id).unwrap();
+        .find(|item| item["employee"]["id"] == employee_id).unwrap();
     assert_eq!(employee["totalDeductionsMilli"], 90_000);
-    assert_eq!(employee["remainingSalaryMilli"], 685_000);
+    assert_eq!(employee["remainingSalaryMilli"], 735_000);
 
-    let (status, _) = request_json(
-        &test_app.router,
-        Method::DELETE,
-        &format!("/api/payroll/deductions/{deduction_id}"),
-        Some(&manager_token),
-        None,
-    ).await;
+    let (status, deleted_worker) = request_json(&test_app.router, Method::DELETE, &format!("/api/workers/{worker_id}"), Some(&manager_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    let (_, payroll_after_delete) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
-    let employee = payroll_after_delete["data"]["employees"].as_array().unwrap().iter()
-        .find(|item| item["worker"]["id"] == worker_id).unwrap();
-    assert_eq!(employee["totalDeductionsMilli"], 0);
-    assert_eq!(employee["remainingSalaryMilli"], 775_000);
+    assert_eq!(deleted_worker["data"]["worker"]["id"], worker_id);
+    assert_eq!(deleted_worker["data"]["archived"], true);
+    let (_, workers_after_worker_delete) = request_json(&test_app.router, Method::GET, "/api/workers", Some(&manager_token), None).await;
+    assert!(!workers_after_worker_delete["data"]["items"].as_array().unwrap().iter().any(|worker| worker["id"] == worker_id));
+    let (_, payroll_after_worker_delete) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
+    assert!(payroll_after_worker_delete["data"]["employees"].as_array().unwrap().iter().any(|item| item["employee"]["id"] == employee_id));
+
+    let (status, _) = request_json(&test_app.router, Method::DELETE, &format!("/api/payroll/employees/{employee_id}"), Some(&manager_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, worker_after_employee_delete) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_id}"), Some(&manager_token), None).await;
+    assert_eq!(worker_after_employee_delete["data"]["worker"]["fullName"], "عامل مستقل معدل");
+    let (_, worker_financial_after_deletes) = request_json(&test_app.router, Method::GET, &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")), Some(&manager_token), None).await;
+    assert_eq!(worker_financial_after_deletes["data"]["grossCommissionMilli"], 25_000);
 
     let (_, users) = request_json(&test_app.router, Method::GET, "/api/users", Some(&manager_token), None).await;
     assert!(!users["data"]["items"].as_array().unwrap().iter().any(|user| user["fullName"] == "موظف مرتبات يدوي"));
-    test_app.cleanup();
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened = build_router(create_state(data_dir.clone()).expect("separated payroll database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, payroll_after_restart) = request_json(&reopened, Method::GET, "/api/payroll?month=2026-08", Some(&reopened_token), None).await;
+    assert!(payroll_after_restart["data"]["employees"].as_array().unwrap().is_empty());
+    let (_, worker_after_restart) = request_json(&reopened, Method::GET, &format!("/api/workers/{worker_id}"), Some(&reopened_token), None).await;
+    assert_eq!(worker_after_restart["data"]["worker"]["fullName"], "عامل مستقل معدل");
+    drop(reopened);
+
+    let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+    assert_eq!(connection.query_row("SELECT is_active FROM workers WHERE id=?1", [worker_id], |row| row.get::<_,i64>(0)).unwrap(), 0);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM wash_operations", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM payroll_employees WHERE id=?1", [employee_id.clone()], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM payroll_salary_rates WHERE employee_id=?1", [employee_id.clone()], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM salary_withdrawals WHERE employee_id=?1", [employee_id.clone()], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM salary_deductions WHERE employee_id=?1", [employee_id], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    drop(connection);
+    let _ = fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
@@ -187,7 +419,12 @@ async fn showroom_payments_reduce_debt_and_edit_delete_persist_without_touching_
 async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_history() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
-    let worker_id = create_worker(&test_app.router, &manager_token, "موظف المرتبات").await;
+    let (status, created_employee) = request_json(
+        &test_app.router, Method::POST, "/api/payroll/employees", Some(&manager_token),
+        Some(json!({"fullName":"موظف المرتبات","month":"2026-08","salary":"1000"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let employee_id = created_employee["data"]["employee"]["id"].as_str().unwrap().to_owned();
 
     let (status, _) = request_json(
         &test_app.router,
@@ -198,15 +435,6 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
     ).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, _) = request_json(
-        &test_app.router,
-        Method::PUT,
-        &format!("/api/payroll/workers/{worker_id}/salary"),
-        Some(&manager_token),
-        Some(json!({"month":"2026-08","salary":"1000"})),
-    ).await;
-    assert_eq!(status, StatusCode::OK);
-
     let (_, july) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-07", Some(&manager_token), None).await;
     let (_, august) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     assert_eq!(july["data"]["employees"][0]["salaryMilli"], 0);
@@ -215,7 +443,7 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
     let (status, _) = request_json(
         &test_app.router,
         Method::PUT,
-        &format!("/api/payroll/workers/{worker_id}/salary"),
+        &format!("/api/payroll/employees/{employee_id}/salary"),
         Some(&manager_token),
         Some(json!({"month":"2026-09","salary":"1200"})),
     ).await;
@@ -226,7 +454,7 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
         Method::POST,
         "/api/payroll/withdrawals",
         Some(&manager_token),
-        Some(json!({"workerId":worker_id,"amount":"200","withdrawnAt":"2026-08-15T12:00:00Z","notes":"سلفة"})),
+        Some(json!({"employeeId":employee_id,"amount":"200","withdrawnAt":"2026-08-15T12:00:00Z","notes":"سلفة"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let withdrawal_id = created["data"]["id"].as_str().unwrap().to_owned();
@@ -241,7 +469,7 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
         Method::PATCH,
         &format!("/api/payroll/withdrawals/{withdrawal_id}"),
         Some(&manager_token),
-        Some(json!({"workerId":worker_id,"amount":"250","withdrawnAt":"2026-09-10T12:00:00Z","notes":"سلفة معدلة"})),
+        Some(json!({"employeeId":employee_id,"amount":"250","withdrawnAt":"2026-09-10T12:00:00Z","notes":"سلفة معدلة"})),
     ).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -272,25 +500,16 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
     let (_, august_history) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     assert_eq!(august_history["data"]["totalSalaryMilli"], 1_000_000, "later salary changes must not rewrite previous months");
 
-    create_cash_wash(&test_app.router, &manager_token, &worker_id, "50").await;
     let (status, _) = request_json(
         &test_app.router,
         Method::DELETE,
-        &format!("/api/payroll/workers/{worker_id}"),
+        &format!("/api/payroll/employees/{employee_id}"),
         Some(&manager_token),
         None,
     ).await;
     assert_eq!(status, StatusCode::OK);
     let (_, active_payroll) = request_json(&test_app.router, Method::GET, "/api/payroll?month=2026-08", Some(&manager_token), None).await;
     assert_eq!(active_payroll["data"]["employees"].as_array().unwrap().len(), 0);
-
-    let (_, worker_financial) = request_json(&test_app.router, Method::GET, &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")), Some(&manager_token), None).await;
-    assert_eq!(worker_financial["data"]["grossCommissionMilli"], 25_000);
-    assert_eq!(worker_financial["data"]["paidMilli"], 0);
-    assert_eq!(worker_financial["data"]["remainingMilli"], 25_000);
-    assert!(worker_financial["data"]["payments"].as_array().unwrap().is_empty());
-    let (_, washes) = request_json(&test_app.router, Method::GET, "/api/washes?from=2026-08-01T00:00:00Z&to=2026-08-31T23:59:59Z", Some(&manager_token), None).await;
-    assert!(washes["data"]["items"].as_array().unwrap().iter().any(|wash| wash["worker"]["id"] == worker_id));
 
     test_app.cleanup();
 }
@@ -349,7 +568,7 @@ async fn obsolete_worker_payments_are_migrated_out_and_never_reduce_worker_balan
     let (_, finance) = request_json(&reopened_router, Method::GET, &all_time_endpoint("/api/finance/overview"), Some(&reopened_token), None).await;
     assert_eq!(finance["data"]["outstandingWorkerBalancesMilli"], 25_000);
     assert!(finance["data"].get("workerPaymentsMilli").is_none());
-    let (_, dashboard) = request_json(&reopened_router, Method::GET, "/api/dashboard", Some(&reopened_token), None).await;
+    let (_, dashboard) = request_json(&reopened_router, Method::GET, "/api/dashboard?date=2026-08-29", Some(&reopened_token), None).await;
     assert_eq!(dashboard["data"]["financial"]["workerPayable"], 25_000);
     let removed_endpoint_status = reopened_router.clone().oneshot(
         Request::builder()
@@ -1006,6 +1225,19 @@ async fn employee_account_is_independent_from_workers_and_financial_access() {
     let manager_token = bootstrap_manager(&test_app.router).await;
     let worker_a = create_worker(&test_app.router, &manager_token, "أحمد العامل").await;
     let worker_b = create_worker(&test_app.router, &manager_token, "سالم العامل").await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/workers/{worker_a}"),
+        Some(&manager_token),
+        Some(json!({
+            "fullName": "أحمد العامل",
+            "commissionBpsOverride": 3750,
+            "isActive": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     create_cash_wash(&test_app.router, &manager_token, &worker_a, "80").await;
 
     let (status, payload) = request_json(
@@ -1101,8 +1333,61 @@ async fn employee_account_is_independent_from_workers_and_financial_access() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(workers["data"]["items"].as_array().unwrap().len(), 2);
     for worker in workers["data"]["items"].as_array().unwrap() {
-        assert!(worker.get("financial").is_none());
+        assert_no_sensitive_financial_keys(worker);
     }
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/workers",
+        Some(&employee_token),
+        Some(json!({
+            "fullName": "عامل بعمولة غير مخولة",
+            "commissionBpsOverride": 5000,
+            "isActive": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/workers/{worker_a}"),
+        Some(&employee_token),
+        Some(json!({
+            "fullName": "أحمد العامل",
+            "commissionBpsOverride": 5000,
+            "isActive": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/workers/{worker_a}"),
+        Some(&employee_token),
+        Some(json!({
+            "fullName": "أحمد العامل",
+            "commissionBpsOverride": null,
+            "isActive": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, worker_a_financial) = request_json(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/workers/{worker_a}/financial?date=2026-08-29"),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(worker_a_financial["data"]["commissionBpsOverride"], 3750);
 
     let (status, worker_a_detail) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_a}?date=2026-08-29"), Some(&employee_token), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1456,6 +1741,13 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     let selected_morning = format!("{}Z", (selected_start_utc + Duration::hours(8)).format("%Y-%m-%dT%H:%M:%S"));
     let selected_evening = format!("{}Z", (selected_start_utc + Duration::hours(23) + Duration::minutes(59)).format("%Y-%m-%dT%H:%M:%S"));
     let following_midnight = format!("{}Z", (selected_start_utc + Duration::hours(24)).format("%Y-%m-%dT%H:%M:%S"));
+    let payroll_month = &selected_key[..7];
+    let (status, payroll_employee) = request_json(
+        &test_app.router, Method::POST, "/api/payroll/employees", Some(&manager_token),
+        Some(json!({"fullName":"موظف التاريخ العالمي","month":payroll_month,"salary":"100"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let payroll_employee_id = payroll_employee["data"]["employee"]["id"].as_str().unwrap().to_owned();
 
     let (status, first) = request_json(
         &test_app.router, Method::POST, "/api/washes", Some(&manager_token),
@@ -1523,14 +1815,14 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     for (withdrawn_at, amount) in [(&selected_morning, "25"), (&following_midnight, "35")] {
         let (status, _) = request_json(
             &test_app.router, Method::POST, "/api/payroll/withdrawals", Some(&manager_token),
-            Some(json!({"workerId":worker_id,"amount":amount,"withdrawnAt":withdrawn_at,"notes":"مسحوب التاريخ العالمي"})),
+            Some(json!({"employeeId":payroll_employee_id,"amount":amount,"withdrawnAt":withdrawn_at,"notes":"مسحوب التاريخ العالمي"})),
         ).await;
         assert_eq!(status, StatusCode::OK);
     }
     for (deducted_at, amount) in [(&selected_evening, "7"), (&following_midnight, "11")] {
         let (status, _) = request_json(
             &test_app.router, Method::POST, "/api/payroll/deductions", Some(&manager_token),
-            Some(json!({"workerId":worker_id,"amount":amount,"deductedAt":deducted_at,"notes":"خصم التاريخ العالمي"})),
+            Some(json!({"employeeId":payroll_employee_id,"amount":amount,"deductedAt":deducted_at,"notes":"خصم التاريخ العالمي"})),
         ).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1870,6 +2162,276 @@ async fn worker_withdrawal_returns_are_isolated_and_wash_deletion_recalculates_p
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     test_app.cleanup();
+}
+
+#[tokio::test]
+async fn worker_profile_wash_count_and_full_value_follow_add_edit_reassign_delete_and_restart() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_a = create_worker(&test_app.router, &manager_token, "عامل الإحصاءات أ").await;
+    let worker_b = create_worker(&test_app.router, &manager_token, "عامل الإحصاءات ب").await;
+    let wash_a = create_cash_wash_at(&test_app.router, &manager_token, &worker_a, "30", "2026-08-20T10:00:00Z").await;
+    let wash_b = create_cash_wash_at(&test_app.router, &manager_token, &worker_a, "40", "2026-08-20T11:00:00Z").await;
+    let profile_url_a = all_time_endpoint(&format!("/api/workers/{worker_a}"));
+    let profile_url_b = all_time_endpoint(&format!("/api/workers/{worker_b}"));
+
+    let (_, after_add) = request_json(&test_app.router, Method::GET, &profile_url_a, Some(&manager_token), None).await;
+    assert_eq!(after_add["data"]["worker"]["washCount"], 2);
+    assert_eq!(after_add["data"]["worker"]["totalWashValueMilli"], 70_000);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{wash_b}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Camry","manufactureYear":2024,
+            "licensePlate":"1234 أ ب","price":"55","workerId":worker_a,
+            "paymentType":"cash","occurredAt":"2026-08-20T11:00:00Z"
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_price_edit) = request_json(&test_app.router, Method::GET, &profile_url_a, Some(&manager_token), None).await;
+    assert_eq!(after_price_edit["data"]["worker"]["washCount"], 2);
+    assert_eq!(after_price_edit["data"]["worker"]["totalWashValueMilli"], 85_000);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{wash_b}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Camry","manufactureYear":2024,
+            "licensePlate":"1234 أ ب","price":"55","workerId":worker_b,
+            "paymentType":"cash","occurredAt":"2026-08-20T11:00:00Z"
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, worker_a_after_reassign) = request_json(&test_app.router, Method::GET, &profile_url_a, Some(&manager_token), None).await;
+    let (_, worker_b_after_reassign) = request_json(&test_app.router, Method::GET, &profile_url_b, Some(&manager_token), None).await;
+    assert_eq!(worker_a_after_reassign["data"]["worker"]["washCount"], 1);
+    assert_eq!(worker_a_after_reassign["data"]["worker"]["totalWashValueMilli"], 30_000);
+    assert_eq!(worker_b_after_reassign["data"]["worker"]["washCount"], 1);
+    assert_eq!(worker_b_after_reassign["data"]["worker"]["totalWashValueMilli"], 55_000);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{wash_a}/void"),
+        Some(&manager_token),
+        Some(json!({"reason":"اختبار حذف الإحصاءات"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, worker_a_after_delete) = request_json(&test_app.router, Method::GET, &profile_url_a, Some(&manager_token), None).await;
+    assert_eq!(worker_a_after_delete["data"]["worker"]["washCount"], 0);
+    assert_eq!(worker_a_after_delete["data"]["worker"]["totalWashValueMilli"], 0);
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened = build_router(create_state(data_dir.clone()).expect("database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, persisted_a) = request_json(&reopened, Method::GET, &profile_url_a, Some(&reopened_token), None).await;
+    let (_, persisted_b) = request_json(&reopened, Method::GET, &profile_url_b, Some(&reopened_token), None).await;
+    assert_eq!(persisted_a["data"]["worker"]["washCount"], 0);
+    assert_eq!(persisted_a["data"]["worker"]["totalWashValueMilli"], 0);
+    assert_eq!(persisted_b["data"]["worker"]["washCount"], 1);
+    assert_eq!(persisted_b["data"]["worker"]["totalWashValueMilli"], 55_000);
+    drop(reopened);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn worker_movements_settle_persist_delete_and_recalculate_without_negative_balance() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل تصفية المستقطعات").await;
+    let ledger_url = all_time_endpoint(&format!("/api/workers/{worker_id}/withdrawals-returns"));
+
+    let (status, withdrawal) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"withdrawal","amount":"500","occurredAt":"2026-08-10T12:00:00Z","notes":"مسحوب الاختبار"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let withdrawal_id = withdrawal["data"]["id"].as_str().unwrap().to_owned();
+    let (status, returned) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"return","amount":"200","occurredAt":"2026-08-11T12:00:00Z","notes":"مرتجع الاختبار"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let return_id = returned["data"]["id"].as_str().unwrap().to_owned();
+
+    let (status, _) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"return","amount":"301","occurredAt":"2026-08-12T12:00:00Z"})),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a return cannot make the persisted outstanding balance negative");
+
+    let (status, settled) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns/settle"), Some(&manager_token),
+        Some(json!({"occurredAt":"2026-08-13T12:00:00Z"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(settled["data"]["amountMilli"], 300_000);
+    let settlement_id = settled["data"]["id"].as_str().unwrap().to_owned();
+    let (_, after_settlement) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_settlement["data"]["totalWithdrawalsMilli"], 500_000);
+    assert_eq!(after_settlement["data"]["totalReturnsMilli"], 200_000);
+    assert_eq!(after_settlement["data"]["totalSettlementsMilli"], 300_000);
+    assert_eq!(after_settlement["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(after_settlement["data"]["transactions"].as_array().unwrap().len(), 3);
+    assert!(after_settlement["data"]["transactions"].as_array().unwrap().iter().any(|movement| movement["type"] == "settlement"));
+    let (status, _) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns/settle"), Some(&manager_token),
+        Some(json!({"occurredAt":"2026-08-14T12:00:00Z"})),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened = build_router(create_state(data_dir.clone()).expect("movement database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, persisted) = request_json(&reopened, Method::GET, &ledger_url, Some(&reopened_token), None).await;
+    assert_eq!(persisted["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(persisted["data"]["transactions"].as_array().unwrap().len(), 3);
+
+    let (status, _) = request_json(&reopened, Method::DELETE, &format!("/api/workers/{worker_id}/withdrawals-returns/{settlement_id}"), Some(&reopened_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, without_settlement) = request_json(&reopened, Method::GET, &ledger_url, Some(&reopened_token), None).await;
+    assert_eq!(without_settlement["data"]["totalSettlementsMilli"], 0);
+    assert_eq!(without_settlement["data"]["outstandingBalanceMilli"], 300_000);
+
+    let (status, _) = request_json(&reopened, Method::DELETE, &format!("/api/workers/{worker_id}/withdrawals-returns/{return_id}"), Some(&reopened_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, without_return) = request_json(&reopened, Method::GET, &ledger_url, Some(&reopened_token), None).await;
+    assert_eq!(without_return["data"]["totalReturnsMilli"], 0);
+    assert_eq!(without_return["data"]["outstandingBalanceMilli"], 500_000);
+
+    let (status, _) = request_json(&reopened, Method::DELETE, &format!("/api/workers/{worker_id}/withdrawals-returns/{withdrawal_id}"), Some(&reopened_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, empty) = request_json(&reopened, Method::GET, &ledger_url, Some(&reopened_token), None).await;
+    assert_eq!(empty["data"]["totalWithdrawalsMilli"], 0);
+    assert_eq!(empty["data"]["outstandingBalanceMilli"], 0);
+    assert!(empty["data"]["transactions"].as_array().unwrap().is_empty());
+    drop(reopened);
+
+    let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+    let retained_deleted_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM worker_withdrawal_returns WHERE worker_id=?1 AND deleted_at IS NOT NULL",
+        [worker_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(retained_deleted_rows, 3, "deleted movements remain persisted for auditability");
+    drop(connection);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding_balance() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل تسديد الاستقطاع").await;
+    let ledger_url = all_time_endpoint(&format!("/api/workers/{worker_id}/withdrawals-returns"));
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/expenses",
+        Some(&manager_token),
+        Some(json!({
+            "description":"استقطاع عامل الاختبار","category":"أخرى","amount":"300",
+            "occurredAt":"2026-08-01T12:00:00Z","allocationType":"workers"
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, deduction_only) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(deduction_only["data"]["totalDeductionsMilli"], 300_000);
+    assert_eq!(deduction_only["data"]["outstandingBalanceMilli"], 300_000);
+    assert!(deduction_only["data"]["transactions"].as_array().unwrap().iter().any(|movement| movement["type"] == "deduction" && movement["amountMilli"] == 300_000));
+
+    let (status, first_payment) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"deduction_payment","amount":"100","occurredAt":"2026-08-02T12:00:00Z","notes":"الدفعة الأولى"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_payment_id = first_payment["data"]["id"].as_str().unwrap().to_owned();
+    let (_, after_first_payment) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_first_payment["data"]["totalDeductionPaymentsMilli"], 100_000);
+    assert_eq!(after_first_payment["data"]["outstandingBalanceMilli"], 200_000);
+
+    let (status, second_payment) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"deduction_payment","amount":"50","occurredAt":"2026-08-03T12:00:00Z","notes":"الدفعة الثانية"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_payment_id = second_payment["data"]["id"].as_str().unwrap().to_owned();
+    let (_, after_second_payment) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_second_payment["data"]["totalDeductionPaymentsMilli"], 150_000);
+    assert_eq!(after_second_payment["data"]["outstandingBalanceMilli"], 150_000);
+
+    let (status, _) = request_json(
+        &test_app.router, Method::PATCH, &format!("/api/workers/{worker_id}/withdrawals-returns/{first_payment_id}"), Some(&manager_token),
+        Some(json!({"transactionType":"deduction_payment","amount":"120","occurredAt":"2026-08-02T12:00:00Z","notes":"الدفعة الأولى معدلة"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_edit) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_edit["data"]["totalDeductionPaymentsMilli"], 170_000);
+    assert_eq!(after_edit["data"]["outstandingBalanceMilli"], 130_000);
+    let edited = after_edit["data"]["transactions"].as_array().unwrap().iter().find(|movement| movement["id"] == first_payment_id).unwrap();
+    assert_eq!(edited["amountMilli"], 120_000);
+    assert_eq!(edited["notes"], "الدفعة الأولى معدلة");
+
+    let (status, _) = request_json(
+        &test_app.router, Method::DELETE, &format!("/api/workers/{worker_id}/withdrawals-returns/{second_payment_id}"), Some(&manager_token), None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_payment_delete) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_payment_delete["data"]["totalDeductionPaymentsMilli"], 120_000);
+    assert_eq!(after_payment_delete["data"]["outstandingBalanceMilli"], 180_000);
+
+    let (status, _) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"withdrawal","amount":"200","occurredAt":"2026-08-04T12:00:00Z","notes":"مسحوب مع الاستقطاع"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, combined) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(combined["data"]["outstandingBalanceMilli"], 380_000);
+
+    let (status, _) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
+        Some(json!({"transactionType":"return","amount":"80","occurredAt":"2026-08-05T12:00:00Z","notes":"مرتجع مع الاستقطاع"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_return) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_return["data"]["outstandingBalanceMilli"], 300_000);
+
+    let (status, settled) = request_json(
+        &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns/settle"), Some(&manager_token),
+        Some(json!({"occurredAt":"2026-08-06T12:00:00Z"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(settled["data"]["amountMilli"], 300_000);
+    let (_, after_settlement) = request_json(&test_app.router, Method::GET, &ledger_url, Some(&manager_token), None).await;
+    assert_eq!(after_settlement["data"]["outstandingBalanceMilli"], 0);
+    for movement_type in ["deduction", "deduction_payment", "withdrawal", "return", "settlement"] {
+        assert!(after_settlement["data"]["transactions"].as_array().unwrap().iter().any(|movement| movement["type"] == movement_type));
+    }
+
+    let (_, financial) = request_json(&test_app.router, Method::GET, &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")), Some(&manager_token), None).await;
+    assert_eq!(financial["data"]["deductionsMilli"], 300_000);
+    assert_eq!(financial["data"]["grossCommissionMilli"], 0);
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened = build_router(create_state(data_dir.clone()).expect("deduction payment database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, persisted) = request_json(&reopened, Method::GET, &ledger_url, Some(&reopened_token), None).await;
+    assert_eq!(persisted["data"]["totalDeductionsMilli"], 300_000);
+    assert_eq!(persisted["data"]["totalDeductionPaymentsMilli"], 120_000);
+    assert_eq!(persisted["data"]["totalSettlementsMilli"], 300_000);
+    assert_eq!(persisted["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(persisted["data"]["transactions"].as_array().unwrap().len(), 5);
+    drop(reopened);
+    let _ = fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]

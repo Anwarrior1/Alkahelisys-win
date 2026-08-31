@@ -796,7 +796,7 @@ function ViewRouter({ view, user, selectedDate, canWrite, canFinancial, navigate
     case 'washes': return <WashesView selectedDate={selectedDate} isManager={managerOf(user)} canWrite={canWrite} onNotify={notify} />;
     case 'paidCars': return <PaidCarsView selectedDate={selectedDate} isManager={managerOf(user)} canWrite={canWrite} onNotify={notify} />;
     case 'overnight': return <OvernightCarsView selectedDate={selectedDate} canWrite={canWrite} onNotify={notify} />;
-    case 'workers': return <WorkersView selectedDate={selectedDate} currentUserId={user.id} isManager={managerOf(user)} canWrite={canWrite} onNotify={notify} />;
+    case 'workers': return <WorkersView selectedDate={selectedDate} currentUserId={user.id} isManager={managerOf(user)} canWrite={canWrite} canFinancial={canFinancial} onNotify={notify} />;
     case 'showrooms': return <ShowroomsView selectedDate={selectedDate} canFinancial={canFinancial} canWrite={canWrite} onNotify={notify} />;
     case 'showroomDebts': return <ShowroomDebtsView selectedDate={selectedDate} reportIssuer={user.full_name || user.username} onNotify={notify} />;
     case 'reports': return <ReportsView selectedDate={selectedDate} isManager={canFinancial} />;
@@ -907,13 +907,14 @@ function InlineRetry({ error, onRetry }: { error: string; onRetry: () => void })
   return <div className="inline-retry glass-card"><AlertTriangle size={22} /><p>{error}</p><Button variant="secondary" onClick={onRetry} icon={<RefreshCw size={16} />}>إعادة المحاولة</Button></div>;
 }
 
-function WashList({ washes, compact = false, showWorkerEntitlement = true, showPaidStatus = false, showCreator = false, showCarColor = false, paidUpdatingId, onTogglePaid, onEdit, onDelete, canDelete }: { washes: Wash[]; compact?: boolean; showWorkerEntitlement?: boolean; showPaidStatus?: boolean; showCreator?: boolean; showCarColor?: boolean; paidUpdatingId?: string | null; onTogglePaid?: (wash: Wash) => void | Promise<void>; onEdit?: (wash: Wash) => void; onDelete?: (wash: Wash) => void; canDelete?: (wash: Wash) => boolean }) {
+function WashList({ washes, compact = false, showWorkerEntitlement = true, showPaidStatus = false, showCreator = false, showCarColor = false, showWashType = false, paidUpdatingId, onTogglePaid, onEdit, onDelete, canDelete }: { washes: Wash[]; compact?: boolean; showWorkerEntitlement?: boolean; showPaidStatus?: boolean; showCreator?: boolean; showCarColor?: boolean; showWashType?: boolean; paidUpdatingId?: string | null; onTogglePaid?: (wash: Wash) => void | Promise<void>; onEdit?: (wash: Wash) => void; onDelete?: (wash: Wash) => void; canDelete?: (wash: Wash) => boolean }) {
   if (washes.length === 0) return <EmptyState title="لا توجد بيانات" />;
   return (
-    <div className={`wash-list ${compact ? 'wash-list--compact' : ''}`}>
+    <div className={`wash-list ${compact ? 'wash-list--compact' : ''} ${showWashType ? 'wash-list--with-type' : ''}`}>
       {washes.map((wash) => (
         <div className="wash-row" key={wash.id}>
           <div className="wash-row__car"><div><Car size={18} /></div><span><strong>{wash.vehicle_make} {wash.vehicle_model}</strong><small>{wash.license_plate || 'بدون لوحة'} {wash.manufacturing_year ? `• ${wash.manufacturing_year}` : ''}{showCarColor && wash.car_color ? ` • ${wash.car_color}` : ''}</small></span></div>
+          {showWashType && <span className="wash-row__type"><small>نوع الغسيل</small><strong>{wash.wash_type || 'غير محدد'}</strong></span>}
           <span className="wash-row__worker"><UsersRound size={15} /><span>{wash.worker_name || 'عامل غير محدد'}{showCreator && <small>الحساب: {wash.created_by_name || 'غير محدد'}</small>}</span></span>
           {!compact && <span className="wash-row__date"><Clock3 size={15} />{dateFormat(wash.performed_at, true)}</span>}
           <span className="wash-row__statuses"><span className={wash.payment_type === 'cash' ? 'payment-pill payment-pill--cash' : 'payment-pill payment-pill--showroom'}>{wash.payment_type === 'cash' ? 'نقدي' : 'حساب معرض'}</span>{showPaidStatus && <span className={`payment-pill paid-status ${wash.is_paid ? 'is-paid' : ''}`}>{wash.is_paid ? 'خالصة' : 'غير خالصة'}</span>}</span>
@@ -934,7 +935,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
   const [editing, setEditing] = useState<Wash | null>(null);
   const [paidUpdatingId, setPaidUpdatingId] = useState<string | null>(null);
   const cancellingWashIds = useRef(new Set<string>());
-  const [form, setForm] = useState({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
+  const [form, setForm] = useState({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', wash_type: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
 
   const load = async () => {
     setLoading(true);
@@ -973,6 +974,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
         manufacturing_year: form.manufacturing_year ? Number(form.manufacturing_year) : null,
         license_plate: form.license_plate.trim() || null,
         car_color: form.car_color.trim() || null,
+        wash_type: form.wash_type.trim() || null,
         price: form.price,
         worker_id: form.worker_id,
         performed_at: new Date(form.performed_at).toISOString(),
@@ -980,7 +982,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
         showroom_id: form.payment_type === 'showroom_account' ? form.showroom_id : null,
         showroom_payment_method: form.payment_type === 'showroom_account' ? form.showroom_payment_method : null,
       });
-      setForm({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
+      setForm({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', wash_type: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
       void load();
       refreshDashboard();
       onNotify({ tone: 'success', text: 'تم تسجيل عملية الغسيل وتحديث السجلات المرتبطة تلقائيًا.' });
@@ -1027,6 +1029,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
                 <FormField label="رقم اللوحة"><input value={form.license_plate} onChange={(event) => update('license_plate', event.target.value)} placeholder="اختياري" /></FormField>
                 <FormField label="لون السيارة"><input value={form.car_color} onChange={(event) => update('car_color', event.target.value)} placeholder="اختياري" /></FormField>
                 <FormField label="سعر الغسيل (د.ل)" required><input value={form.price} onChange={(event) => update('price', event.target.value)} type="number" min="0.01" step="0.01" placeholder="0.00" required dir="ltr" /></FormField>
+                <FormField label="نوع الغسيل"><input value={form.wash_type} onChange={(event) => update('wash_type', event.target.value)} placeholder="مثال: غسيل كامل" /></FormField>
                 <FormField label="العامل" required><select value={form.worker_id} onChange={(event) => update('worker_id', event.target.value)} required><option value="">اختر العامل</option>{workers.map((worker) => <option key={worker.id} value={worker.id}>{worker.name}</option>)}</select></FormField>
                 <FormField label="التاريخ والوقت" required><input value={form.performed_at} onChange={(event) => update('performed_at', event.target.value)} type="datetime-local" required dir="ltr" /></FormField>
                 <FormField label="نوع الزبون" required><select value={form.payment_type} onChange={(event) => setForm((current) => ({ ...current, payment_type: event.target.value, showroom_id: '', showroom_payment_method: '' }))}><option value="showroom_account">حساب معرض</option><option value="cash">زبون عادي</option></select></FormField>
@@ -1039,7 +1042,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
         <aside className="wash-side-note glass-card"><div className="wash-side-note__icon"><ShieldCheck size={24} /></div><h3>سجل موحّد وآمن</h3><p>لا تحتاج إلى إدخال العملية مرة أخرى للعمال أو للمعارض؛ تُنشأ القيود المرتبطة تلقائيًا ضمن معاملة واحدة.</p><div><CheckCircle2 size={17} /> سجل العامل</div><div><CheckCircle2 size={17} /> حساب المعرض</div><div><CheckCircle2 size={17} /> التقارير</div></aside>
       </div>}
       <SectionCard title="أحدث العمليات" subtitle={`عمليات الغسيل المسجلة ليوم ${workingDateFormat(selectedDate)}.`} className="data-card">
-        {loading ? <LoadingBlock /> : washes.length ? <WashList washes={washes} showPaidStatus paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? togglePaid : undefined} onEdit={canWrite ? setEditing : undefined} onDelete={canWrite ? removeWash : undefined} /> : <EmptyState icon={<Car size={28} />} title="لا توجد عمليات مسجلة حتى الآن" description="استخدم النموذج أعلاه لإضافة أول عملية." />}
+        {loading ? <LoadingBlock /> : washes.length ? <WashList washes={washes} showWashType showPaidStatus paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? togglePaid : undefined} onEdit={canWrite ? setEditing : undefined} onDelete={canWrite ? removeWash : undefined} /> : <EmptyState icon={<Car size={28} />} title="لا توجد عمليات مسجلة حتى الآن" description="استخدم النموذج أعلاه لإضافة أول عملية." />}
       </SectionCard>
       {editing && <EditWashModal wash={editing} workers={workers} showrooms={showrooms} isManager={isManager || canWrite} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); void load(); refreshDashboard(); onNotify({ tone: 'success', text: 'تم تعديل العملية وإعادة احتساب جميع آثارها.' }); }} onNotify={onNotify} />}
     </>
@@ -1093,17 +1096,17 @@ function PaidCarsView({ selectedDate, isManager, canWrite, onNotify }: { selecte
       <MetricCard label="التسوية المالية" value={money(settlement)} note="إجمالي أسعار السيارات الخالصة فقط" icon={<CircleDollarSign size={21} />} tone="blue" />
     </div>
     <SectionCard title="سجل السيارات الخالصة" subtitle={items.length ? `${items.length} عملية خالصة مرتبطة بسجل الغسيل الأصلي.` : 'تظهر هنا العمليات بعد اعتماد علامة الخالص.'} className="data-card">
-      {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={load} /> : items.length ? <WashList washes={items} showPaidStatus showCreator={isManager} showCarColor showWorkerEntitlement={isManager} paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? revertToUnpaid : undefined} /> : <EmptyState icon={<CheckCircle2 size={29} />} title="لا توجد سيارات خالصة" description="استخدم علامة الصح بجانب عملية الغسيل لاعتمادها كخالصة." />}
+      {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={load} /> : items.length ? <WashList washes={items} showWashType showPaidStatus showCreator={isManager} showCarColor showWorkerEntitlement={isManager} paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? revertToUnpaid : undefined} /> : <EmptyState icon={<CheckCircle2 size={29} />} title="لا توجد سيارات خالصة" description="استخدم علامة الصح بجانب عملية الغسيل لاعتمادها كخالصة." />}
     </SectionCard>
   </>;
 }
 
 function EditWashModal({ wash, workers, showrooms, isManager, onClose, onSaved, onNotify }: { wash: Wash; workers: Worker[]; showrooms: Showroom[]; isManager: boolean; onClose: () => void; onSaved: () => void; onNotify: (message: ToastMessage) => void }) {
-  const [form,setForm]=useState({vehicle_make:wash.vehicle_make,vehicle_model:wash.vehicle_model,manufacturing_year:wash.manufacturing_year?.toString()??'',license_plate:wash.license_plate??'',car_color:wash.car_color??'',price:String(wash.price??''),worker_id:wash.worker_id??'',performed_at:dateTimeInputValue(new Date(wash.performed_at)),payment_type:wash.payment_type,showroom_id:wash.showroom_id??'',showroom_payment_method:wash.showroom_payment_method??(wash.payment_type==='showroom_account'?'cash':'')});
+  const [form,setForm]=useState({vehicle_make:wash.vehicle_make,vehicle_model:wash.vehicle_model,manufacturing_year:wash.manufacturing_year?.toString()??'',license_plate:wash.license_plate??'',car_color:wash.car_color??'',wash_type:wash.wash_type??'',price:String(wash.price??''),worker_id:wash.worker_id??'',performed_at:dateTimeInputValue(new Date(wash.performed_at)),payment_type:wash.payment_type,showroom_id:wash.showroom_id??'',showroom_payment_method:wash.showroom_payment_method??(wash.payment_type==='showroom_account'?'cash':'')});
   const [markAsOvernight,setMarkAsOvernight]=useState(wash.is_overnight===true);
   const [saving,setSaving]=useState(false); const update=(key:keyof typeof form,value:string)=>setForm(current=>({...current,[key]:value}));
-  const submit=async(event:FormEvent)=>{event.preventDefault();if(form.payment_type==='showroom_account'&&(!form.showroom_id||!['cash','bank'].includes(form.showroom_payment_method))){onNotify({tone:'error',text:'اختر المعرض وطريقة الدفع.'});return;}setSaving(true);try{await api.updateWash(wash.id,{...form,manufacturing_year:form.manufacturing_year?Number(form.manufacturing_year):null,license_plate:form.license_plate.trim()||null,car_color:form.car_color.trim()||null,performed_at:new Date(form.performed_at).toISOString(),showroom_id:form.payment_type==='showroom_account'?form.showroom_id:null,showroom_payment_method:form.payment_type==='showroom_account'?form.showroom_payment_method:null,mark_as_overnight:markAsOvernight});onSaved();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setSaving(false);}};
-  return <Modal title="تعديل عملية الغسيل" subtitle="يعيد النظام احتساب العمولة وحصة المركز وحساب المعرض تلقائيًا." onClose={onClose} wide><form className="entry-form" onSubmit={submit}><div className="form-grid form-grid--two"><FormField label="صانع المركبة" required><input value={form.vehicle_make} onChange={e=>update('vehicle_make',e.target.value)} required /></FormField><FormField label="الطراز" required><input value={form.vehicle_model} onChange={e=>update('vehicle_model',e.target.value)} required /></FormField><FormField label="سنة الصنع"><input value={form.manufacturing_year} onChange={e=>update('manufacturing_year',e.target.value)} type="number" /></FormField><FormField label="رقم اللوحة"><input value={form.license_plate} onChange={e=>update('license_plate',e.target.value)} /></FormField><FormField label="لون السيارة"><input value={form.car_color} onChange={e=>update('car_color',e.target.value)} /></FormField><FormField label="السعر" required><input value={form.price} onChange={e=>update('price',e.target.value)} type="number" min="0.01" step="0.01" required dir="ltr" /></FormField><FormField label="العامل" required><select value={form.worker_id} onChange={e=>update('worker_id',e.target.value)} required>{workers.map(worker=><option key={worker.id} value={worker.id}>{worker.name}</option>)}</select></FormField><FormField label="التاريخ والوقت" required><input value={form.performed_at} onChange={e=>update('performed_at',e.target.value)} type="datetime-local" required /></FormField><FormField label="نوع الزبون"><select value={form.payment_type} onChange={e=>setForm(current=>({...current,payment_type:e.target.value as Wash['payment_type'],showroom_id:'',showroom_payment_method:''}))}><option value="showroom_account">حساب معرض</option><option value="cash">زبون عادي</option></select></FormField></div>{form.payment_type==='showroom_account'&&<div className="showroom-selection"><FormField label="المعرض" required><select value={form.showroom_id} onChange={e=>setForm(current=>({...current,showroom_id:e.target.value,showroom_payment_method:e.target.value?(current.showroom_payment_method||'cash'):''}))} required><option value="">اختر المعرض</option>{showrooms.map(showroom=><option key={showroom.id} value={showroom.id}>{showroom.name}</option>)}</select></FormField>{form.showroom_id&&<FormField label="طريقة الدفع" required><select value={form.showroom_payment_method} onChange={e=>update('showroom_payment_method',e.target.value)}><option value="cash">نقدي</option><option value="bank">مصرفي</option></select></FormField>}</div>}{isManager&&<div className="permission-toggle-row"><div><strong>Mark as Overnight Car / تعليم كسيارة مبيتة</strong><span>{markAsOvernight?'ستظهر السيارة في سجل سيارات المبيت.':'لن تظهر السيارة في سجل سيارات المبيت.'}</span></div><button type="button" className={`permission-switch ${markAsOvernight?'is-on':''}`} role="switch" aria-checked={markAsOvernight} onClick={()=>setMarkAsOvernight(current=>!current)}><span>{markAsOvernight?'مفعّل':'متوقف'}</span><i aria-hidden="true" /></button></div>}<div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>;
+  const submit=async(event:FormEvent)=>{event.preventDefault();if(form.payment_type==='showroom_account'&&(!form.showroom_id||!['cash','bank'].includes(form.showroom_payment_method))){onNotify({tone:'error',text:'اختر المعرض وطريقة الدفع.'});return;}setSaving(true);try{await api.updateWash(wash.id,{...form,manufacturing_year:form.manufacturing_year?Number(form.manufacturing_year):null,license_plate:form.license_plate.trim()||null,car_color:form.car_color.trim()||null,wash_type:form.wash_type.trim()||null,performed_at:new Date(form.performed_at).toISOString(),showroom_id:form.payment_type==='showroom_account'?form.showroom_id:null,showroom_payment_method:form.payment_type==='showroom_account'?form.showroom_payment_method:null,mark_as_overnight:markAsOvernight});onSaved();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setSaving(false);}};
+  return <Modal title="تعديل عملية الغسيل" subtitle="يعيد النظام احتساب العمولة وحصة المركز وحساب المعرض تلقائيًا." onClose={onClose} wide><form className="entry-form" onSubmit={submit}><div className="form-grid form-grid--two"><FormField label="صانع المركبة" required><input value={form.vehicle_make} onChange={e=>update('vehicle_make',e.target.value)} required /></FormField><FormField label="الطراز" required><input value={form.vehicle_model} onChange={e=>update('vehicle_model',e.target.value)} required /></FormField><FormField label="سنة الصنع"><input value={form.manufacturing_year} onChange={e=>update('manufacturing_year',e.target.value)} type="number" /></FormField><FormField label="رقم اللوحة"><input value={form.license_plate} onChange={e=>update('license_plate',e.target.value)} /></FormField><FormField label="لون السيارة"><input value={form.car_color} onChange={e=>update('car_color',e.target.value)} /></FormField><FormField label="السعر" required><input value={form.price} onChange={e=>update('price',e.target.value)} type="number" min="0.01" step="0.01" required dir="ltr" /></FormField><FormField label="نوع الغسيل"><input value={form.wash_type} onChange={e=>update('wash_type',e.target.value)} placeholder="مثال: غسيل كامل" /></FormField><FormField label="العامل" required><select value={form.worker_id} onChange={e=>update('worker_id',e.target.value)} required>{workers.map(worker=><option key={worker.id} value={worker.id}>{worker.name}</option>)}</select></FormField><FormField label="التاريخ والوقت" required><input value={form.performed_at} onChange={e=>update('performed_at',e.target.value)} type="datetime-local" required /></FormField><FormField label="نوع الزبون"><select value={form.payment_type} onChange={e=>setForm(current=>({...current,payment_type:e.target.value as Wash['payment_type'],showroom_id:'',showroom_payment_method:''}))}><option value="showroom_account">حساب معرض</option><option value="cash">زبون عادي</option></select></FormField></div>{form.payment_type==='showroom_account'&&<div className="showroom-selection"><FormField label="المعرض" required><select value={form.showroom_id} onChange={e=>setForm(current=>({...current,showroom_id:e.target.value,showroom_payment_method:e.target.value?(current.showroom_payment_method||'cash'):''}))} required><option value="">اختر المعرض</option>{showrooms.map(showroom=><option key={showroom.id} value={showroom.id}>{showroom.name}</option>)}</select></FormField>{form.showroom_id&&<FormField label="طريقة الدفع" required><select value={form.showroom_payment_method} onChange={e=>update('showroom_payment_method',e.target.value)}><option value="cash">نقدي</option><option value="bank">مصرفي</option></select></FormField>}</div>}{isManager&&<div className="permission-toggle-row"><div><strong>Mark as Overnight Car / تعليم كسيارة مبيتة</strong><span>{markAsOvernight?'ستظهر السيارة في سجل سيارات المبيت.':'لن تظهر السيارة في سجل سيارات المبيت.'}</span></div><button type="button" className={`permission-switch ${markAsOvernight?'is-on':''}`} role="switch" aria-checked={markAsOvernight} onClick={()=>setMarkAsOvernight(current=>!current)}><span>{markAsOvernight?'مفعّل':'متوقف'}</span><i aria-hidden="true" /></button></div>}<div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>;
 }
 
 function OvernightCarsView({ selectedDate, canWrite, onNotify }: { selectedDate: string; canWrite: boolean; onNotify: (message: ToastMessage) => void }) {
@@ -1117,10 +1120,10 @@ function OvernightCarsView({ selectedDate, canWrite, onNotify }: { selectedDate:
   const load=async()=>{setLoading(true);setError(null);try{const [overnight,activeWorkers,availableShowrooms]=await Promise.all([api.overnightCars({date:selectedDate}),api.workers({status:'active',include_financials:false}),api.showrooms({include_financials:false})]);setItems(overnight);setWorkers(activeWorkers);setShowrooms(availableShowrooms);}catch(requestError){setError(friendlyError(requestError));}finally{setLoading(false);}};
   useEffect(()=>{void load();},[selectedDate]);
   const remove=async(item:OvernightCar)=>{if(deletingId||!window.confirm(`هل تريد حذف سجل سيارة ${item.wash.vehicle_make} ${item.wash.vehicle_model}؟ ستبقى عملية الغسيل الأصلية محفوظة.`))return;setDeletingId(item.id);try{await api.deleteOvernightCar(item.id);setItems(current=>current.filter(entry=>entry.id!==item.id));onNotify({tone:'success',text:'تم حذف سجل سيارة المبيت مع الاحتفاظ بعملية الغسيل الأصلية.'});}catch(requestError){onNotify({tone:'error',text:friendlyError(requestError)});}finally{setDeletingId(null);}};
-  return <><PageHeader eyebrow="سجل التشغيل" title="سيارات المبيت" description={`السيارات المرتبطة بعمليات يوم ${workingDateFormat(selectedDate)} والمعلّمة للمبيت.`}/><SectionCard title="سجل سيارات المبيت" subtitle={items.length?`${items.length} سيارة مسجلة للمبيت`:'تظهر هنا السيارات التي يحددها المستخدم من تعديل عملية الغسيل.'} className="data-card">{loading?<LoadingBlock/>:error?<InlineRetry error={error} onRetry={load}/>:items.length?<WashList washes={items.map(item=>item.wash)} onEdit={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)setEditing(item);}) : undefined} onDelete={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)void remove(item);}) : undefined}/>:<EmptyState icon={<Moon size={28}/>} title="لا توجد سيارات مبيت" description="يمكن تعليم السيارة للمبيت من نافذة تعديل عملية الغسيل."/>}</SectionCard>{editing&&<EditWashModal wash={editing.wash} workers={workers} showrooms={showrooms} isManager={canWrite} onClose={()=>setEditing(null)} onSaved={()=>{setEditing(null);void load();onNotify({tone:'success',text:'تم تحديث بيانات سيارة المبيت والعملية المرتبطة.'});}} onNotify={onNotify}/>}</>;
+  return <><PageHeader eyebrow="سجل التشغيل" title="سيارات المبيت" description={`السيارات المرتبطة بعمليات يوم ${workingDateFormat(selectedDate)} والمعلّمة للمبيت.`}/><SectionCard title="سجل سيارات المبيت" subtitle={items.length?`${items.length} سيارة مسجلة للمبيت`:'تظهر هنا السيارات التي يحددها المستخدم من تعديل عملية الغسيل.'} className="data-card">{loading?<LoadingBlock/>:error?<InlineRetry error={error} onRetry={load}/>:items.length?<WashList washes={items.map(item=>item.wash)} showWashType onEdit={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)setEditing(item);}) : undefined} onDelete={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)void remove(item);}) : undefined}/>:<EmptyState icon={<Moon size={28}/>} title="لا توجد سيارات مبيت" description="يمكن تعليم السيارة للمبيت من نافذة تعديل عملية الغسيل."/>}</SectionCard>{editing&&<EditWashModal wash={editing.wash} workers={workers} showrooms={showrooms} isManager={canWrite} onClose={()=>setEditing(null)} onSaved={()=>{setEditing(null);void load();onNotify({tone:'success',text:'تم تحديث بيانات سيارة المبيت والعملية المرتبطة.'});}} onNotify={onNotify}/>}</>;
 }
 
-function WorkersView({ selectedDate, currentUserId, isManager, canWrite, onNotify }: { selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; onNotify: (message: ToastMessage) => void }) {
+function WorkersView({ selectedDate, currentUserId, isManager, canWrite, canFinancial, onNotify }: { selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; canFinancial: boolean; onNotify: (message: ToastMessage) => void }) {
   const range = selectedDateRange(selectedDate);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1131,7 +1134,7 @@ function WorkersView({ selectedDate, currentUserId, isManager, canWrite, onNotif
   const load = async () => {
     setLoading(true);
     try {
-      const result = await api.workers({ date: selectedDate, include_financials: true });
+      const result = await api.workers({ date: selectedDate, include_financials: canFinancial });
       setWorkers(result);
     } catch (error) {
       onNotify({ tone: 'error', text: friendlyError(error) });
@@ -1152,29 +1155,29 @@ function WorkersView({ selectedDate, currentUserId, isManager, canWrite, onNotif
       </SectionCard>
       {loading ? <LoadingBlock /> : filteredWorkers.length === 0 ? <EmptyState icon={<UsersRound size={29} />} title="لا يوجد عمال مطابقون" description="أضف عاملًا جديدًا أو غيّر معايير البحث." /> : (
         <div className="worker-grid">
-          {filteredWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} isManager onClick={() => setSelectedId(worker.id)} />)}
+          {filteredWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} canFinancial={canFinancial} onClick={() => setSelectedId(worker.id)} />)}
         </div>
       )}
-      {selectedId && <WorkerProfile workerId={selectedId} selectedDate={selectedDate} currentUserId={currentUserId} isManager={isManager} canWrite={canWrite} range={range} onClose={() => setSelectedId(null)} onChanged={() => { setSelectedId(null); void load(); }} onDeleted={() => { setSelectedId(null); setWorkers((current) => current.filter((worker) => worker.id !== selectedId)); }} onNotify={onNotify} />}
+      {selectedId && <WorkerProfile workerId={selectedId} selectedDate={selectedDate} currentUserId={currentUserId} isManager={isManager} canWrite={canWrite} canFinancial={canFinancial} range={range} onClose={() => setSelectedId(null)} onChanged={() => { setSelectedId(null); void load(); }} onDeleted={(deletedWorkerId) => { setSelectedId(null); setWorkers((current) => current.filter((worker) => worker.id !== deletedWorkerId)); void load(); }} onNotify={onNotify} />}
       {canWrite && addOpen && <CreateWorkerModal onClose={() => setAddOpen(false)} onSaved={(worker) => { setWorkers((current) => [worker, ...current]); setAddOpen(false); onNotify({ tone: 'success', text: 'تمت إضافة العامل إلى فريق العمل.' }); }} onNotify={onNotify} />}
     </>
   );
 }
 
-function WorkerCard({ worker, isManager, onClick }: { worker: Worker; isManager: boolean; onClick: () => void }) {
+function WorkerCard({ worker, canFinancial, onClick }: { worker: Worker; canFinancial: boolean; onClick: () => void }) {
   const count = worker.cars_washed ?? worker.washes_count ?? 0;
   const finance = worker.financials;
   return (
     <button className="worker-card glass-card" onClick={onClick}>
       <div className="worker-card__header"><div className="worker-avatar">{worker.name.slice(0, 1)}</div><div><h3>{worker.name}</h3><span>{worker.phone || 'بدون رقم اتصال'}</span></div><ChevronLeft size={18} /></div>
       <div className="worker-card__stats"><span><Car size={16} />{count} سيارة</span><span><Clock3 size={16} />{worker.latest_wash_at ? dateFormat(worker.latest_wash_at) : 'لا توجد عملية حديثة'}</span></div>
-      {isManager && finance && <div className="worker-card__finance"><span>الرصيد المستحق</span><strong>{money(finance.payable_balance)}</strong></div>}
-      {!isManager && <div className="worker-card__operational-note"><Activity size={16} /> عرض النشاط التشغيلي</div>}
+      {canFinancial && finance && <div className="worker-card__finance"><span>الرصيد المستحق</span><strong>{money(finance.payable_balance)}</strong></div>}
+      {!canFinancial && <div className="worker-card__operational-note"><Activity size={16} /> عرض النشاط التشغيلي</div>}
     </button>
   );
 }
 
-function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWrite, range, onClose, onChanged, onDeleted, onNotify }: { workerId: string; selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; range: DateRange; onClose: () => void; onChanged: () => void; onDeleted: () => void; onNotify: (message: ToastMessage) => void }) {
+function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWrite, canFinancial, range, onClose, onChanged, onDeleted, onNotify }: { workerId: string; selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; canFinancial: boolean; range: DateRange; onClose: () => void; onChanged: () => void; onDeleted: (workerId: string) => void; onNotify: (message: ToastMessage) => void }) {
   const [worker, setWorker] = useState<(Worker & { washes?: Wash[] }) | null>(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -1186,7 +1189,7 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
     const load = async () => {
       setLoading(true);
       try {
-        const result = await api.worker(workerId, true, selectedDate);
+        const result = await api.worker(workerId, canFinancial, selectedDate);
         if (mounted) setWorker(result);
       } catch (error) {
         onNotify({ tone: 'error', text: friendlyError(error) });
@@ -1195,7 +1198,7 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
     };
     void load();
     return () => { mounted = false; };
-  }, [workerId, selectedDate]);
+  }, [workerId, selectedDate, canFinancial]);
 
   const removeWash = async (wash: Wash) => {
     if (deletingWashIds.current.has(wash.id) || !window.confirm(`هل تريد حذف عملية ${wash.vehicle_make} ${wash.vehicle_model} من سجل العامل؟ سيتم عكس آثارها المالية بأمان.`)) return;
@@ -1203,8 +1206,7 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
     try {
       await api.voidWash(wash.id, 'حذف عملية الغسيل من ملف العامل');
       refreshDashboard();
-      setWorker((current) => current ? { ...current, washes: current.washes?.filter((item) => item.id !== wash.id), washes_count: Math.max(0, (current.washes_count ?? 1) - 1), cars_washed: Math.max(0, (current.cars_washed ?? 1) - 1) } : current);
-      const refreshed = await api.worker(workerId, true, selectedDate);
+      const refreshed = await api.worker(workerId, canFinancial, selectedDate);
       setWorker(refreshed);
       onNotify({ tone: 'success', text: 'تم حذف عملية الغسيل وتحديث إجماليات العامل.' });
     } catch (error) {
@@ -1218,21 +1220,20 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
   return (
     <SidePanel title="ملف العامل" onClose={onClose}>
       <div className="profile-heading"><div className="profile-heading__avatar">{worker.name.slice(0, 1)}</div><div><h2>{worker.name}</h2><span>{worker.phone || 'لا يوجد رقم اتصال'}</span></div></div>
-      {canWrite && <div className="profile-actions"><Button variant="secondary" onClick={() => setEditing(true)} icon={<Pencil size={16}/>}>تعديل العامل</Button>{worker.status!=='inactive'&&<Button variant="danger" onClick={async()=>{if(!window.confirm(`هل تريد تعطيل العامل ${worker.name}؟ سيبقى سجله المالي محفوظًا.`))return;try{await api.updateWorker(worker.id,{name:worker.name,phone:worker.phone,notes:worker.notes,status:'inactive',commission_percentage:worker.financials?.commission_percentage});onNotify({tone:'success',text:'تم تعطيل العامل مع الاحتفاظ بسجله التاريخي.'});onChanged();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}}} icon={<Trash2 size={16}/>}>تعطيل العامل</Button>}{isManager && <Button variant="danger" onClick={async()=>{if(!window.confirm(`هل تريد حذف الموظف ${worker.name}؟ سيتم إخفاؤه من قائمة الموظفين مع الاحتفاظ بكل عمليات الغسيل والمدفوعات والسجلات المالية.`))return;try{await api.deleteWorker(worker.id);onNotify({tone:'success',text:'تم حذف الموظف من القائمة مع الاحتفاظ بسجله التاريخي.'});onDeleted();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}}} icon={<Trash2 size={16}/>}>حذف الموظف</Button>}</div>}
+      {canWrite && <div className="profile-actions"><Button variant="secondary" onClick={() => setEditing(true)} icon={<Pencil size={16}/>}>تعديل العامل</Button>{isManager && <Button variant="danger" onClick={async()=>{if(!window.confirm(`هل تريد حذف العامل المحدد «${worker.name}»؟ سيتم حذفه من قائمة العمال مع الاحتفاظ بعمليات الغسيل والسجلات التاريخية المرتبطة به.`))return;try{await api.deleteWorker(worker.id);onNotify({tone:'success',text:`تم حذف العامل «${worker.name}» من قائمة العمال مع الاحتفاظ بسجله التاريخي.`});onDeleted(worker.id);}catch(error){onNotify({tone:'error',text:friendlyError(error)});}}} icon={<Trash2 size={16}/>}>حذف العامل</Button>}</div>}
       <div className="profile-period"><CalendarDays size={16} /> الفترة المعروضة: {dateFormat(range.from)} — {dateFormat(range.to)}</div>
-      <div className="profile-operational-metrics"><MetricCard label="السيارات المغسولة" value={worker.cars_washed ?? worker.washes_count ?? 0} icon={<Car size={18} />} /></div>
+      <div className="profile-operational-metrics"><MetricCard label="السيارات المغسولة" value={worker.cars_washed ?? worker.washes_count ?? 0} icon={<Car size={18} />} /><MetricCard label="إجمالي قيمة الغسيل" value={money(worker.total_wash_value)} icon={<Banknote size={18} />} tone="teal" /></div>
       {financials && (
         <section className="profile-financials">
           <div className="sensitive-label"><LockKeyhole size={14} /> معلومات مالية مخولة</div>
-          <div className="mini-metric-grid">
-            {financials && <><MiniMetric label="إجمالي العمولة" value={financials.gross_commission} /><MiniMetric label="الاستقطاعات" value={financials.deductions} tone="danger" /><MiniMetric label="صافي المستحق" value={financials.net_earnings} /><MiniMetric label="المدفوع" value={financials.amount_paid} tone="success" /><MiniMetric label="الرصيد المتبقي" value={financials.payable_balance} tone="warning" /></>}
-            <div className="mini-metric daily-value-metric"><span>القيمة اليومية</span><strong>{money(safeNumber(financials.gross_commission) * 0.5)}</strong><em>{dateFormat(selectedDate)}</em></div>
+          <div className="mini-metric-grid profile-commission-summary">
+            <MiniMetric label="إجمالي العمولة" value={financials.gross_commission} />
           </div>
         </section>
       )}
-      {isManager && <button type="button" className="worker-ledger-entry glass-card" onClick={() => setLedgerOpen(true)}><div className="worker-ledger-entry__icon"><WalletCards size={21} /></div><div><strong>المسحوبات والمرتجعات</strong><span>حركات يوم {workingDateFormat(selectedDate)} ورصيدها</span></div><ChevronLeft size={18} /></button>}
+      {isManager && <button type="button" className="worker-ledger-entry glass-card" onClick={() => setLedgerOpen(true)}><div className="worker-ledger-entry__icon"><WalletCards size={21} /></div><div><strong>المسحوبات والمرتجعات</strong><span>السجل الكامل والرصيد القائم للعامل</span></div><ChevronLeft size={18} /></button>}
       <section className="profile-history"><div className="profile-section-heading"><h3>سجل عمليات الغسيل</h3><span>{worker.washes?.length ?? 0} عملية</span></div>{worker.washes?.length ? <WashList washes={worker.washes} compact onDelete={canWrite ? (wash) => void removeWash(wash) : undefined} canDelete={(wash) => isManager || wash.created_by_id === currentUserId} /> : <EmptyState title="لا توجد عمليات ضمن هذه الفترة" />}</section>
-      {editing&&<EditWorkerModal worker={worker} onClose={()=>setEditing(false)} onSaved={()=>{setEditing(false);onChanged();onNotify({tone:'success',text:'تم تحديث بيانات العامل.'});}} onNotify={onNotify}/>}
+      {editing&&<EditWorkerModal worker={worker} canFinancial={canFinancial} onClose={()=>setEditing(false)} onSaved={()=>{setEditing(false);onChanged();onNotify({tone:'success',text:'تم تحديث بيانات العامل.'});}} onNotify={onNotify}/>}
       {ledgerOpen && <WorkerWithdrawalsReturnsView workerId={worker.id} workerName={worker.name} selectedDate={selectedDate} onClose={() => setLedgerOpen(false)} onNotify={onNotify} />}
     </SidePanel>
   );
@@ -1242,34 +1243,63 @@ function WorkerWithdrawalsReturnsView({ workerId, workerName, selectedDate, onCl
   const [ledger, setLedger] = useState<WorkerWithdrawalReturnLedger | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [entryType, setEntryType] = useState<'withdrawal' | 'return' | null>(null);
-  const load = async () => { setLoading(true); setError(null); try { setLedger(await api.workerWithdrawalReturns(workerId, { date: selectedDate })); } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); } };
+  const [entryType, setEntryType] = useState<'withdrawal' | 'return' | 'deduction_payment' | null>(null);
+  const [editingPayment, setEditingPayment] = useState<WorkerWithdrawalReturnLedger['transactions'][number] | null>(null);
+  const [settling, setSettling] = useState(false);
+  const [deletingMovementId, setDeletingMovementId] = useState<string | null>(null);
+  const load = async () => { setLoading(true); setError(null); try { setLedger(await api.workerWithdrawalReturns(workerId, { from: '0000-01-01T00:00:00Z', to: '9999-12-31T23:59:59Z' })); } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); } };
   useEffect(() => { void load(); }, [workerId, selectedDate]);
-  return <Modal title={`المسحوبات والمرتجعات — ${workerName}`} subtitle={`حركات يوم ${workingDateFormat(selectedDate)}؛ السجل مستقل ولا يؤثر على عمولات عمليات الغسيل.`} onClose={onClose} wide>
+  const settle = async () => {
+    if (!ledger || Number(ledger.outstanding_balance) <= 0 || !window.confirm(`هل تريد تصفية كامل الرصيد القائم للعامل ${workerName}؟ ستُحفظ التصفية كحركة مستقلة ولن تُحذف الحركات السابقة.`)) return;
+    setSettling(true);
+    try {
+      await api.settleWorkerWithdrawalReturns(workerId, new Date(`${selectedDate}T12:00:00`).toISOString());
+      await load();
+      onNotify({ tone: 'success', text: 'تمت تصفية المستقطعات وحفظ حركة التصفية في السجل.' });
+    } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); }
+    finally { setSettling(false); }
+  };
+  const removeMovement = async (movementId: string, movementLabel: string) => {
+    if (deletingMovementId || !window.confirm(`هل تريد حذف حركة ${movementLabel}؟ ستُعاد جميع الإجماليات من السجلات المتبقية.`)) return;
+    setDeletingMovementId(movementId);
+    try {
+      await api.deleteWorkerWithdrawalReturn(workerId, movementId);
+      await load();
+      onNotify({ tone: 'success', text: 'تم حذف الحركة وإعادة احتساب الرصيد من السجل المحفوظ.' });
+    } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); }
+    finally { setDeletingMovementId(null); }
+  };
+  return <Modal title={`المسحوبات والمرتجعات — ${workerName}`} subtitle="السجل الكامل للعامل؛ الحركات مستقلة ولا تؤثر على عمولات عمليات الغسيل." onClose={onClose} wide>
     {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : ledger && <>
-      <div className="mini-metric-grid worker-ledger-summary"><MiniMetric label="إجمالي المسحوبات" value={ledger.total_withdrawals} tone="danger" /><MiniMetric label="إجمالي المرتجعات" value={ledger.total_returns} tone="success" /><MiniMetric label="الرصيد القائم" value={ledger.outstanding_balance} tone="warning" /></div>
-      <div className="profile-actions"><Button onClick={() => setEntryType('withdrawal')} icon={<ArrowDownLeft size={17} />}>إضافة مسحوب</Button><Button variant="secondary" onClick={() => setEntryType('return')} icon={<ArrowUpLeft size={17} />}>إضافة مرتجع</Button></div>
+      <div className="mini-metric-grid worker-ledger-summary"><MiniMetric label="إجمالي المسحوبات" value={ledger.total_withdrawals} tone="danger" /><MiniMetric label="إجمالي الاستقطاعات" value={ledger.total_deductions} tone="danger" /><MiniMetric label="إجمالي المرتجعات" value={ledger.total_returns} tone="success" /><MiniMetric label="تسديدات الاستقطاع" value={ledger.total_deduction_payments} tone="success" /><MiniMetric label="إجمالي التسويات" value={ledger.total_settlements} /><MiniMetric label="الرصيد القائم" value={ledger.outstanding_balance} tone="warning" /></div>
+      <div className="profile-actions"><Button onClick={() => setEntryType('withdrawal')} icon={<ArrowDownLeft size={17} />}>إضافة مسحوب</Button><Button variant="secondary" onClick={() => setEntryType('return')} icon={<ArrowUpLeft size={17} />}>إضافة مرتجع</Button><Button variant="secondary" onClick={() => setEntryType('deduction_payment')} disabled={Number(ledger.outstanding_balance) <= 0} icon={<Banknote size={17} />}>تسديد استقطاع</Button><Button variant="secondary" onClick={() => void settle()} disabled={settling || Number(ledger.outstanding_balance) <= 0} icon={settling ? <LoaderCircle size={17} className="spin" /> : <CheckCircle2 size={17} />}>{settling ? 'جارٍ التصفية...' : 'تصفية المستقطعات'}</Button></div>
       <SectionCard title="سجل الحركات" subtitle={`${ledger.transactions.length} حركة مسجلة للعامل المحدد فقط.`}>
-        {ledger.transactions.length === 0 ? <EmptyState icon={<WalletCards size={27} />} title="لا توجد مسحوبات أو مرتجعات" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>النوع</th><th>المبلغ</th><th>التاريخ</th><th>الملاحظة</th><th>سجله</th></tr></thead><tbody>{ledger.transactions.map((transaction) => <tr key={transaction.id}><td><StatusBadge tone={transaction.type === 'withdrawal' ? 'danger' : 'success'}>{transaction.type === 'withdrawal' ? 'مسحوب' : 'مرتجع'}</StatusBadge></td><td className="money-cell">{money(transaction.amount)}</td><td>{dateFormat(transaction.occurred_at)}</td><td>{transaction.notes || '—'}</td><td>{transaction.created_by_name || '—'}</td></tr>)}</tbody></table></div>}
+        {ledger.transactions.length === 0 ? <EmptyState icon={<WalletCards size={27} />} title="لا توجد حركات مالية" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>النوع</th><th>المبلغ</th><th>التاريخ</th><th>الملاحظة</th><th>سجله</th><th>إجراء</th></tr></thead><tbody>{ledger.transactions.map((transaction) => {
+          const label = transaction.type === 'withdrawal' ? 'مسحوب' : transaction.type === 'deduction' ? 'استقطاع' : transaction.type === 'return' ? 'مرتجع' : transaction.type === 'deduction_payment' ? 'تسديد استقطاع' : 'تصفية';
+          const tone = transaction.type === 'withdrawal' || transaction.type === 'deduction' ? 'danger' : transaction.type === 'return' || transaction.type === 'deduction_payment' ? 'success' : 'info';
+          return <tr key={transaction.id}><td><StatusBadge tone={tone}>{label}</StatusBadge></td><td className="money-cell">{money(transaction.amount)}</td><td>{dateFormat(transaction.occurred_at)}</td><td>{transaction.notes || '—'}</td><td>{transaction.created_by_name || '—'}</td><td><div className="worker-ledger-row-actions">{transaction.editable && <button type="button" className="table-action worker-ledger-edit" onClick={() => setEditingPayment(transaction)} title="تعديل تسديد الاستقطاع" aria-label="تعديل تسديد الاستقطاع"><Pencil size={15} /></button>}{transaction.deletable ? <button type="button" className="table-action danger-action worker-ledger-delete" onClick={() => void removeMovement(transaction.id, label)} disabled={deletingMovementId === transaction.id} title={`حذف حركة ${label}`} aria-label={`حذف حركة ${label}`}>{deletingMovementId === transaction.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button> : <span className="table-muted" title="يُدار الاستقطاع من المصروف المرتبط">—</span>}</div></td></tr>;
+        })}</tbody></table></div>}
       </SectionCard>
     </>}
-    {entryType && <WorkerWithdrawalReturnModal type={entryType} workerId={workerId} onClose={() => setEntryType(null)} onSaved={() => { setEntryType(null); void load(); onNotify({ tone: 'success', text: entryType === 'withdrawal' ? 'تم تسجيل المسحوب وتحديث الرصيد القائم.' : 'تم تسجيل المرتجع وتحديث الرصيد القائم.' }); }} onNotify={onNotify} />}
+    {entryType && <WorkerWithdrawalReturnModal type={entryType} workerId={workerId} selectedDate={selectedDate} onClose={() => setEntryType(null)} onSaved={() => { setEntryType(null); void load(); onNotify({ tone: 'success', text: entryType === 'withdrawal' ? 'تم تسجيل المسحوب وتحديث الرصيد القائم.' : entryType === 'return' ? 'تم تسجيل المرتجع وتحديث الرصيد القائم.' : 'تم تسجيل تسديد الاستقطاع وتحديث الرصيد القائم.' }); }} onNotify={onNotify} />}
+    {editingPayment && <WorkerWithdrawalReturnModal type="deduction_payment" workerId={workerId} selectedDate={selectedDate} movement={editingPayment} onClose={() => setEditingPayment(null)} onSaved={() => { setEditingPayment(null); void load(); onNotify({ tone: 'success', text: 'تم تعديل تسديد الاستقطاع وإعادة احتساب الرصيد.' }); }} onNotify={onNotify} />}
   </Modal>;
 }
 
-function WorkerWithdrawalReturnModal({ type, workerId, onClose, onSaved, onNotify }: { type: 'withdrawal' | 'return'; workerId: string; onClose: () => void; onSaved: () => void; onNotify: (message: ToastMessage) => void }) {
-  const [amount, setAmount] = useState('');
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
-  const [notes, setNotes] = useState('');
+function WorkerWithdrawalReturnModal({ type, workerId, selectedDate, movement, onClose, onSaved, onNotify }: { type: 'withdrawal' | 'return' | 'deduction_payment'; workerId: string; selectedDate: string; movement?: WorkerWithdrawalReturnLedger['transactions'][number]; onClose: () => void; onSaved: () => void; onNotify: (message: ToastMessage) => void }) {
+  const [amount, setAmount] = useState(movement ? String(movement.amount) : '');
+  const [date, setDate] = useState(movement?.occurred_at.slice(0, 10) || selectedDate);
+  const [notes, setNotes] = useState(movement?.notes || '');
   const [saving, setSaving] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { await api.createWorkerWithdrawalReturn(workerId, { type, amount, occurred_at: new Date(`${date}T12:00:00`).toISOString(), notes: notes.trim() || null }); onSaved(); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
-  return <Modal title={type === 'withdrawal' ? 'إضافة مسحوب' : 'إضافة مرتجع'} onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المبلغ" required><input value={amount} onChange={(event) => setAmount(event.target.value)} type="number" min="0.001" step="0.001" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={date} onChange={(event) => setDate(event.target.value)} type="date" required /></FormField><FormField label="ملاحظة"><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'حفظ الحركة'}</Button></div></form></Modal>;
+  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { const data = { amount, occurred_at: new Date(`${date}T12:00:00`).toISOString(), notes: notes.trim() || null }; if (movement) await api.updateWorkerDeductionPayment(workerId, movement.id, data); else await api.createWorkerWithdrawalReturn(workerId, { type, ...data }); onSaved(); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
+  const title = movement ? 'تعديل تسديد استقطاع' : type === 'withdrawal' ? 'إضافة مسحوب' : type === 'return' ? 'إضافة مرتجع' : 'تسديد استقطاع';
+  return <Modal title={title} onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المبلغ" required><input value={amount} onChange={(event) => setAmount(event.target.value)} type="number" min="0.001" step="0.001" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={date} onChange={(event) => setDate(event.target.value)} type="date" required /></FormField><FormField label="ملاحظة"><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : movement ? 'حفظ التعديل' : 'حفظ الحركة'}</Button></div></form></Modal>;
 }
 
-function EditWorkerModal({worker,onClose,onSaved,onNotify}:{worker:Worker;onClose:()=>void;onSaved:()=>void;onNotify:(message:ToastMessage)=>void}){
+function EditWorkerModal({worker,canFinancial,onClose,onSaved,onNotify}:{worker:Worker;canFinancial:boolean;onClose:()=>void;onSaved:()=>void;onNotify:(message:ToastMessage)=>void}){
   const [form,setForm]=useState({name:worker.name,phone:worker.phone??'',notes:worker.notes??'',status:worker.status??'active',commission_percentage:String(worker.financials?.commission_percentage??'')});const[saving,setSaving]=useState(false);
   const submit=async(event:FormEvent)=>{event.preventDefault();setSaving(true);try{await api.updateWorker(worker.id,{...form,phone:form.phone.trim()||null,notes:form.notes.trim()||null,commission_percentage:form.commission_percentage||null});onSaved();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setSaving(false);}};
-  return <Modal title="تعديل بيانات العامل" onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="اسم العامل" required><input value={form.name} onChange={e=>setForm(c=>({...c,name:e.target.value}))} required/></FormField><FormField label="رقم الاتصال"><input value={form.phone} onChange={e=>setForm(c=>({...c,phone:e.target.value}))}/></FormField><FormField label="ملاحظات"><textarea value={form.notes} onChange={e=>setForm(c=>({...c,notes:e.target.value}))}/></FormField><div className="form-grid form-grid--two"><FormField label="الحالة"><select value={form.status} onChange={e=>setForm(c=>({...c,status:e.target.value}))}><option value="active">نشط</option><option value="inactive">غير نشط</option></select></FormField></div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>;
+  return <Modal title="تعديل بيانات العامل" onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="اسم العامل" required><input value={form.name} onChange={e=>setForm(c=>({...c,name:e.target.value}))} required/></FormField><FormField label="رقم الاتصال"><input value={form.phone} onChange={e=>setForm(c=>({...c,phone:e.target.value}))}/></FormField><FormField label="ملاحظات"><textarea value={form.notes} onChange={e=>setForm(c=>({...c,notes:e.target.value}))}/></FormField><div className="form-grid form-grid--two"><FormField label="الحالة"><select value={form.status} onChange={e=>setForm(c=>({...c,status:e.target.value}))}><option value="active">نشط</option><option value="inactive">غير نشط</option></select></FormField>{canFinancial&&<FormField label="نسبة العمولة الخاصة (%)" hint="اتركها فارغة لاستخدام النسبة الافتراضية."><input value={form.commission_percentage} onChange={e=>setForm(c=>({...c,commission_percentage:e.target.value}))} type="number" min="0" max="100" step="0.01" dir="ltr" /></FormField>}</div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>;
 }
 
 function MiniMetric({ label, value, tone = 'neutral' }: { label: string; value: number | string | undefined; tone?: 'neutral' | 'danger' | 'success' | 'warning' }) {
@@ -1595,7 +1625,7 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
   useEffect(() => { void load(); }, [month, selectedDate]);
 
   const removeWithdrawal = async (withdrawal: SalaryWithdrawal) => {
-    if (!window.confirm(`هل تريد حذف مسحوب الموظف «${withdrawal.worker_name}» بقيمة ${money(withdrawal.amount)}؟`)) return;
+    if (!window.confirm(`هل تريد حذف مسحوب الموظف «${withdrawal.employee_name}» بقيمة ${money(withdrawal.amount)}؟`)) return;
     try {
       await api.deleteSalaryWithdrawal(withdrawal.id);
       await load();
@@ -1606,7 +1636,7 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
   };
 
   const removeDeduction = async (deduction: SalaryDeduction) => {
-    if (!window.confirm(`هل تريد حذف خصم الموظف «${deduction.worker_name}» بقيمة ${money(deduction.amount)}؟`)) return;
+    if (!window.confirm(`هل تريد حذف خصم الموظف «${deduction.employee_name}» بقيمة ${money(deduction.amount)}؟`)) return;
     try {
       await api.deleteSalaryDeduction(deduction.id);
       await load();
@@ -1617,9 +1647,9 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
   };
 
   const removeEmployee = async (employee: PayrollEmployee) => {
-    if (!window.confirm(`هل تريد حذف الموظف «${employee.worker_name}» من قسم المرتبات؟ سيتم الاحتفاظ بكل عمليات الغسيل والمدفوعات والسجلات المالية التاريخية.`)) return;
+    if (!window.confirm(`هل تريد حذف الموظف «${employee.employee_name}» من قسم المرتبات؟ سيتم الاحتفاظ بكل سجلات المرتبات التاريخية.`)) return;
     try {
-      await api.deletePayrollEmployee(employee.worker_id);
+      await api.deletePayrollEmployee(employee.employee_id);
       await load();
       onNotify({ tone: 'success', text: 'تمت أرشفة الموظف من المرتبات مع الاحتفاظ بسجله التاريخي.' });
     } catch (requestError) {
@@ -1651,13 +1681,13 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
             <MetricCard label="إجمالي المتبقي" value={money(summary.total_remaining)} note="المرتب ناقص المسحوبات والخصومات" icon={<CircleDollarSign size={21} />} tone="teal" />
           </div>
           <SectionCard title="مرتبات الموظفين" subtitle="المرتب المحدد للشهر يستمر للأشهر التالية حتى تسجيل قيمة جديدة.">
-            {employees.length === 0 ? <EmptyState icon={<UsersRound size={28} />} title="لا يوجد موظفون مسجلون" /> : <div className="data-table-wrap"><table className="data-table payroll-table"><thead><tr><th>الموظف</th><th>المرتب</th><th>إجمالي المسحوبات</th><th>إجمالي الخصومات</th><th>المتبقي</th><th>إجراءات</th></tr></thead><tbody>{employees.map((employee) => <tr key={employee.worker_id}><td><strong>{employee.worker_name}</strong></td><td className="money-cell">{employee.salary_configured ? money(employee.salary) : <StatusBadge tone="warning">غير محدد</StatusBadge>}</td><td className="money-cell">{money(employee.total_withdrawals)}</td><td className="money-cell">{money(employee.total_deductions)}</td><td className={`money-cell ${safeNumber(employee.remaining_salary) < 0 ? 'salary-remaining--negative' : ''}`}>{money(employee.remaining_salary)}</td><td><div className="row-actions"><button onClick={() => setSalaryEmployee(employee)} aria-label={`تعديل مرتب ${employee.worker_name}`} title="تعديل المرتب"><Pencil size={15} /></button><button onClick={() => setWithdrawalEmployee(employee)} aria-label={`مسحوبات الموظف ${employee.worker_name}`} title="مسحوبات"><Plus size={15} /></button><button onClick={() => setDeductionEmployee(employee)} aria-label={`خصم للموظف ${employee.worker_name}`} title="خصم"><Minus size={15} /></button><button className="danger-action" onClick={() => void removeEmployee(employee)} aria-label={`حذف الموظف ${employee.worker_name}`} title="حذف الموظف"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+            {employees.length === 0 ? <EmptyState icon={<UsersRound size={28} />} title="لا يوجد موظفون مسجلون" /> : <div className="data-table-wrap"><table className="data-table payroll-table"><thead><tr><th>الموظف</th><th>المرتب</th><th>إجمالي المسحوبات</th><th>إجمالي الخصومات</th><th>المتبقي</th><th>إجراءات</th></tr></thead><tbody>{employees.map((employee) => <tr key={employee.employee_id}><td><strong>{employee.employee_name}</strong></td><td className="money-cell">{employee.salary_configured ? money(employee.salary) : <StatusBadge tone="warning">غير محدد</StatusBadge>}</td><td className="money-cell">{money(employee.total_withdrawals)}</td><td className="money-cell">{money(employee.total_deductions)}</td><td className={`money-cell ${safeNumber(employee.remaining_salary) < 0 ? 'salary-remaining--negative' : ''}`}>{money(employee.remaining_salary)}</td><td><div className="row-actions"><button onClick={() => setSalaryEmployee(employee)} aria-label={`تعديل مرتب ${employee.employee_name}`} title="تعديل المرتب"><Pencil size={15} /></button><button onClick={() => setWithdrawalEmployee(employee)} aria-label={`مسحوبات الموظف ${employee.employee_name}`} title="مسحوبات"><Plus size={15} /></button><button onClick={() => setDeductionEmployee(employee)} aria-label={`خصم للموظف ${employee.employee_name}`} title="خصم"><Minus size={15} /></button><button className="danger-action" onClick={() => void removeEmployee(employee)} aria-label={`حذف الموظف ${employee.employee_name}`} title="حذف الموظف"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
           </SectionCard>
           <SectionCard title="مسحوبات الموظف" subtitle={`سجل المسحوبات ليوم ${workingDateFormat(selectedDate)}.`} action={<Button onClick={() => setWithdrawalEmployee(employees[0] ?? null)} disabled={employees.length === 0} icon={<Plus size={17} />}>إضافة مسحوب</Button>}>
-            {withdrawals.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد مسحوبات في اليوم المحدد" description="سجّل أول مسحوب وسيُحتسب المتبقي تلقائيًا." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{withdrawals.map((withdrawal) => <tr key={withdrawal.id}><td>{dateFormat(withdrawal.withdrawn_at)}</td><td><strong>{withdrawal.worker_name}</strong></td><td className="money-cell">{money(withdrawal.amount)}</td><td>{withdrawal.notes || '—'}</td><td>{withdrawal.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingWithdrawal(withdrawal)} aria-label="تعديل المسحوب"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeWithdrawal(withdrawal)} aria-label="حذف المسحوب"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+            {withdrawals.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد مسحوبات في اليوم المحدد" description="سجّل أول مسحوب وسيُحتسب المتبقي تلقائيًا." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{withdrawals.map((withdrawal) => <tr key={withdrawal.id}><td>{dateFormat(withdrawal.withdrawn_at)}</td><td><strong>{withdrawal.employee_name}</strong></td><td className="money-cell">{money(withdrawal.amount)}</td><td>{withdrawal.notes || '—'}</td><td>{withdrawal.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingWithdrawal(withdrawal)} aria-label="تعديل المسحوب"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeWithdrawal(withdrawal)} aria-label="حذف المسحوب"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
           </SectionCard>
           <SectionCard title="سجل الخصومات" subtitle={`سجل الخصومات ليوم ${workingDateFormat(selectedDate)}.`}>
-            {deductions.length === 0 ? <EmptyState icon={<ReceiptText size={28} />} title="لا توجد خصومات في اليوم المحدد" description="استخدم زر خصم بجانب الموظف لتسجيل أول خصم." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>السبب / الملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{deductions.map((deduction) => <tr key={deduction.id}><td>{dateFormat(deduction.deducted_at)}</td><td><strong>{deduction.worker_name}</strong></td><td className="money-cell">{money(deduction.amount)}</td><td>{deduction.notes || '—'}</td><td>{deduction.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingDeduction(deduction)} aria-label="تعديل الخصم"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeDeduction(deduction)} aria-label="حذف الخصم"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+            {deductions.length === 0 ? <EmptyState icon={<ReceiptText size={28} />} title="لا توجد خصومات في اليوم المحدد" description="استخدم زر خصم بجانب الموظف لتسجيل أول خصم." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>السبب / الملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{deductions.map((deduction) => <tr key={deduction.id}><td>{dateFormat(deduction.deducted_at)}</td><td><strong>{deduction.employee_name}</strong></td><td className="money-cell">{money(deduction.amount)}</td><td>{deduction.notes || '—'}</td><td>{deduction.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingDeduction(deduction)} aria-label="تعديل الخصم"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeDeduction(deduction)} aria-label="حذف الخصم"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
           </SectionCard>
         </>
       )}
@@ -1694,23 +1724,23 @@ function SalaryModal({ employee, month, onClose, onSaved, onNotify }: { employee
     event.preventDefault();
     setSaving(true);
     try {
-      await api.setWorkerSalary(employee.worker_id, month, salary);
+      await api.setEmployeeSalary(employee.employee_id, month, salary);
       onSaved();
     } catch (requestError) {
       onNotify({ tone: 'error', text: friendlyError(requestError) });
     } finally { setSaving(false); }
   };
-  return <Modal title={`مرتب ${employee.worker_name}`} subtitle={`القيمة فعالة من شهر ${month} وتبقى للأشهر التالية حتى تغييرها.`} onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المرتب الشهري (د.ل)" required><input value={salary} onChange={(event) => setSalary(event.target.value)} type="number" min="0.001" step="0.001" required dir="ltr" autoFocus /></FormField><div className="inline-alert inline-alert--info"><History size={17} /> لن تتغير قيم المرتبات المحفوظة للأشهر السابقة.</div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'حفظ المرتب'}</Button></div></form></Modal>;
+  return <Modal title={`مرتب ${employee.employee_name}`} subtitle={`القيمة فعالة من شهر ${month} وتبقى للأشهر التالية حتى تغييرها.`} onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المرتب الشهري (د.ل)" required><input value={salary} onChange={(event) => setSalary(event.target.value)} type="number" min="0.001" step="0.001" required dir="ltr" autoFocus /></FormField><div className="inline-alert inline-alert--info"><History size={17} /> لن تتغير قيم المرتبات المحفوظة للأشهر السابقة.</div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'حفظ المرتب'}</Button></div></form></Modal>;
 }
 
 function SalaryWithdrawalModal({ employees, month, selectedEmployee, withdrawal, onClose, onSaved, onNotify }: { employees: PayrollEmployee[]; month: string; selectedEmployee?: PayrollEmployee; withdrawal?: SalaryWithdrawal; onClose: () => void; onSaved: () => void; onNotify: (message: ToastMessage) => void }) {
   const defaultDate = withdrawal?.withdrawn_at.slice(0, 10) ?? (month === monthInputValue() ? dateInputValue() : `${month}-01`);
-  const [form, setForm] = useState({ worker_id: withdrawal?.worker_id ?? selectedEmployee?.worker_id ?? '', amount: withdrawal ? String(withdrawal.amount) : '', withdrawn_at: defaultDate, notes: withdrawal?.notes ?? '' });
+  const [form, setForm] = useState({ employee_id: withdrawal?.employee_id ?? selectedEmployee?.employee_id ?? '', amount: withdrawal ? String(withdrawal.amount) : '', withdrawn_at: defaultDate, notes: withdrawal?.notes ?? '' });
   const [saving, setSaving] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
-    const payload = { worker_id: form.worker_id, amount: form.amount, withdrawn_at: `${form.withdrawn_at}T12:00:00Z`, notes: form.notes.trim() || null };
+    const payload = { employee_id: form.employee_id, amount: form.amount, withdrawn_at: `${form.withdrawn_at}T12:00:00Z`, notes: form.notes.trim() || null };
     try {
       if (withdrawal) await api.updateSalaryWithdrawal(withdrawal.id, payload);
       else await api.createSalaryWithdrawal(payload);
@@ -1719,17 +1749,17 @@ function SalaryWithdrawalModal({ employees, month, selectedEmployee, withdrawal,
       onNotify({ tone: 'error', text: friendlyError(requestError) });
     } finally { setSaving(false); }
   };
-  return <Modal title={withdrawal ? 'تعديل مسحوب موظف' : 'تسجيل مسحوب موظف'} subtitle="يُخصم المبلغ تلقائيًا من مرتب شهر تاريخ المسحوب." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الموظف" required><select value={form.worker_id} onChange={(event) => setForm((current) => ({ ...current, worker_id: event.target.value }))} required><option value="">اختر الموظف</option>{employees.map((employee) => <option key={employee.worker_id} value={employee.worker_id}>{employee.worker_name}</option>)}</select></FormField><div className="form-grid form-grid--two"><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.001" step="0.001" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={form.withdrawn_at} onChange={(event) => setForm((current) => ({ ...current, withdrawn_at: event.target.value }))} type="date" required dir="ltr" /></FormField></div><FormField label="ملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : withdrawal ? 'حفظ التعديل' : 'تسجيل المسحوب'}</Button></div></form></Modal>;
+  return <Modal title={withdrawal ? 'تعديل مسحوب موظف' : 'تسجيل مسحوب موظف'} subtitle="يُخصم المبلغ تلقائيًا من مرتب شهر تاريخ المسحوب." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الموظف" required><select value={form.employee_id} onChange={(event) => setForm((current) => ({ ...current, employee_id: event.target.value }))} required><option value="">اختر الموظف</option>{employees.map((employee) => <option key={employee.employee_id} value={employee.employee_id}>{employee.employee_name}</option>)}</select></FormField><div className="form-grid form-grid--two"><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.001" step="0.001" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={form.withdrawn_at} onChange={(event) => setForm((current) => ({ ...current, withdrawn_at: event.target.value }))} type="date" required dir="ltr" /></FormField></div><FormField label="ملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : withdrawal ? 'حفظ التعديل' : 'تسجيل المسحوب'}</Button></div></form></Modal>;
 }
 
 function SalaryDeductionModal({ employees, month, selectedEmployee, deduction, onClose, onSaved, onNotify }: { employees: PayrollEmployee[]; month: string; selectedEmployee?: PayrollEmployee; deduction?: SalaryDeduction; onClose: () => void; onSaved: () => void; onNotify: (message: ToastMessage) => void }) {
   const defaultDate = deduction?.deducted_at.slice(0, 10) ?? (month === monthInputValue() ? dateInputValue() : `${month}-01`);
-  const [form, setForm] = useState({ worker_id: deduction?.worker_id ?? selectedEmployee?.worker_id ?? '', amount: deduction ? String(deduction.amount) : '', deducted_at: defaultDate, notes: deduction?.notes ?? '' });
+  const [form, setForm] = useState({ employee_id: deduction?.employee_id ?? selectedEmployee?.employee_id ?? '', amount: deduction ? String(deduction.amount) : '', deducted_at: defaultDate, notes: deduction?.notes ?? '' });
   const [saving, setSaving] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
-    const payload = { worker_id: form.worker_id, amount: form.amount, deducted_at: `${form.deducted_at}T12:00:00Z`, notes: form.notes.trim() || null };
+    const payload = { employee_id: form.employee_id, amount: form.amount, deducted_at: `${form.deducted_at}T12:00:00Z`, notes: form.notes.trim() || null };
     try {
       if (deduction) await api.updateSalaryDeduction(deduction.id, payload);
       else await api.createSalaryDeduction(payload);
@@ -1738,7 +1768,7 @@ function SalaryDeductionModal({ employees, month, selectedEmployee, deduction, o
       onNotify({ tone: 'error', text: friendlyError(requestError) });
     } finally { setSaving(false); }
   };
-  return <Modal title={deduction ? 'تعديل خصم موظف' : `خصم من مرتب ${selectedEmployee?.worker_name ?? ''}`} subtitle="يُخصم المبلغ من مرتب شهر تاريخ الخصم، ويبقى منفصلًا عن المسحوبات." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الموظف" required><select value={form.worker_id} onChange={(event) => setForm((current) => ({ ...current, worker_id: event.target.value }))} required><option value="">اختر الموظف</option>{employees.map((employee) => <option key={employee.worker_id} value={employee.worker_id}>{employee.worker_name}</option>)}</select></FormField><div className="form-grid form-grid--two"><FormField label="مبلغ الخصم (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.001" step="0.001" required dir="ltr" autoFocus /></FormField><FormField label="التاريخ" required><input value={form.deducted_at} onChange={(event) => setForm((current) => ({ ...current, deducted_at: event.target.value }))} type="date" required dir="ltr" /></FormField></div><FormField label="السبب أو الملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><div className="inline-alert inline-alert--info"><History size={17} /> سيُحتسب المتبقي تلقائيًا: المرتب ناقص المسحوبات والخصومات.</div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : deduction ? 'حفظ التعديل' : 'حفظ الخصم'}</Button></div></form></Modal>;
+  return <Modal title={deduction ? 'تعديل خصم موظف' : `خصم من مرتب ${selectedEmployee?.employee_name ?? ''}`} subtitle="يُخصم المبلغ من مرتب شهر تاريخ الخصم، ويبقى منفصلًا عن المسحوبات." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الموظف" required><select value={form.employee_id} onChange={(event) => setForm((current) => ({ ...current, employee_id: event.target.value }))} required><option value="">اختر الموظف</option>{employees.map((employee) => <option key={employee.employee_id} value={employee.employee_id}>{employee.employee_name}</option>)}</select></FormField><div className="form-grid form-grid--two"><FormField label="مبلغ الخصم (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.001" step="0.001" required dir="ltr" autoFocus /></FormField><FormField label="التاريخ" required><input value={form.deducted_at} onChange={(event) => setForm((current) => ({ ...current, deducted_at: event.target.value }))} type="date" required dir="ltr" /></FormField></div><FormField label="السبب أو الملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><div className="inline-alert inline-alert--info"><History size={17} /> سيُحتسب المتبقي تلقائيًا: المرتب ناقص المسحوبات والخصومات.</div><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : deduction ? 'حفظ التعديل' : 'حفظ الخصم'}</Button></div></form></Modal>;
 }
 
 function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotify: (message: ToastMessage) => void }) {

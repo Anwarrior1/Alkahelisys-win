@@ -41,6 +41,7 @@ export interface Worker {
   status?: 'active' | 'inactive' | string;
   washes_count?: number;
   cars_washed?: number;
+  total_wash_value?: Money;
   latest_wash_at?: string | null;
   financials?: WorkerFinancials;
   daily_value?: Money;
@@ -94,6 +95,7 @@ export interface Wash {
   vehicle_make: string;
   vehicle_model: string;
   car_color?: string | null;
+  wash_type?: string | null;
   manufacturing_year?: number | null;
   license_plate?: string | null;
   price?: Money;
@@ -179,25 +181,30 @@ export interface PaymentRecord {
 
 export interface WorkerWithdrawalReturnTransaction {
   id: string;
-  type: 'withdrawal' | 'return';
+  type: 'withdrawal' | 'deduction' | 'return' | 'deduction_payment' | 'settlement';
   amount: Money;
   occurred_at: string;
   notes?: string | null;
   created_by_name?: string;
+  editable?: boolean;
+  deletable?: boolean;
 }
 
 export interface WorkerWithdrawalReturnLedger {
   worker_id: string;
   worker_name: string;
   total_withdrawals: Money;
+  total_deductions: Money;
   total_returns: Money;
+  total_deduction_payments: Money;
+  total_settlements: Money;
   outstanding_balance: Money;
   transactions: WorkerWithdrawalReturnTransaction[];
 }
 
 export interface PayrollEmployee {
-  worker_id: string;
-  worker_name: string;
+  employee_id: string;
+  employee_name: string;
   is_active: boolean;
   salary: Money;
   total_withdrawals: Money;
@@ -208,8 +215,8 @@ export interface PayrollEmployee {
 
 export interface SalaryDeduction {
   id: string;
-  worker_id: string;
-  worker_name: string;
+  employee_id: string;
+  employee_name: string;
   amount: Money;
   deducted_at: string;
   notes?: string | null;
@@ -220,8 +227,8 @@ export interface SalaryDeduction {
 
 export interface SalaryWithdrawal {
   id: string;
-  worker_id: string;
-  worker_name: string;
+  employee_id: string;
+  employee_name: string;
   amount: Money;
   withdrawn_at: string;
   notes?: string | null;

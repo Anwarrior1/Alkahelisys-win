@@ -165,6 +165,7 @@ impl Database {
                 manufacture_year INTEGER,
                 license_plate TEXT,
                 car_color TEXT,
+                wash_type TEXT,
                 price_milli INTEGER NOT NULL CHECK(price_milli > 0),
                 worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
                 payment_type TEXT NOT NULL CHECK(payment_type IN ('cash','showroom')),
@@ -210,7 +211,6 @@ impl Database {
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(worker_id, effective_month)
              );
-             CREATE INDEX IF NOT EXISTS idx_worker_salary_rates_month ON worker_salary_rates(effective_month, worker_id);
              CREATE TABLE IF NOT EXISTS salary_withdrawals (
                 id TEXT PRIMARY KEY,
                 worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
@@ -222,7 +222,6 @@ impl Database {
                 updated_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
                 updated_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_salary_withdrawals_worker_month ON salary_withdrawals(worker_id, withdrawn_at);
              CREATE TABLE IF NOT EXISTS showroom_payments (
                 id TEXT PRIMARY KEY,
                 showroom_id TEXT NOT NULL REFERENCES showrooms(id) ON DELETE RESTRICT,
@@ -408,8 +407,7 @@ impl Database {
                 notes TEXT,
                 created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
                 created_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_salary_deductions_worker_month ON salary_deductions(worker_id, deduction_month);"
+             );"
         )?;
         self.ensure_column("salary_deductions", "deducted_at", "deducted_at TEXT")?;
         self.ensure_column(
@@ -462,12 +460,14 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS worker_withdrawal_returns (
                 id TEXT PRIMARY KEY,
                 worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
-                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('withdrawal','return')),
+                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('withdrawal','return','deduction_payment','settlement')),
                 amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
                 occurred_at TEXT NOT NULL,
                 notes TEXT,
                 created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                deleted_at TEXT,
+                deleted_by TEXT REFERENCES users(id) ON DELETE SET NULL
              );
              CREATE INDEX IF NOT EXISTS idx_worker_withdrawal_returns_worker ON worker_withdrawal_returns(worker_id, occurred_at DESC);"
         )?;
@@ -553,6 +553,233 @@ impl Database {
                 [now()],
             )?;
             tx.commit()?;
+        }
+        let worker_movement_settlements_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=15",
+            [],
+            |row| row.get(0),
+        )?;
+        if worker_movement_settlements_added == 0 {
+            let movement_schema: String = self.conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='worker_withdrawal_returns'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.transaction()?;
+            if !movement_schema.contains("'settlement'") || !movement_schema.contains("deleted_at") {
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS idx_worker_withdrawal_returns_worker;
+                     ALTER TABLE worker_withdrawal_returns RENAME TO worker_withdrawal_returns_legacy;
+                     CREATE TABLE worker_withdrawal_returns (
+                        id TEXT PRIMARY KEY,
+                        worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                        transaction_type TEXT NOT NULL CHECK(transaction_type IN ('withdrawal','return','settlement')),
+                        amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
+                        occurred_at TEXT NOT NULL,
+                        notes TEXT,
+                        created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                        created_at TEXT NOT NULL,
+                        deleted_at TEXT,
+                        deleted_by TEXT REFERENCES users(id) ON DELETE SET NULL
+                     );
+                     INSERT INTO worker_withdrawal_returns(
+                        id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at,deleted_at,deleted_by
+                     )
+                     SELECT id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at,NULL,NULL
+                     FROM worker_withdrawal_returns_legacy;
+                     DROP TABLE worker_withdrawal_returns_legacy;",
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_worker_withdrawal_returns_worker
+                 ON worker_withdrawal_returns(worker_id, occurred_at DESC);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
+        }
+        let worker_deduction_payments_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=16",
+            [],
+            |row| row.get(0),
+        )?;
+        if worker_deduction_payments_added == 0 {
+            let movement_schema: String = self.conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='worker_withdrawal_returns'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tx = self.conn.transaction()?;
+            if !movement_schema.contains("'deduction_payment'") {
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS idx_worker_withdrawal_returns_worker;
+                     ALTER TABLE worker_withdrawal_returns RENAME TO worker_withdrawal_returns_legacy;
+                     CREATE TABLE worker_withdrawal_returns (
+                        id TEXT PRIMARY KEY,
+                        worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                        transaction_type TEXT NOT NULL CHECK(transaction_type IN ('withdrawal','return','deduction_payment','settlement')),
+                        amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
+                        occurred_at TEXT NOT NULL,
+                        notes TEXT,
+                        created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                        created_at TEXT NOT NULL,
+                        deleted_at TEXT,
+                        deleted_by TEXT REFERENCES users(id) ON DELETE SET NULL
+                     );
+                     INSERT INTO worker_withdrawal_returns(
+                        id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at,deleted_at,deleted_by
+                     )
+                     SELECT id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at,deleted_at,deleted_by
+                     FROM worker_withdrawal_returns_legacy;
+                     DROP TABLE worker_withdrawal_returns_legacy;",
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_worker_withdrawal_returns_worker
+                 ON worker_withdrawal_returns(worker_id, occurred_at DESC);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
+        }
+        let payroll_employees_separated: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=17",
+            [],
+            |row| row.get(0),
+        )?;
+        if payroll_employees_separated == 0 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE payroll_employees (
+                    id TEXT PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT,
+                    archived_by TEXT REFERENCES users(id) ON DELETE SET NULL
+                 );
+                 INSERT INTO payroll_employees(id,full_name,is_active,created_at,updated_at,archived_at,archived_by)
+                 SELECT 'payroll-' || worker.id,worker.full_name,worker.is_active,worker.created_at,worker.updated_at,
+                        CASE WHEN worker.is_active=0 THEN worker.deactivated_at ELSE NULL END,
+                        CASE WHEN worker.is_active=0 THEN worker.deactivated_by ELSE NULL END
+                 FROM workers worker
+                 WHERE EXISTS(SELECT 1 FROM worker_salary_rates rate WHERE rate.worker_id=worker.id)
+                    OR EXISTS(SELECT 1 FROM salary_withdrawals withdrawal WHERE withdrawal.worker_id=worker.id)
+                    OR EXISTS(SELECT 1 FROM salary_deductions deduction WHERE deduction.worker_id=worker.id);
+
+                 DROP INDEX IF EXISTS idx_worker_salary_rates_month;
+                 ALTER TABLE worker_salary_rates RENAME TO worker_salary_rates_legacy;
+                 CREATE TABLE payroll_salary_rates (
+                    employee_id TEXT NOT NULL REFERENCES payroll_employees(id) ON DELETE RESTRICT,
+                    effective_month TEXT NOT NULL CHECK(length(effective_month) = 7),
+                    salary_milli INTEGER NOT NULL CHECK(salary_milli > 0),
+                    set_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(employee_id, effective_month)
+                 );
+                 INSERT INTO payroll_salary_rates(employee_id,effective_month,salary_milli,set_by,created_at,updated_at)
+                 SELECT 'payroll-' || worker_id,effective_month,salary_milli,set_by,created_at,updated_at
+                 FROM worker_salary_rates_legacy;
+                 DROP TABLE worker_salary_rates_legacy;
+                 CREATE INDEX idx_payroll_salary_rates_month
+                 ON payroll_salary_rates(effective_month, employee_id);
+
+                 DROP INDEX IF EXISTS idx_salary_withdrawals_worker_month;
+                 ALTER TABLE salary_withdrawals RENAME TO salary_withdrawals_legacy;
+                 CREATE TABLE salary_withdrawals (
+                    id TEXT PRIMARY KEY,
+                    employee_id TEXT NOT NULL REFERENCES payroll_employees(id) ON DELETE RESTRICT,
+                    amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
+                    withdrawn_at TEXT NOT NULL,
+                    notes TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    created_at TEXT NOT NULL,
+                    updated_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO salary_withdrawals(id,employee_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_by,updated_at)
+                 SELECT id,'payroll-' || worker_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_by,updated_at
+                 FROM salary_withdrawals_legacy;
+                 DROP TABLE salary_withdrawals_legacy;
+                 CREATE INDEX idx_salary_withdrawals_employee_month
+                 ON salary_withdrawals(employee_id, withdrawn_at);
+
+                 DROP INDEX IF EXISTS idx_salary_deductions_worker_month;
+                 ALTER TABLE salary_deductions RENAME TO salary_deductions_legacy;
+                 CREATE TABLE salary_deductions (
+                    id TEXT PRIMARY KEY,
+                    employee_id TEXT NOT NULL REFERENCES payroll_employees(id) ON DELETE RESTRICT,
+                    amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
+                    deduction_month TEXT NOT NULL CHECK(length(deduction_month) = 7),
+                    notes TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    created_at TEXT NOT NULL,
+                    deducted_at TEXT NOT NULL,
+                    updated_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO salary_deductions(id,employee_id,amount_milli,deduction_month,notes,created_by,created_at,deducted_at,updated_by,updated_at)
+                 SELECT id,'payroll-' || worker_id,amount_milli,deduction_month,notes,created_by,created_at,deducted_at,updated_by,updated_at
+                 FROM salary_deductions_legacy;
+                 DROP TABLE salary_deductions_legacy;
+                 CREATE INDEX idx_salary_deductions_employee_month
+                 ON salary_deductions(employee_id, deduction_month);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
+        }
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS worker_salary_rates;")?;
+        let payroll_employee_ids_separated: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=18",
+            [],
+            |row| row.get(0),
+        )?;
+        if payroll_employee_ids_separated == 0 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "INSERT INTO payroll_employees(id,full_name,is_active,created_at,updated_at,archived_at,archived_by)
+                 SELECT 'payroll-' || employee.id,employee.full_name,employee.is_active,employee.created_at,employee.updated_at,employee.archived_at,employee.archived_by
+                 FROM payroll_employees employee
+                 WHERE EXISTS(SELECT 1 FROM workers worker WHERE worker.id=employee.id);
+                 UPDATE payroll_salary_rates
+                 SET employee_id='payroll-' || employee_id
+                 WHERE EXISTS(SELECT 1 FROM workers worker WHERE worker.id=payroll_salary_rates.employee_id);
+                 UPDATE salary_withdrawals
+                 SET employee_id='payroll-' || employee_id
+                 WHERE EXISTS(SELECT 1 FROM workers worker WHERE worker.id=salary_withdrawals.employee_id);
+                 UPDATE salary_deductions
+                 SET employee_id='payroll-' || employee_id
+                 WHERE EXISTS(SELECT 1 FROM workers worker WHERE worker.id=salary_deductions.employee_id);
+                 DELETE FROM payroll_employees
+                 WHERE EXISTS(SELECT 1 FROM workers worker WHERE worker.id=payroll_employees.id);",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(18, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
+        }
+        let wash_type_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=19",
+            [],
+            |row| row.get(0),
+        )?;
+        if wash_type_added == 0 {
+            self.ensure_column("wash_operations", "wash_type", "wash_type TEXT")?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(19, ?1)",
+                [now()],
+            )?;
         }
         Ok(())
     }
@@ -701,7 +928,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migration_removes_user_worker_link_without_touching_workers() {
+    fn migrations_preserve_workers_and_separate_legacy_payroll_records() {
         let data_dir = std::env::temp_dir()
             .join("alkaheli-user-worker-migration-tests")
             .join(Uuid::new_v4().to_string());
@@ -731,10 +958,62 @@ mod tests {
                 updated_at TEXT NOT NULL
              );
              CREATE INDEX idx_users_worker ON users(worker_id);
+             CREATE TABLE worker_withdrawal_returns (
+                id TEXT PRIMARY KEY,
+                worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                transaction_type TEXT NOT NULL CHECK(transaction_type IN ('withdrawal','return')),
+                amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
+                occurred_at TEXT NOT NULL,
+                notes TEXT,
+                created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL
+             );
+             CREATE INDEX idx_worker_withdrawal_returns_worker
+             ON worker_withdrawal_returns(worker_id, occurred_at DESC);
+             CREATE TABLE worker_salary_rates (
+                worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                effective_month TEXT NOT NULL,
+                salary_milli INTEGER NOT NULL,
+                set_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(worker_id,effective_month)
+             );
+             CREATE TABLE salary_withdrawals (
+                id TEXT PRIMARY KEY,
+                worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                amount_milli INTEGER NOT NULL,
+                withdrawn_at TEXT NOT NULL,
+                notes TEXT,
+                created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                updated_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE salary_deductions (
+                id TEXT PRIMARY KEY,
+                worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                amount_milli INTEGER NOT NULL,
+                deduction_month TEXT NOT NULL,
+                notes TEXT,
+                created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                deducted_at TEXT NOT NULL,
+                updated_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
+                updated_at TEXT NOT NULL
+             );
              INSERT INTO workers(id,full_name,is_active,created_at,updated_at)
              VALUES('worker-existing','عامل محفوظ',1,'2026-08-01','2026-08-01');
              INSERT INTO users(id,full_name,username_norm,password_hash,is_active,worker_id,created_at,updated_at)
-             VALUES('user-existing','مستخدم محفوظ','existing.user','hash',1,'worker-existing','2026-08-01','2026-08-01');",
+             VALUES('user-existing','مستخدم محفوظ','existing.user','hash',1,'worker-existing','2026-08-01','2026-08-01');
+             INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
+             VALUES('movement-existing','worker-existing','withdrawal',500000,'2026-08-10T12:00:00Z','سجل محفوظ','user-existing','2026-08-10T12:00:00Z');
+             INSERT INTO worker_salary_rates(worker_id,effective_month,salary_milli,set_by,created_at,updated_at)
+             VALUES('worker-existing','2026-08',1000000,'user-existing','2026-08-01','2026-08-01');
+             INSERT INTO salary_withdrawals(id,worker_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_at)
+             VALUES('salary-withdrawal-existing','worker-existing',100000,'2026-08-15T12:00:00Z','مسحوب محفوظ','user-existing','2026-08-15','2026-08-15');
+             INSERT INTO salary_deductions(id,worker_id,amount_milli,deduction_month,notes,created_by,created_at,deducted_at,updated_at)
+             VALUES('salary-deduction-existing','worker-existing',50000,'2026-08','خصم محفوظ','user-existing','2026-08-16','2026-08-16T12:00:00Z','2026-08-16');",
         ).unwrap();
         drop(connection);
 
@@ -760,6 +1039,86 @@ mod tests {
                 .any(|column| column == "worker_id")
         };
         assert!(!has_worker_id);
+        let preserved_movement: (String, i64, Option<String>) = database
+            .conn
+            .query_row(
+                "SELECT transaction_type,amount_milli,deleted_at FROM worker_withdrawal_returns WHERE id='movement-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_movement, ("withdrawal".to_owned(), 500_000, None));
+        database.conn.execute(
+            "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
+             VALUES('movement-settlement','worker-existing','settlement',500000,'2026-08-11T12:00:00Z','تصفية','user-existing','2026-08-11T12:00:00Z')",
+            [],
+        ).unwrap();
+        database.conn.execute(
+            "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
+             VALUES('movement-deduction-payment','worker-existing','deduction_payment',100000,'2026-08-12T12:00:00Z','تسديد','user-existing','2026-08-12T12:00:00Z')",
+            [],
+        ).unwrap();
+        let migration_16: i64 = database.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=16",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migration_16, 1);
+        let migrated_employee: (String, String, i64) = database.conn.query_row(
+            "SELECT id,full_name,is_active FROM payroll_employees WHERE id='payroll-worker-existing'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(migrated_employee, ("payroll-worker-existing".to_owned(), "عامل محفوظ".to_owned(), 1));
+        let migrated_salary: i64 = database.conn.query_row(
+            "SELECT salary_milli FROM payroll_salary_rates WHERE employee_id='payroll-worker-existing' AND effective_month='2026-08'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrated_salary, 1_000_000);
+        let migrated_withdrawal: i64 = database.conn.query_row(
+            "SELECT amount_milli FROM salary_withdrawals WHERE employee_id='payroll-worker-existing'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrated_withdrawal, 100_000);
+        let migrated_deduction: i64 = database.conn.query_row(
+            "SELECT amount_milli FROM salary_deductions WHERE employee_id='payroll-worker-existing'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrated_deduction, 50_000);
+        let legacy_salary_table: i64 = database.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='worker_salary_rates'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(legacy_salary_table, 0);
+        let migration_17: i64 = database.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=17",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migration_17, 1);
+        let migration_18: i64 = database.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=18",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migration_18, 1);
+        let migration_19: i64 = database.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=19",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migration_19, 1);
+        let has_wash_type: bool = {
+            let mut statement = database.conn.prepare("PRAGMA table_info(wash_operations)").unwrap();
+            statement.query_map([], |row| row.get::<_, String>(1)).unwrap()
+                .collect::<Result<Vec<_>, _>>().unwrap()
+                .iter().any(|column| column == "wash_type")
+        };
+        assert!(has_wash_type);
         drop(database);
         fs::remove_dir_all(data_dir).unwrap();
     }

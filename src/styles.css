@@ -480,6 +480,7 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
 .dashboard-lower-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(310px, .85fr); gap: 17px; margin-top: 17px; }
 .wash-list { display: grid; }
 .wash-row { display: grid; grid-template-columns: minmax(180px, 1.4fr) minmax(108px, .75fr) minmax(138px, .8fr) auto auto; align-items: center; gap: 10px; padding: 12px 2px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.wash-list--with-type .wash-row { grid-template-columns: minmax(180px, 1.3fr) minmax(110px, .7fr) minmax(108px, .7fr) minmax(138px, .8fr) auto auto; }
 .wash-row:last-child { border-bottom: 0; }
 .wash-row__car { display: flex; align-items: center; min-width: 0; gap: 8px; }
 .wash-row__car > div { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 auto; color: var(--blue); border-radius: 10px; background: var(--blue-soft); }
@@ -490,6 +491,9 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
 .wash-row__worker svg, .wash-row__date svg { color: var(--blue); }
 .wash-row__worker > span { display: grid; gap: 2px; min-width: 0; }
 .wash-row__worker small { color: var(--muted); font-size: 11px; }
+.wash-row__type { display: grid; min-width: 0; gap: 3px; }
+.wash-row__type small { color: var(--muted); font-size: 11px; }
+.wash-row__type strong { overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .wash-row__statuses { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
 .payment-pill { width: fit-content; padding: 4px 7px; border-radius: 999px; font-size: 12px; font-weight: 800; white-space: nowrap; }
 .payment-pill--cash { color: var(--success); background: rgba(24, 130, 101, .1); }
@@ -594,7 +598,7 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
 .showroom-debt-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .showroom-debt-table { min-width: 720px; }
 .showroom-debt-print { display: none; }
-.profile-operational-metrics { margin-top: 15px; }
+.profile-operational-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 15px; }
 .profile-operational-metrics .metric-card { min-height: auto; }
 .worker-ledger-entry { display: flex; align-items: center; width: 100%; gap: 11px; margin-top: 18px; padding: 14px; color: var(--text); text-align: right; }
 .worker-ledger-entry:hover { border-color: var(--border-strong); background: var(--surface-hover); }
@@ -613,9 +617,14 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
   gap: 10px;
   margin: 0 0 24px;
 }
+.worker-ledger-delete { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; color: var(--danger); border-radius: 8px; }
+.worker-ledger-delete:disabled { opacity: .55; cursor: wait; }
+.worker-ledger-row-actions { display: flex; align-items: center; gap: 4px; }
+.worker-ledger-edit { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border-radius: 8px; }
 .profile-financials { margin-top: 20px; padding: 14px; border: 1px solid rgba(55, 139, 222, .22); border-radius: 15px; background: linear-gradient(135deg, rgba(60, 145, 227, .1), transparent); }
 .sensitive-label { display: flex; align-items: center; gap: 6px; margin-bottom: 11px; color: var(--blue); font-size: 12px; font-weight: 900; }
 .mini-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.profile-commission-summary { grid-template-columns: minmax(0, 1fr); }
 .mini-metric { display: grid; gap: 5px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .mini-metric span { color: var(--muted); font-size: 11px; }
 .mini-metric strong { font-size: 14px; white-space: nowrap; }
@@ -823,6 +832,7 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
   .backup-hero > div:nth-child(2) { min-width: min(250px, calc(100% - 70px)); }
   .backup-hero .button { width: 100%; }
   .wash-row { grid-template-columns: minmax(150px, 1fr) auto auto; }
+  .wash-list--with-type .wash-row { grid-template-columns: minmax(150px, 1fr) minmax(105px, .7fr) auto auto; }
   .wash-row__worker, .wash-row__date { display: none; }
   .wash-list--compact .wash-row { grid-template-columns: minmax(150px, 1fr) auto auto; }
 }
@@ -835,7 +845,7 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
   .auth-card__heading { margin-bottom: 23px; }
   .auth-card__heading h2 { font-size: 24px; }
   .auth-form { gap: 16px; }
-  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .worker-ledger-summary, .paid-cars-summary { grid-template-columns: 1fr; }
+  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .profile-operational-metrics, .worker-ledger-summary, .paid-cars-summary { grid-template-columns: 1fr; }
   .section-card { padding: 16px; border-radius: 19px; }
   .metric-card { min-height: 106px; padding: 14px; }
   .metric-card__icon { width: 35px; height: 35px; }

@@ -149,6 +149,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/workers/:id/withdrawals-returns",
             get(worker_withdrawal_returns).post(create_worker_withdrawal_return),
         )
+        .route(
+            "/api/workers/:id/withdrawals-returns/settle",
+            post(settle_worker_withdrawal_returns),
+        )
+        .route(
+            "/api/workers/:worker_id/withdrawals-returns/:movement_id",
+            patch(update_worker_deduction_payment).delete(delete_worker_withdrawal_return),
+        )
         .route("/api/showrooms", get(list_showrooms).post(create_showroom))
         .route(
             "/api/showrooms/:id",
@@ -162,8 +170,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/showroom-debts/:id", get(showroom_debt_detail))
         .route("/api/payroll", get(payroll_summary))
         .route("/api/payroll/employees", post(create_payroll_employee))
-        .route("/api/payroll/workers/:id/salary", put(set_worker_salary))
-        .route("/api/payroll/workers/:id", delete(delete_payroll_employee))
+        .route(
+            "/api/payroll/employees/:id/salary",
+            put(set_employee_salary),
+        )
+        .route(
+            "/api/payroll/employees/:id",
+            delete(delete_payroll_employee),
+        )
         .route(
             "/api/payroll/withdrawals",
             get(list_salary_withdrawals).post(create_salary_withdrawal),
@@ -943,6 +957,7 @@ struct WashInput {
     manufacture_year: Option<i32>,
     license_plate: Option<String>,
     car_color: Option<String>,
+    wash_type: Option<String>,
     price: String,
     worker_id: String,
     payment_type: String,
@@ -980,7 +995,7 @@ async fn list_washes(
         let mut statement = db.conn.prepare(
             "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,w.occurred_at,w.payment_type,w.status,
                     worker.id,worker.full_name,showroom.id,showroom.name,w.commission_bps,w.commission_milli,w.business_share_milli,w.showroom_payment_method,
-                    EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id),w.is_paid,w.paid_at
+                    EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id),w.is_paid,w.paid_at,w.wash_type
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
              WHERE w.status='posted' AND w.is_paid=0 AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
         ).map_err(ApiError::internal)?;
@@ -999,6 +1014,7 @@ async fn list_washes(
             }
             item["isPaid"] = json!(row.get::<_, i64>(19)? == 1);
             item["paidAt"] = json!(row.get::<_, Option<String>>(20)?);
+            item["washType"] = json!(row.get::<_, Option<String>>(21)?);
             Ok(item)
         }).map_err(ApiError::internal)?;
         for row in rows {
@@ -1009,7 +1025,7 @@ async fn list_washes(
         let owner_id = principal.id.clone();
         let mut statement = db.conn.prepare(
             "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,w.occurred_at,w.payment_type,w.status,
-                    worker.id,worker.full_name,showroom.id,showroom.name,w.showroom_payment_method,w.is_paid,w.paid_at
+                    worker.id,worker.full_name,showroom.id,showroom.name,w.showroom_payment_method,w.is_paid,w.paid_at,w.wash_type
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
              WHERE w.status='posted' AND w.is_paid=0 AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
         ).map_err(ApiError::internal)?;
@@ -1021,7 +1037,8 @@ async fn list_washes(
             "showroom": row.get::<_, Option<String>>(12)?.map(|id| json!({"id": id, "name": row.get::<_, Option<String>>(13).ok().flatten()})),
             "showroomPaymentMethod": row.get::<_, Option<String>>(14)?,
             "isPaid": row.get::<_, i64>(15)? == 1,
-            "paidAt": row.get::<_, Option<String>>(16)?
+            "paidAt": row.get::<_, Option<String>>(16)?,
+            "washType": row.get::<_, Option<String>>(17)?
         }))).map_err(ApiError::internal)?;
         for row in rows {
             washes.push(row.map_err(ApiError::internal)?);
@@ -1048,7 +1065,7 @@ async fn list_paid_cars(
         "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,
                 w.occurred_at,w.payment_type,w.status,worker.id,worker.full_name,showroom.id,showroom.name,
                 w.commission_bps,w.commission_milli,w.business_share_milli,w.showroom_payment_method,w.paid_at,
-                creator.id,creator.full_name
+                creator.id,creator.full_name,w.wash_type
          FROM wash_operations w
          JOIN workers worker ON worker.id=w.worker_id
          LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
@@ -1070,6 +1087,7 @@ async fn list_paid_cars(
                 "showroomPaymentMethod":row.get::<_,Option<String>>(17)?,"isPaid":true,"paidAt":row.get::<_,Option<String>>(18)?,
                 "createdBy":{"id":row.get::<_,String>(19)?,"fullName":row.get::<_,String>(20)?}
             });
+            item["washType"] = json!(row.get::<_,Option<String>>(21)?);
             if include_financials {
                 item["commissionBps"] = json!(row.get::<_,i64>(14)?);
                 item["commissionMilli"] = json!(row.get::<_,i64>(15)?);
@@ -1206,7 +1224,7 @@ fn wash_item_by_id(
                 w.occurred_at,w.payment_type,w.status,worker.id,worker.full_name,showroom.id,showroom.name,
                 w.commission_bps,w.commission_milli,w.business_share_milli,w.showroom_payment_method,
                 EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id),w.is_paid,w.paid_at,
-                creator.id,creator.full_name
+                creator.id,creator.full_name,w.wash_type
          FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id
          LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
          JOIN users creator ON creator.id=w.created_by WHERE w.id=?1",
@@ -1222,6 +1240,7 @@ fn wash_item_by_id(
                 "isPaid":row.get::<_,i64>(19)?==1,"paidAt":row.get::<_,Option<String>>(20)?,
                 "createdBy":{"id":row.get::<_,String>(21)?,"fullName":row.get::<_,String>(22)?}
             });
+            item["washType"] = json!(row.get::<_,Option<String>>(23)?);
             item["priceMilli"] = json!(row.get::<_,i64>(6)?);
             if include_financials {
                 item["commissionBps"] = json!(row.get::<_,i64>(14)?);
@@ -1278,6 +1297,18 @@ async fn create_wash(
         .is_some_and(|value| value.chars().count() > 60)
     {
         return Err(ApiError::bad("لون السيارة طويل جدًا"));
+    }
+    let wash_type = input
+        .wash_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if wash_type
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 120)
+    {
+        return Err(ApiError::bad("نوع الغسيل طويل جدًا"));
     }
     let price = parse_milli(&input.price)?;
     if let Some(year) = input.manufacture_year {
@@ -1379,9 +1410,9 @@ async fn create_wash(
     let wash_id = new_id();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,manufacture_year,license_plate,car_color,price_milli,worker_id,payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,created_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-        params![wash_id, vehicle_make, vehicle_model, input.manufacture_year, input.license_plate.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()), car_color, price, input.worker_id, input.payment_type, showroom_id, showroom_payment_method, occurred_at, commission_bps, commission, business_share, principal.id, request_id, now()],
+        "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,manufacture_year,license_plate,car_color,wash_type,price_milli,worker_id,payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        params![wash_id, vehicle_make, vehicle_model, input.manufacture_year, input.license_plate.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()), car_color, wash_type, price, input.worker_id, input.payment_type, showroom_id, showroom_payment_method, occurred_at, commission_bps, commission, business_share, principal.id, request_id, now()],
     ).map_err(ApiError::internal)?;
     let debit_account = if input.payment_type == "cash" {
         "CASH"
@@ -1457,6 +1488,18 @@ async fn update_wash(
         .is_some_and(|value| value.chars().count() > 60)
     {
         return Err(ApiError::bad("لون السيارة طويل جدًا"));
+    }
+    let wash_type = input
+        .wash_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if wash_type
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 120)
+    {
+        return Err(ApiError::bad("نوع الغسيل طويل جدًا"));
     }
     if input
         .manufacture_year
@@ -1620,8 +1663,8 @@ async fn update_wash(
             ),
         ],
     )?;
-    tx.execute("UPDATE wash_operations SET vehicle_make=?1,vehicle_model=?2,manufacture_year=?3,license_plate=?4,car_color=?5,price_milli=?6,worker_id=?7,payment_type=?8,showroom_id=?9,showroom_payment_method=?10,occurred_at=?11,commission_bps=?12,commission_milli=?13,business_share_milli=?14,revision=revision+1,updated_at=?15,updated_by=?16 WHERE id=?17",
-        params![vehicle_make,vehicle_model,input.manufacture_year,input.license_plate.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),car_color,price,input.worker_id,input.payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission,business_share,now(),principal.id,id]).map_err(ApiError::internal)?;
+    tx.execute("UPDATE wash_operations SET vehicle_make=?1,vehicle_model=?2,manufacture_year=?3,license_plate=?4,car_color=?5,wash_type=?6,price_milli=?7,worker_id=?8,payment_type=?9,showroom_id=?10,showroom_payment_method=?11,occurred_at=?12,commission_bps=?13,commission_milli=?14,business_share_milli=?15,revision=revision+1,updated_at=?16,updated_by=?17 WHERE id=?18",
+        params![vehicle_make,vehicle_model,input.manufacture_year,input.license_plate.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),car_color,wash_type,price,input.worker_id,input.payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission,business_share,now(),principal.id,id]).map_err(ApiError::internal)?;
     if input.mark_as_overnight == Some(true) {
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES(?1,?2,?3,?4)",
@@ -1685,7 +1728,7 @@ async fn list_overnight_cars(
         "SELECT overnight.id,overnight.marked_at,marker.full_name,
                 wash.id,wash.vehicle_make,wash.vehicle_model,wash.manufacture_year,wash.license_plate,wash.car_color,wash.price_milli,
                 wash.occurred_at,wash.payment_type,wash.status,wash.showroom_payment_method,
-                worker.id,worker.full_name,showroom.id,showroom.name,wash.commission_milli
+                worker.id,worker.full_name,showroom.id,showroom.name,wash.commission_milli,wash.wash_type
          FROM overnight_cars overnight
          JOIN wash_operations wash ON wash.id=overnight.wash_id
          JOIN workers worker ON worker.id=wash.worker_id
@@ -1703,6 +1746,7 @@ async fn list_overnight_cars(
             "showroomPaymentMethod": row.get::<_,Option<String>>(13)?,
             "worker": {"id": row.get::<_,String>(14)?, "fullName": row.get::<_,String>(15)?},
             "showroom": row.get::<_,Option<String>>(16)?.map(|id| json!({"id":id,"name":row.get::<_,Option<String>>(17).ok().flatten()})),
+            "washType": row.get::<_,Option<String>>(19)?,
             "isOvernight": true
         });
         if can_view_all {
@@ -1870,12 +1914,14 @@ async fn list_workers(
          GROUP BY w.id ORDER BY w.full_name",
     ).map_err(ApiError::internal)?;
     let rows = statement.query_map(params![from, to], |row| {
+        let commission_bps_override: Option<i64> = row.get(5)?;
         let gross: i64 = row.get(7)?; let deductions: i64 = row.get(8)?;
         let mut item = json!({
             "id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,
-            "isActive":row.get::<_,i64>(4)? == 1,"commissionBpsOverride":row.get::<_,Option<i64>>(5)?,"washCount":row.get::<_,i64>(6)?
+            "isActive":row.get::<_,i64>(4)? == 1,"washCount":row.get::<_,i64>(6)?
         });
         if can_view_financial {
+            item["commissionBpsOverride"] = json!(commission_bps_override);
             item["financial"] = json!({"grossCommissionMilli":gross,"deductionsMilli":deductions,"paidMilli":0,"remainingMilli":(gross-deductions).max(0)});
         }
         Ok(item)
@@ -1896,6 +1942,9 @@ async fn create_worker(
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "operational.write")?;
     let full_name = trim_required(&input.full_name, "اسم العامل")?;
+    if input.commission_bps_override.is_some() && !principal.has_permission("financial.manage") {
+        return Err(ApiError::forbidden());
+    }
     if let Some(bps) = input.commission_bps_override {
         if !(0..=10000).contains(&bps) {
             return Err(ApiError::bad("نسبة العمولة الخاصة غير صالحة"));
@@ -1931,6 +1980,9 @@ async fn update_worker(
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "operational.write")?;
     let full_name = trim_required(&input.full_name, "اسم العامل")?;
+    if input.commission_bps_override.is_some() && !principal.has_permission("financial.manage") {
+        return Err(ApiError::forbidden());
+    }
     if let Some(bps) = input.commission_bps_override {
         if !(0..=10000).contains(&bps) {
             return Err(ApiError::bad("نسبة العمولة الخاصة غير صالحة"));
@@ -1940,20 +1992,25 @@ async fn update_worker(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let previous_active = db
+    let (previous_active, previous_commission_bps_override) = db
         .conn
         .query_row(
-            "SELECT is_active FROM workers WHERE id=?1",
+            "SELECT is_active,commission_bps_override FROM workers WHERE id=?1",
             [id.clone()],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
         .optional()
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
     let next_active = input.is_active.unwrap_or(previous_active == 1);
+    let next_commission_bps_override = if principal.has_permission("financial.manage") {
+        input.commission_bps_override
+    } else {
+        previous_commission_bps_override
+    };
     let affected = db.conn.execute(
         "UPDATE workers SET full_name=?1,phone=?2,notes=?3,is_active=?4,commission_bps_override=?5,updated_at=?6,deactivated_at=CASE WHEN ?4=0 THEN COALESCE(deactivated_at,?6) ELSE NULL END,deactivated_by=CASE WHEN ?4=0 THEN ?8 ELSE NULL END WHERE id=?7",
-        params![full_name, input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), if next_active{1}else{0}, input.commission_bps_override, now(), id, principal.id],
+        params![full_name, input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), if next_active{1}else{0}, next_commission_bps_override, now(), id, principal.id],
     ).map_err(ApiError::internal)?;
     if affected == 0 {
         return Err(ApiError::not_found());
@@ -1985,7 +2042,7 @@ async fn delete_worker(
     Path(id): Path<String>,
 ) -> ApiResult {
     let principal = manager(&state, &headers)?;
-    let mut db = state
+    let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
@@ -2013,7 +2070,7 @@ async fn delete_worker(
         "WORKER_DELETED_SAFELY",
         "worker",
         Some(&id),
-        "تم حذف الموظف من القائمة النشطة مع الاحتفاظ بكل السجلات التاريخية",
+        "تم حذف العامل من قائمة العمال النشطة مع الاحتفاظ بكل السجلات التاريخية",
         None,
     )
     .map_err(ApiError::internal)?;
@@ -2035,7 +2092,16 @@ async fn worker_detail(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let worker: Option<Value> = db.conn.query_row("SELECT id,full_name,phone,notes,is_active FROM workers WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,"isActive":row.get::<_,i64>(4)?==1}))).optional().map_err(ApiError::internal)?;
-    let worker = worker.ok_or_else(ApiError::not_found)?;
+    let mut worker = worker.ok_or_else(ApiError::not_found)?;
+    let (wash_count, total_wash_value): (i64, i64) = db.conn.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(price_milli),0)
+         FROM wash_operations
+         WHERE worker_id=?1 AND status='posted' AND occurred_at BETWEEN ?2 AND ?3",
+        params![id.clone(),from.clone(),to.clone()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(ApiError::internal)?;
+    worker["washCount"] = json!(wash_count);
+    worker["totalWashValueMilli"] = json!(total_wash_value);
     let value_date = selected_business_date(&query)?
         .unwrap_or_else(business_today)
         .format("%Y-%m-%d")
@@ -2088,7 +2154,7 @@ async fn update_worker_daily_value(
         .map_err(|_| ApiError::bad("تاريخ القيمة اليومية غير صالح"))?;
     let value_date = date.format("%Y-%m-%d").to_string();
     let amount = parse_milli(&input.amount)?;
-    let mut db = state
+    let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
@@ -2128,20 +2194,20 @@ async fn worker_financial(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let exists: Option<String> = db
+    let commission_bps_override: Option<i64> = db
         .conn
-        .query_row("SELECT id FROM workers WHERE id=?1", [id.clone()], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT commission_bps_override FROM workers WHERE id=?1",
+            [id.clone()],
+            |row| row.get(0),
+        )
         .optional()
-        .map_err(ApiError::internal)?;
-    if exists.is_none() {
-        return Err(ApiError::not_found());
-    }
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
     let gross=total_for(&db.conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND worker_id=?1 AND occurred_at BETWEEN ?2 AND ?3",params![id,from,to])?;
     let deductions=total_for(&db.conn,"SELECT COALESCE(SUM(ea.amount_milli),0) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE ea.worker_id=?1 AND e.occurred_at BETWEEN ?2 AND ?3",params![id,from,to])?;
     Ok(ok(
-        json!({"grossCommissionMilli":gross,"deductionsMilli":deductions,"netEarningsMilli":(gross-deductions).max(0),"paidMilli":0,"remainingMilli":(gross-deductions).max(0),"payments":[]}),
+        json!({"commissionBpsOverride":commission_bps_override,"grossCommissionMilli":gross,"deductionsMilli":deductions,"netEarningsMilli":(gross-deductions).max(0),"paidMilli":0,"remainingMilli":(gross-deductions).max(0),"payments":[]}),
     ))
 }
 
@@ -2152,6 +2218,74 @@ struct WorkerWithdrawalReturnInput {
     amount: String,
     occurred_at: String,
     notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerSettlementInput {
+    occurred_at: String,
+}
+
+struct WorkerMovementTotals {
+    withdrawals: i64,
+    deductions: i64,
+    returns: i64,
+    deduction_payments: i64,
+    settlements: i64,
+    outstanding: i64,
+}
+
+fn worker_movement_totals_excluding(
+    conn: &Connection,
+    worker_id: &str,
+    from: &str,
+    to: &str,
+    excluded_movement_id: Option<&str>,
+) -> Result<WorkerMovementTotals, ApiError> {
+    let (withdrawals, returns, deduction_payments, settlements): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN transaction_type='withdrawal' THEN amount_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN transaction_type='return' THEN amount_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN transaction_type='deduction_payment' THEN amount_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN transaction_type='settlement' THEN amount_milli ELSE 0 END),0)
+             FROM worker_withdrawal_returns
+             WHERE worker_id=?1 AND deleted_at IS NULL AND occurred_at BETWEEN ?2 AND ?3
+                   AND (?4 IS NULL OR id<>?4)",
+            params![worker_id, from, to, excluded_movement_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(ApiError::internal)?;
+    let deductions = total_for(
+        conn,
+        "SELECT COALESCE(SUM(ea.amount_milli),0)
+         FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id
+         WHERE ea.worker_id=?1 AND e.occurred_at BETWEEN ?2 AND ?3",
+        params![worker_id, from, to],
+    )?;
+    let outstanding = withdrawals
+        .saturating_add(deductions)
+        .saturating_sub(returns)
+        .saturating_sub(deduction_payments)
+        .saturating_sub(settlements)
+        .max(0);
+    Ok(WorkerMovementTotals {
+        withdrawals,
+        deductions,
+        returns,
+        deduction_payments,
+        settlements,
+        outstanding,
+    })
+}
+
+fn worker_movement_totals(
+    conn: &Connection,
+    worker_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<WorkerMovementTotals, ApiError> {
+    worker_movement_totals_excluding(conn, worker_id, from, to, None)
 }
 
 async fn worker_withdrawal_returns(
@@ -2176,25 +2310,45 @@ async fn worker_withdrawal_returns(
         .optional()
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    let total_withdrawals = total_for(&db.conn, "SELECT COALESCE(SUM(amount_milli),0) FROM worker_withdrawal_returns WHERE worker_id=?1 AND transaction_type='withdrawal' AND occurred_at BETWEEN ?2 AND ?3", params![id.clone(),from.clone(),to.clone()])?;
-    let total_returns = total_for(&db.conn, "SELECT COALESCE(SUM(amount_milli),0) FROM worker_withdrawal_returns WHERE worker_id=?1 AND transaction_type='return' AND occurred_at BETWEEN ?2 AND ?3", params![id.clone(),from.clone(),to.clone()])?;
+    let totals = worker_movement_totals(&db.conn, &id, &from, &to)?;
     let mut transactions = Vec::new();
     let mut statement = db.conn.prepare(
         "SELECT movement.id,movement.transaction_type,movement.amount_milli,movement.occurred_at,movement.notes,user.full_name
          FROM worker_withdrawal_returns movement JOIN users user ON user.id=movement.created_by
-         WHERE movement.worker_id=?1 AND movement.occurred_at BETWEEN ?2 AND ?3
+         WHERE movement.worker_id=?1 AND movement.deleted_at IS NULL AND movement.occurred_at BETWEEN ?2 AND ?3
          ORDER BY movement.occurred_at DESC,movement.created_at DESC"
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![id.clone(),from,to], |row| Ok(json!({
+    let rows = statement.query_map(params![id.clone(),from.clone(),to.clone()], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"type":row.get::<_,String>(1)?,"amountMilli":row.get::<_,i64>(2)?,
-        "occurredAt":row.get::<_,String>(3)?,"notes":row.get::<_,Option<String>>(4)?,"createdByName":row.get::<_,String>(5)?
+        "occurredAt":row.get::<_,String>(3)?,"notes":row.get::<_,Option<String>>(4)?,"createdByName":row.get::<_,String>(5)?,
+        "editable":row.get::<_,String>(1)? == "deduction_payment","deletable":true
     }))).map_err(ApiError::internal)?;
     for row in rows {
         transactions.push(row.map_err(ApiError::internal)?);
     }
+    let mut deduction_statement = db.conn.prepare(
+        "SELECT allocation.id,allocation.amount_milli,expense.occurred_at,expense.description,user.full_name
+         FROM expense_allocations allocation
+         JOIN expenses expense ON expense.id=allocation.expense_id
+         JOIN users user ON user.id=expense.created_by
+         WHERE allocation.worker_id=?1 AND allocation.amount_milli>0 AND expense.occurred_at BETWEEN ?2 AND ?3"
+    ).map_err(ApiError::internal)?;
+    let deduction_rows = deduction_statement.query_map(params![id.clone(),from,to], |row| Ok(json!({
+        "id":format!("deduction:{}",row.get::<_,String>(0)?),"type":"deduction","amountMilli":row.get::<_,i64>(1)?,
+        "occurredAt":row.get::<_,String>(2)?,"notes":row.get::<_,String>(3)?,"createdByName":row.get::<_,String>(4)?,
+        "editable":false,"deletable":false
+    }))).map_err(ApiError::internal)?;
+    for row in deduction_rows {
+        transactions.push(row.map_err(ApiError::internal)?);
+    }
+    transactions.sort_by(|left, right| {
+        right["occurredAt"].as_str().cmp(&left["occurredAt"].as_str())
+    });
     Ok(ok(json!({
-        "worker":{"id":id,"fullName":worker_name},"totalWithdrawalsMilli":total_withdrawals,
-        "totalReturnsMilli":total_returns,"outstandingBalanceMilli":total_withdrawals-total_returns,"transactions":transactions
+        "worker":{"id":id,"fullName":worker_name},"totalWithdrawalsMilli":totals.withdrawals,
+        "totalDeductionsMilli":totals.deductions,"totalReturnsMilli":totals.returns,
+        "totalDeductionPaymentsMilli":totals.deduction_payments,"totalSettlementsMilli":totals.settlements,
+        "outstandingBalanceMilli":totals.outstanding,"transactions":transactions
     })))
 }
 
@@ -2205,7 +2359,10 @@ async fn create_worker_withdrawal_return(
     Json(input): Json<WorkerWithdrawalReturnInput>,
 ) -> ApiResult {
     let principal = manager(&state, &headers)?;
-    if !matches!(input.transaction_type.as_str(), "withdrawal" | "return") {
+    if !matches!(
+        input.transaction_type.as_str(),
+        "withdrawal" | "return" | "deduction_payment"
+    ) {
         return Err(ApiError::bad("نوع الحركة غير صالح"));
     }
     let amount = parse_milli(&input.amount)?;
@@ -2235,6 +2392,21 @@ async fn create_worker_withdrawal_return(
         .optional()
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
+    if matches!(input.transaction_type.as_str(), "return" | "deduction_payment") {
+        let totals = worker_movement_totals(
+            &db.conn,
+            &worker_id,
+            "0000-01-01T00:00:00Z",
+            "9999-12-31T23:59:59Z",
+        )?;
+        if amount > totals.outstanding {
+            return Err(ApiError::bad(if input.transaction_type == "return" {
+                "لا يمكن أن يتجاوز المرتجع الرصيد القائم للعامل"
+            } else {
+                "لا يمكن أن يتجاوز تسديد الاستقطاع الرصيد القائم للعامل"
+            }));
+        }
+    }
     let id = new_id();
     let created_at = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
@@ -2255,6 +2427,172 @@ async fn create_worker_withdrawal_return(
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({"id":id,"created":true})))
+}
+
+async fn update_worker_deduction_payment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((worker_id, movement_id)): Path<(String, String)>,
+    Json(input): Json<WorkerWithdrawalReturnInput>,
+) -> ApiResult {
+    let principal = manager(&state, &headers)?;
+    if input.transaction_type != "deduction_payment" {
+        return Err(ApiError::bad("يمكن تعديل حركات تسديد الاستقطاع فقط"));
+    }
+    let amount = parse_milli(&input.amount)?;
+    DateTime::parse_from_rfc3339(&input.occurred_at)
+        .map_err(|_| ApiError::bad("تاريخ الحركة غير صالح"))?;
+    let notes = input
+        .notes
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if notes
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 500)
+    {
+        return Err(ApiError::bad("الملاحظة طويلة جدًا"));
+    }
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let previous_amount: i64 = db
+        .conn
+        .query_row(
+            "SELECT amount_milli FROM worker_withdrawal_returns
+             WHERE id=?1 AND worker_id=?2 AND transaction_type='deduction_payment' AND deleted_at IS NULL",
+            params![movement_id.clone(),worker_id.clone()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let available = worker_movement_totals_excluding(
+        &db.conn,
+        &worker_id,
+        "0000-01-01T00:00:00Z",
+        "9999-12-31T23:59:59Z",
+        Some(&movement_id),
+    )?
+    .outstanding;
+    if amount > available {
+        return Err(ApiError::bad(
+            "لا يمكن أن يتجاوز تسديد الاستقطاع الرصيد القائم بعد إعادة الاحتساب",
+        ));
+    }
+    let tx = db.conn.transaction().map_err(ApiError::internal)?;
+    tx.execute(
+        "UPDATE worker_withdrawal_returns
+         SET amount_milli=?1,occurred_at=?2,notes=?3
+         WHERE id=?4 AND worker_id=?5 AND transaction_type='deduction_payment' AND deleted_at IS NULL",
+        params![amount,input.occurred_at,notes,movement_id,worker_id],
+    ).map_err(ApiError::internal)?;
+    insert_audit_tx(
+        &tx,
+        Some(&principal.id),
+        "WORKER_DEDUCTION_PAYMENT_UPDATED",
+        "worker_withdrawal_return",
+        Some(&movement_id),
+        "تم تعديل حركة تسديد استقطاع وإعادة احتساب الرصيد من السجلات المحفوظة",
+        Some(&json!({"workerId":worker_id,"previousAmountMilli":previous_amount,"amountMilli":amount})),
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(ok(json!({"id":movement_id,"updated":true})))
+}
+
+async fn settle_worker_withdrawal_returns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(worker_id): Path<String>,
+    Json(input): Json<WorkerSettlementInput>,
+) -> ApiResult {
+    let principal = manager(&state, &headers)?;
+    DateTime::parse_from_rfc3339(&input.occurred_at)
+        .map_err(|_| ApiError::bad("تاريخ التصفية غير صالح"))?;
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let worker_name: String = db
+        .conn
+        .query_row(
+            "SELECT full_name FROM workers WHERE id=?1",
+            [worker_id.clone()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let outstanding = worker_movement_totals(
+        &db.conn,
+        &worker_id,
+        "0000-01-01T00:00:00Z",
+        "9999-12-31T23:59:59Z",
+    )?.outstanding;
+    if outstanding == 0 {
+        return Err(ApiError::bad("لا يوجد رصيد قائم يحتاج إلى تصفية"));
+    }
+    let id = new_id();
+    let created_at = now();
+    let tx = db.conn.transaction().map_err(ApiError::internal)?;
+    tx.execute(
+        "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
+         VALUES(?1,?2,'settlement',?3,?4,?5,?6,?7)",
+        params![id,worker_id,outstanding,input.occurred_at,"تصفية المستقطعات",principal.id,created_at],
+    ).map_err(ApiError::internal)?;
+    insert_audit_tx(
+        &tx,
+        Some(&principal.id),
+        "WORKER_DEDUCTIONS_SETTLED",
+        "worker_withdrawal_return",
+        Some(&id),
+        "تمت تصفية الرصيد القائم لمسحوبات العامل مع الاحتفاظ بالسجل السابق",
+        Some(&json!({"workerId":worker_id,"workerName":worker_name,"amountMilli":outstanding})),
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(ok(json!({"id":id,"created":true,"amountMilli":outstanding,"outstandingBalanceMilli":0})))
+}
+
+async fn delete_worker_withdrawal_return(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((worker_id, movement_id)): Path<(String, String)>,
+) -> ApiResult {
+    let principal = manager(&state, &headers)?;
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let movement: (String, i64) = db
+        .conn
+        .query_row(
+            "SELECT transaction_type,amount_milli
+             FROM worker_withdrawal_returns
+             WHERE id=?1 AND worker_id=?2 AND deleted_at IS NULL",
+            params![movement_id.clone(),worker_id.clone()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let deleted_at = now();
+    let tx = db.conn.transaction().map_err(ApiError::internal)?;
+    tx.execute(
+        "UPDATE worker_withdrawal_returns SET deleted_at=?1,deleted_by=?2
+         WHERE id=?3 AND worker_id=?4 AND deleted_at IS NULL",
+        params![deleted_at,principal.id,movement_id,worker_id],
+    ).map_err(ApiError::internal)?;
+    insert_audit_tx(
+        &tx,
+        Some(&principal.id),
+        "WORKER_WITHDRAWAL_RETURN_DELETED",
+        "worker_withdrawal_return",
+        Some(&movement_id),
+        "تم حذف حركة من سجل مسحوبات ومرتجعات العامل وإعادة احتساب الرصيد من السجلات المتبقية",
+        Some(&json!({"workerId":worker_id,"type":movement.0,"amountMilli":movement.1})),
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(ok(json!({"id":movement_id,"deleted":true})))
 }
 
 #[derive(Deserialize)]
@@ -2516,7 +2854,7 @@ async fn delete_showroom(
     Path(id): Path<String>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "operational.write")?;
-    let mut db = state
+    let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
@@ -2916,17 +3254,17 @@ async fn payroll_summary(
     let mut statement = db
         .conn
         .prepare(
-            "SELECT w.id,w.full_name,w.is_active,
-                COALESCE((SELECT rate.salary_milli FROM worker_salary_rates rate
-                          WHERE rate.worker_id=w.id AND rate.effective_month<=?1
+            "SELECT employee.id,employee.full_name,employee.is_active,
+                COALESCE((SELECT rate.salary_milli FROM payroll_salary_rates rate
+                          WHERE rate.employee_id=employee.id AND rate.effective_month<=?1
                           ORDER BY rate.effective_month DESC LIMIT 1),0),
                 COALESCE((SELECT SUM(sw.amount_milli) FROM salary_withdrawals sw
-                          WHERE sw.worker_id=w.id AND substr(sw.withdrawn_at,1,7)=?1),0)
+                          WHERE sw.employee_id=employee.id AND substr(sw.withdrawn_at,1,7)=?1),0)
                 ,COALESCE((SELECT SUM(sd.amount_milli) FROM salary_deductions sd
-                          WHERE sd.worker_id=w.id AND sd.deduction_month=?1),0)
-         FROM workers w
-         WHERE w.is_active=1
-         ORDER BY w.is_active DESC,w.full_name,w.id",
+                          WHERE sd.employee_id=employee.id AND sd.deduction_month=?1),0)
+         FROM payroll_employees employee
+         WHERE employee.is_active=1
+         ORDER BY employee.full_name,employee.id",
         )
         .map_err(ApiError::internal)?;
     let rows = statement
@@ -2948,7 +3286,7 @@ async fn payroll_summary(
         total_withdrawals += withdrawals;
         total_deductions += deductions;
         employees.push(json!({
-            "worker": {"id": id, "fullName": full_name, "isActive": is_active},
+            "employee": {"id": id, "fullName": full_name, "isActive": is_active},
             "salaryMilli": salary,
             "totalWithdrawalsMilli": withdrawals,
             "totalDeductionsMilli": deductions,
@@ -2979,40 +3317,40 @@ async fn create_payroll_employee(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_id = new_id();
+    let employee_id = new_id();
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO workers(id,full_name,is_active,created_at,updated_at) VALUES(?1,?2,1,?3,?3)",
-        params![worker_id, full_name, timestamp],
+        "INSERT INTO payroll_employees(id,full_name,is_active,created_at,updated_at) VALUES(?1,?2,1,?3,?3)",
+        params![employee_id, full_name, timestamp],
     )
     .map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO worker_salary_rates(worker_id,effective_month,salary_milli,set_by,created_at,updated_at)
+        "INSERT INTO payroll_salary_rates(employee_id,effective_month,salary_milli,set_by,created_at,updated_at)
          VALUES(?1,?2,?3,?4,?5,?5)",
-        params![worker_id, month, salary, principal.id, timestamp],
+        params![employee_id, month, salary, principal.id, timestamp],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
         Some(&principal.id),
         "PAYROLL_EMPLOYEE_CREATED",
-        "worker",
-        Some(&worker_id),
-        "تم إنشاء موظف في المرتبات دون إنشاء حساب مستخدم",
-        Some(&json!({"workerId":worker_id,"month":month,"salaryMilli":salary})),
+        "payroll_employee",
+        Some(&employee_id),
+        "تم إنشاء موظف مستقل في قسم المرتبات",
+        Some(&json!({"employeeId":employee_id,"month":month,"salaryMilli":salary})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({
-        "worker": {"id":worker_id,"fullName":full_name,"isActive":true},
+        "employee": {"id":employee_id,"fullName":full_name,"isActive":true},
         "month":month,
         "salaryMilli":salary
     })))
 }
 
-async fn set_worker_salary(
+async fn set_employee_salary(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(worker_id): Path<String>,
+    Path(employee_id): Path<String>,
     Json(input): Json<SalaryInput>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
@@ -3022,11 +3360,11 @@ async fn set_worker_salary(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3035,23 +3373,23 @@ async fn set_worker_salary(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO worker_salary_rates(worker_id,effective_month,salary_milli,set_by,created_at,updated_at)
+        "INSERT INTO payroll_salary_rates(employee_id,effective_month,salary_milli,set_by,created_at,updated_at)
          VALUES(?1,?2,?3,?4,?5,?5)
-         ON CONFLICT(worker_id,effective_month) DO UPDATE SET salary_milli=excluded.salary_milli,set_by=excluded.set_by,updated_at=excluded.updated_at",
-        params![worker_id, month, salary, principal.id, timestamp],
+         ON CONFLICT(employee_id,effective_month) DO UPDATE SET salary_milli=excluded.salary_milli,set_by=excluded.set_by,updated_at=excluded.updated_at",
+        params![employee_id, month, salary, principal.id, timestamp],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
         Some(&principal.id),
-        "WORKER_SALARY_SET",
-        "worker_salary_rate",
-        Some(&worker_id),
+        "PAYROLL_EMPLOYEE_SALARY_SET",
+        "payroll_salary_rate",
+        Some(&employee_id),
         "تم تعيين الراتب الشهري للموظف",
-        Some(&json!({"workerId":worker_id,"month":month,"salaryMilli":salary})),
+        Some(&json!({"employeeId":employee_id,"month":month,"salaryMilli":salary})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({
-        "worker": {"id": worker_id, "fullName": worker_name},
+        "employee": {"id": employee_id, "fullName": employee_name},
         "month": month,
         "salaryMilli": salary
     })))
@@ -3060,18 +3398,18 @@ async fn set_worker_salary(
 async fn delete_payroll_employee(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(worker_id): Path<String>,
+    Path(employee_id): Path<String>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3080,29 +3418,29 @@ async fn delete_payroll_employee(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "UPDATE workers SET is_active=0,deactivated_at=COALESCE(deactivated_at,?1),deactivated_by=?2,updated_at=?1 WHERE id=?3",
-        params![timestamp, principal.id, worker_id],
+        "UPDATE payroll_employees SET is_active=0,archived_at=COALESCE(archived_at,?1),archived_by=?2,updated_at=?1 WHERE id=?3",
+        params![timestamp, principal.id, employee_id],
     )
     .map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
         Some(&principal.id),
-        "WORKER_ARCHIVED_FROM_PAYROLL",
-        "worker",
-        Some(&worker_id),
+        "PAYROLL_EMPLOYEE_ARCHIVED",
+        "payroll_employee",
+        Some(&employee_id),
         "تمت أرشفة الموظف من قسم المرتبات مع الاحتفاظ بكل السجلات التاريخية",
         None,
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(
-        json!({"archived":true,"worker":{"id":worker_id,"fullName":worker_name}}),
+        json!({"archived":true,"employee":{"id":employee_id,"fullName":employee_name}}),
     ))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SalaryWithdrawalInput {
-    worker_id: String,
+    employee_id: String,
     amount: String,
     withdrawn_at: String,
     notes: Option<String>,
@@ -3111,7 +3449,7 @@ struct SalaryWithdrawalInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SalaryDeductionInput {
-    worker_id: String,
+    employee_id: String,
     amount: String,
     deducted_at: Option<String>,
     month: Option<String>,
@@ -3148,9 +3486,9 @@ async fn list_salary_deductions(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let mut statement = db.conn.prepare(
-        "SELECT sd.id,sd.amount_milli,sd.deducted_at,sd.notes,w.id,w.full_name,creator.full_name,sd.created_at,sd.updated_at
+        "SELECT sd.id,sd.amount_milli,sd.deducted_at,sd.notes,employee.id,employee.full_name,creator.full_name,sd.created_at,sd.updated_at
          FROM salary_deductions sd
-         JOIN workers w ON w.id=sd.worker_id
+         JOIN payroll_employees employee ON employee.id=sd.employee_id
          JOIN users creator ON creator.id=sd.created_by
          WHERE (?1=0 AND sd.deduction_month=?2)
             OR (?1=1 AND sd.deducted_at BETWEEN ?3 AND ?4)
@@ -3158,7 +3496,7 @@ async fn list_salary_deductions(
     ).map_err(ApiError::internal)?;
     let rows = statement.query_map(params![filter_by_date,month,from,to], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"deductedAt":row.get::<_,String>(2)?,
-        "notes":row.get::<_,Option<String>>(3)?,"worker":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
+        "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
         "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
     }))).map_err(ApiError::internal)?;
     let mut items = Vec::new();
@@ -3174,8 +3512,8 @@ async fn create_salary_deduction(
     Json(input): Json<SalaryDeductionInput>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
-    let worker_id = input.worker_id.trim().to_owned();
-    if worker_id.is_empty() {
+    let employee_id = input.employee_id.trim().to_owned();
+    if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
     }
     let amount = parse_milli(&input.amount)?;
@@ -3188,11 +3526,11 @@ async fn create_salary_deduction(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3202,9 +3540,9 @@ async fn create_salary_deduction(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO salary_deductions(id,worker_id,amount_milli,deduction_month,deducted_at,notes,created_by,created_at,updated_at)
+        "INSERT INTO salary_deductions(id,employee_id,amount_milli,deduction_month,deducted_at,notes,created_by,created_at,updated_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
-        params![id, worker_id, amount, month, deducted_at, notes, principal.id, timestamp],
+        params![id, employee_id, amount, month, deducted_at, notes, principal.id, timestamp],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
@@ -3213,11 +3551,11 @@ async fn create_salary_deduction(
         "salary_deduction",
         Some(&id),
         "تم تسجيل خصم موظف",
-        Some(&json!({"workerId":worker_id,"amountMilli":amount,"month":month})),
+        Some(&json!({"employeeId":employee_id,"amountMilli":amount,"month":month})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(
-        json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"worker":{"id":worker_id,"fullName":worker_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp}),
+        json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp}),
     ))
 }
 
@@ -3228,8 +3566,8 @@ async fn update_salary_deduction(
     Json(input): Json<SalaryDeductionInput>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
-    let worker_id = input.worker_id.trim().to_owned();
-    if worker_id.is_empty() {
+    let employee_id = input.employee_id.trim().to_owned();
+    if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
     }
     let amount = parse_milli(&input.amount)?;
@@ -3242,11 +3580,11 @@ async fn update_salary_deduction(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3255,8 +3593,8 @@ async fn update_salary_deduction(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     let changed = tx.execute(
-        "UPDATE salary_deductions SET worker_id=?1,amount_milli=?2,deduction_month=?3,deducted_at=?4,notes=?5,updated_by=?6,updated_at=?7 WHERE id=?8",
-        params![worker_id,amount,month,deducted_at,notes,principal.id,timestamp,id],
+        "UPDATE salary_deductions SET employee_id=?1,amount_milli=?2,deduction_month=?3,deducted_at=?4,notes=?5,updated_by=?6,updated_at=?7 WHERE id=?8",
+        params![employee_id,amount,month,deducted_at,notes,principal.id,timestamp,id],
     ).map_err(ApiError::internal)?;
     if changed == 0 {
         return Err(ApiError::not_found());
@@ -3268,11 +3606,11 @@ async fn update_salary_deduction(
         "salary_deduction",
         Some(&id),
         "تم تعديل خصم موظف وإعادة احتساب الراتب المتبقي",
-        Some(&json!({"workerId":worker_id,"amountMilli":amount,"month":month})),
+        Some(&json!({"employeeId":employee_id,"amountMilli":amount,"month":month})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(
-        json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"worker":{"id":worker_id,"fullName":worker_name},"recordedBy":principal.full_name,"updatedAt":timestamp}),
+        json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"updatedAt":timestamp}),
     ))
 }
 
@@ -3286,10 +3624,10 @@ async fn delete_salary_deduction(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_id: String = db
+    let employee_id: String = db
         .conn
         .query_row(
-            "SELECT worker_id FROM salary_deductions WHERE id=?1",
+            "SELECT employee_id FROM salary_deductions WHERE id=?1",
             [id.clone()],
             |row| row.get(0),
         )
@@ -3306,7 +3644,7 @@ async fn delete_salary_deduction(
         "salary_deduction",
         Some(&id),
         "تم حذف خصم موظف وإعادة احتساب الراتب المتبقي",
-        Some(&json!({"workerId":worker_id})),
+        Some(&json!({"employeeId":employee_id})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({"deleted":true,"id":id})))
@@ -3331,8 +3669,8 @@ async fn list_salary_withdrawals(
     };
     let (from, to) = date_range(&query)?;
     let filter_by_date = if selected_date.is_some() { 1 } else { 0 };
-    let worker_filter = query
-        .get("workerId")
+    let employee_filter = query
+        .get("employeeId")
         .map(|value| value.trim())
         .filter(|value| !value.is_empty());
     let db = state
@@ -3340,20 +3678,20 @@ async fn list_salary_withdrawals(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let mut items = Vec::new();
-    if let Some(worker_id) = worker_filter {
+    if let Some(employee_id) = employee_filter {
         let mut statement = db.conn.prepare(
-            "SELECT sw.id,sw.amount_milli,sw.withdrawn_at,sw.notes,w.id,w.full_name,creator.full_name,sw.created_at,sw.updated_at
+            "SELECT sw.id,sw.amount_milli,sw.withdrawn_at,sw.notes,employee.id,employee.full_name,creator.full_name,sw.created_at,sw.updated_at
              FROM salary_withdrawals sw
-             JOIN workers w ON w.id=sw.worker_id
+             JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
              WHERE ((?1=0 AND substr(sw.withdrawn_at,1,7)=?2)
                     OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4))
-               AND sw.worker_id=?5
+               AND sw.employee_id=?5
              ORDER BY sw.withdrawn_at DESC,sw.created_at DESC",
         ).map_err(ApiError::internal)?;
-        let rows = statement.query_map(params![filter_by_date,month,from,to,worker_id], |row| Ok(json!({
+        let rows = statement.query_map(params![filter_by_date,month,from,to,employee_id], |row| Ok(json!({
             "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"withdrawnAt":row.get::<_,String>(2)?,
-            "notes":row.get::<_,Option<String>>(3)?,"worker":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
+            "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
             "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
         }))).map_err(ApiError::internal)?;
         for row in rows {
@@ -3361,9 +3699,9 @@ async fn list_salary_withdrawals(
         }
     } else {
         let mut statement = db.conn.prepare(
-            "SELECT sw.id,sw.amount_milli,sw.withdrawn_at,sw.notes,w.id,w.full_name,creator.full_name,sw.created_at,sw.updated_at
+            "SELECT sw.id,sw.amount_milli,sw.withdrawn_at,sw.notes,employee.id,employee.full_name,creator.full_name,sw.created_at,sw.updated_at
              FROM salary_withdrawals sw
-             JOIN workers w ON w.id=sw.worker_id
+             JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
              WHERE (?1=0 AND substr(sw.withdrawn_at,1,7)=?2)
                 OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4)
@@ -3371,7 +3709,7 @@ async fn list_salary_withdrawals(
         ).map_err(ApiError::internal)?;
         let rows = statement.query_map(params![filter_by_date,month,from,to], |row| Ok(json!({
             "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"withdrawnAt":row.get::<_,String>(2)?,
-            "notes":row.get::<_,Option<String>>(3)?,"worker":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
+            "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
             "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
         }))).map_err(ApiError::internal)?;
         for row in rows {
@@ -3387,8 +3725,8 @@ async fn create_salary_withdrawal(
     Json(input): Json<SalaryWithdrawalInput>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
-    let worker_id = input.worker_id.trim().to_owned();
-    if worker_id.is_empty() {
+    let employee_id = input.employee_id.trim().to_owned();
+    if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
     }
     let amount = parse_milli(&input.amount)?;
@@ -3401,11 +3739,11 @@ async fn create_salary_withdrawal(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3415,9 +3753,9 @@ async fn create_salary_withdrawal(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
-        "INSERT INTO salary_withdrawals(id,worker_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_at)
+        "INSERT INTO salary_withdrawals(id,employee_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-        params![id,worker_id,amount,withdrawn_at,notes,principal.id,timestamp],
+        params![id,employee_id,amount,withdrawn_at,notes,principal.id,timestamp],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
@@ -3426,12 +3764,12 @@ async fn create_salary_withdrawal(
         "salary_withdrawal",
         Some(&id),
         "تم تسجيل مسحوب موظف",
-        Some(&json!({"workerId":worker_id,"amountMilli":amount})),
+        Some(&json!({"employeeId":employee_id,"amountMilli":amount})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({
         "id":id,"amountMilli":amount,"withdrawnAt":withdrawn_at,"notes":notes,
-        "worker":{"id":worker_id,"fullName":worker_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp
+        "employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp
     })))
 }
 
@@ -3442,8 +3780,8 @@ async fn update_salary_withdrawal(
     Json(input): Json<SalaryWithdrawalInput>,
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
-    let worker_id = input.worker_id.trim().to_owned();
-    if worker_id.is_empty() {
+    let employee_id = input.employee_id.trim().to_owned();
+    if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
     }
     let amount = parse_milli(&input.amount)?;
@@ -3456,11 +3794,11 @@ async fn update_salary_withdrawal(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_name: String = db
+    let employee_name: String = db
         .conn
         .query_row(
-            "SELECT full_name FROM workers WHERE id=?1",
-            [worker_id.clone()],
+            "SELECT full_name FROM payroll_employees WHERE id=?1 AND is_active=1",
+            [employee_id.clone()],
             |row| row.get(0),
         )
         .optional()
@@ -3469,8 +3807,8 @@ async fn update_salary_withdrawal(
     let timestamp = now();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     let affected = tx.execute(
-        "UPDATE salary_withdrawals SET worker_id=?1,amount_milli=?2,withdrawn_at=?3,notes=?4,updated_by=?5,updated_at=?6 WHERE id=?7",
-        params![worker_id,amount,withdrawn_at,notes,principal.id,timestamp,id],
+        "UPDATE salary_withdrawals SET employee_id=?1,amount_milli=?2,withdrawn_at=?3,notes=?4,updated_by=?5,updated_at=?6 WHERE id=?7",
+        params![employee_id,amount,withdrawn_at,notes,principal.id,timestamp,id],
     ).map_err(ApiError::internal)?;
     if affected == 0 {
         return Err(ApiError::not_found());
@@ -3482,12 +3820,12 @@ async fn update_salary_withdrawal(
         "salary_withdrawal",
         Some(&id),
         "تم تعديل مسحوب موظف وإعادة احتساب الراتب المتبقي",
-        Some(&json!({"workerId":worker_id,"amountMilli":amount})),
+        Some(&json!({"employeeId":employee_id,"amountMilli":amount})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({
         "id":id,"amountMilli":amount,"withdrawnAt":withdrawn_at,"notes":notes,
-        "worker":{"id":worker_id,"fullName":worker_name},"recordedBy":principal.full_name,"updatedAt":timestamp
+        "employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"updatedAt":timestamp
     })))
 }
 
@@ -3501,10 +3839,10 @@ async fn delete_salary_withdrawal(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let worker_id: String = db
+    let employee_id: String = db
         .conn
         .query_row(
-            "SELECT worker_id FROM salary_withdrawals WHERE id=?1",
+            "SELECT employee_id FROM salary_withdrawals WHERE id=?1",
             [id.clone()],
             |row| row.get(0),
         )
@@ -3521,7 +3859,7 @@ async fn delete_salary_withdrawal(
         "salary_withdrawal",
         Some(&id),
         "تم حذف مسحوب موظف وإعادة احتساب الراتب المتبقي",
-        Some(&json!({"workerId":worker_id})),
+        Some(&json!({"employeeId":employee_id})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({"deleted":true,"id":id})))

@@ -113,6 +113,7 @@ function mapWash(raw: unknown): Wash {
     vehicle_make: text(value.vehicleMake),
     vehicle_model: text(value.vehicleModel),
     car_color: value.carColor === null || value.carColor === undefined ? null : text(value.carColor),
+    wash_type: value.washType === null || value.washType === undefined ? null : text(value.washType),
     manufacturing_year: value.manufactureYear === null || value.manufactureYear === undefined ? null : number(value.manufactureYear),
     license_plate: value.licensePlate === null || value.licensePlate === undefined ? null : text(value.licensePlate),
     price: value.priceMilli === undefined || value.priceMilli === null ? undefined : money(value.priceMilli),
@@ -146,6 +147,7 @@ function mapWorker(raw: unknown): Worker {
     status: value.isActive === false ? 'inactive' : 'active',
     washes_count: number(value.washCount),
     cars_washed: number(value.washCount),
+    total_wash_value: money(value.totalWashValueMilli),
     financials: hasFinance ? {
       commission_percentage: value.commissionBpsOverride === null || value.commissionBpsOverride === undefined ? undefined : number(value.commissionBpsOverride) / 100,
       gross_commission: money(finance.grossCommissionMilli),
@@ -198,11 +200,11 @@ function mapPayment(raw: unknown): PaymentRecord {
 
 function mapSalaryWithdrawal(raw: unknown): SalaryWithdrawal {
   const value = record(raw);
-  const worker = record(value.worker);
+  const employee = record(value.employee);
   return {
     id: text(value.id),
-    worker_id: text(worker.id),
-    worker_name: text(worker.fullName),
+    employee_id: text(employee.id),
+    employee_name: text(employee.fullName),
     amount: money(value.amountMilli),
     withdrawn_at: text(value.withdrawnAt),
     notes: value.notes === null || value.notes === undefined ? null : text(value.notes),
@@ -214,11 +216,11 @@ function mapSalaryWithdrawal(raw: unknown): SalaryWithdrawal {
 
 function mapSalaryDeduction(raw: unknown): SalaryDeduction {
   const value = record(raw);
-  const worker = record(value.worker);
+  const employee = record(value.employee);
   return {
     id: text(value.id),
-    worker_id: text(worker.id),
-    worker_name: text(worker.fullName),
+    employee_id: text(employee.id),
+    employee_name: text(employee.fullName),
     amount: money(value.amountMilli),
     deducted_at: text(value.deductedAt),
     notes: value.notes === null || value.notes === undefined ? null : text(value.notes),
@@ -351,6 +353,7 @@ class ApiClient {
     const input = {
       vehicleMake: text(data.vehicle_make), vehicleModel: text(data.vehicle_model), manufactureYear: data.manufacturing_year ?? null,
       carColor: data.car_color ?? null,
+      washType: data.wash_type ?? null,
       licensePlate: data.license_plate ?? null, price: text(data.price), workerId: text(data.worker_id),
       paymentType: data.payment_type === 'showroom_account' ? 'showroom' : 'cash', showroomId: data.showroom_id ?? null,
       showroomPaymentMethod: data.payment_type === 'showroom_account' ? data.showroom_payment_method ?? null : null,
@@ -362,6 +365,7 @@ class ApiClient {
     return {
       id: text(saved.id), vehicle_make: input.vehicleMake, vehicle_model: input.vehicleModel,
       car_color: input.carColor === null ? null : text(input.carColor),
+      wash_type: input.washType === null ? null : text(input.washType),
       manufacturing_year: input.manufactureYear === null ? null : number(input.manufactureYear), license_plate: input.licensePlate === null ? null : text(input.licensePlate),
       price: number(input.price), worker_id: input.workerId, payment_type: input.paymentType === 'showroom' ? 'showroom_account' : 'cash', showroom_id: input.showroomId === null ? null : text(input.showroomId), showroom_payment_method: input.showroomPaymentMethod === 'bank' ? 'bank' : input.showroomPaymentMethod === 'cash' ? 'cash' : null, performed_at: text(input.occurredAt),
     };
@@ -376,6 +380,7 @@ class ApiClient {
     const input = {
       vehicleMake: text(data.vehicle_make), vehicleModel: text(data.vehicle_model), manufactureYear: data.manufacturing_year ?? null,
       carColor: data.car_color ?? null,
+      washType: data.wash_type ?? null,
       licensePlate: data.license_plate ?? null, price: text(data.price), workerId: text(data.worker_id),
       paymentType: data.payment_type === 'showroom_account' ? 'showroom' : 'cash', showroomId: data.showroom_id ?? null,
       showroomPaymentMethod: data.payment_type === 'showroom_account' ? data.showroom_payment_method ?? null : null,
@@ -392,6 +397,7 @@ class ApiClient {
       manufacturing_year: input.manufactureYear === null ? null : number(input.manufactureYear),
       license_plate: input.licensePlate === null ? null : text(input.licensePlate),
       car_color: input.carColor === null ? null : text(input.carColor),
+      wash_type: input.washType === null ? null : text(input.washType),
       price: number(input.price),
       worker_id: input.workerId,
       showroom_id: input.showroomId === null ? null : text(input.showroomId),
@@ -455,11 +461,17 @@ class ApiClient {
       worker.daily_value = dailyValue.amountMilli === null || dailyValue.amountMilli === undefined ? undefined : money(dailyValue.amountMilli);
       worker.daily_value_date = text(dailyValue.date) || selectedDate;
     }
-    worker.washes_count = records(detail.history).length;
     const result: Worker & { washes?: Wash[] } = { ...worker, washes: records(detail.history).map(mapWash) };
     if (includeFinancials) {
       const financial = record(await this.get(`/workers/${encodeURIComponent(id)}/financial${query({ date: selectedDate })}`));
-      result.financials = { gross_commission: money(financial.grossCommissionMilli), deductions: money(financial.deductionsMilli), net_earnings: money(financial.netEarningsMilli), amount_paid: money(financial.paidMilli), payable_balance: money(financial.remainingMilli) };
+      result.financials = {
+        commission_percentage: financial.commissionBpsOverride === null || financial.commissionBpsOverride === undefined ? undefined : number(financial.commissionBpsOverride) / 100,
+        gross_commission: money(financial.grossCommissionMilli),
+        deductions: money(financial.deductionsMilli),
+        net_earnings: money(financial.netEarningsMilli),
+        amount_paid: money(financial.paidMilli),
+        payable_balance: money(financial.remainingMilli),
+      };
     }
     return result;
   }
@@ -474,25 +486,44 @@ class ApiClient {
       worker_id: text(worker.id),
       worker_name: text(worker.fullName),
       total_withdrawals: money(value.totalWithdrawalsMilli),
+      total_deductions: money(value.totalDeductionsMilli),
       total_returns: money(value.totalReturnsMilli),
+      total_deduction_payments: money(value.totalDeductionPaymentsMilli),
+      total_settlements: money(value.totalSettlementsMilli),
       outstanding_balance: money(value.outstandingBalanceMilli),
       transactions: records(value.transactions).map((transaction) => ({
         id: text(transaction.id),
-        type: transaction.type === 'return' ? 'return' : 'withdrawal',
+        type: transaction.type === 'deduction' ? 'deduction' : transaction.type === 'deduction_payment' ? 'deduction_payment' : transaction.type === 'settlement' ? 'settlement' : transaction.type === 'return' ? 'return' : 'withdrawal',
         amount: money(transaction.amountMilli),
         occurred_at: text(transaction.occurredAt),
         notes: transaction.notes === null || transaction.notes === undefined ? null : text(transaction.notes),
         created_by_name: text(transaction.createdByName) || undefined,
+        editable: transaction.editable === true,
+        deletable: transaction.deletable !== false,
       })),
     };
   }
-  async createWorkerWithdrawalReturn(id: string, data: { type: 'withdrawal' | 'return'; amount: string; occurred_at: string; notes?: string | null }): Promise<void> {
+  async createWorkerWithdrawalReturn(id: string, data: { type: 'withdrawal' | 'return' | 'deduction_payment'; amount: string; occurred_at: string; notes?: string | null }): Promise<void> {
     await this.post(`/workers/${encodeURIComponent(id)}/withdrawals-returns`, {
       transactionType: data.type,
       amount: data.amount,
       occurredAt: data.occurred_at,
       notes: data.notes ?? null,
     });
+  }
+  async updateWorkerDeductionPayment(workerId: string, movementId: string, data: { amount: string; occurred_at: string; notes?: string | null }): Promise<void> {
+    await this.patch(`/workers/${encodeURIComponent(workerId)}/withdrawals-returns/${encodeURIComponent(movementId)}`, {
+      transactionType: 'deduction_payment',
+      amount: data.amount,
+      occurredAt: data.occurred_at,
+      notes: data.notes ?? null,
+    });
+  }
+  async settleWorkerWithdrawalReturns(id: string, occurredAt: string): Promise<void> {
+    await this.post(`/workers/${encodeURIComponent(id)}/withdrawals-returns/settle`, { occurredAt });
+  }
+  async deleteWorkerWithdrawalReturn(workerId: string, movementId: string): Promise<void> {
+    await this.delete(`/workers/${encodeURIComponent(workerId)}/withdrawals-returns/${encodeURIComponent(movementId)}`);
   }
 
   async showrooms(params?: Record<string, string | number | boolean | undefined | null>): Promise<Showroom[]> { return records(await this.get(`/showrooms${query(params)}`)).map(mapShowroom); }
@@ -551,11 +582,11 @@ class ApiClient {
     return {
       month: text(value.month),
       employees: records(value.employees).map((item) => {
-        const worker = record(item.worker);
+        const employee = record(item.employee);
         return {
-          worker_id: text(worker.id),
-          worker_name: text(worker.fullName),
-          is_active: worker.isActive !== false,
+          employee_id: text(employee.id),
+          employee_name: text(employee.fullName),
+          is_active: employee.isActive !== false,
           salary: money(item.salaryMilli),
           total_withdrawals: money(item.totalWithdrawalsMilli),
           total_deductions: money(item.totalDeductionsMilli),
@@ -569,23 +600,23 @@ class ApiClient {
       total_remaining: money(value.totalRemainingMilli),
     };
   }
-  async setWorkerSalary(workerId: string, month: string, salary: string): Promise<void> {
-    await this.put(`/payroll/workers/${encodeURIComponent(workerId)}/salary`, { month, salary });
+  async setEmployeeSalary(employeeId: string, month: string, salary: string): Promise<void> {
+    await this.put(`/payroll/employees/${encodeURIComponent(employeeId)}/salary`, { month, salary });
   }
   async createPayrollEmployee(data: { full_name: string; month: string; salary: string }): Promise<void> {
     await this.post('/payroll/employees', { fullName: data.full_name, month: data.month, salary: data.salary });
   }
-  async deletePayrollEmployee(workerId: string): Promise<void> {
-    await this.delete(`/payroll/workers/${encodeURIComponent(workerId)}`);
+  async deletePayrollEmployee(employeeId: string): Promise<void> {
+    await this.delete(`/payroll/employees/${encodeURIComponent(employeeId)}`);
   }
   async salaryDeductions(month: string, selectedDate?: string): Promise<SalaryDeduction[]> {
     return records(await this.get(`/payroll/deductions${query({ month, date: selectedDate })}`)).map(mapSalaryDeduction);
   }
-  async createSalaryDeduction(data: { worker_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
-    return mapSalaryDeduction(await this.post('/payroll/deductions', { workerId: data.worker_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
+  async createSalaryDeduction(data: { employee_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
+    return mapSalaryDeduction(await this.post('/payroll/deductions', { employeeId: data.employee_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
   }
-  async updateSalaryDeduction(id: string, data: { worker_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
-    return mapSalaryDeduction(await this.patch(`/payroll/deductions/${encodeURIComponent(id)}`, { workerId: data.worker_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
+  async updateSalaryDeduction(id: string, data: { employee_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
+    return mapSalaryDeduction(await this.patch(`/payroll/deductions/${encodeURIComponent(id)}`, { employeeId: data.employee_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
   }
   async deleteSalaryDeduction(id: string): Promise<void> {
     await this.delete(`/payroll/deductions/${encodeURIComponent(id)}`);
@@ -593,17 +624,17 @@ class ApiClient {
   async salaryWithdrawals(month: string, selectedDate?: string): Promise<SalaryWithdrawal[]> {
     return records(await this.get(`/payroll/withdrawals${query({ month, date: selectedDate })}`)).map(mapSalaryWithdrawal);
   }
-  async createSalaryWithdrawal(data: { worker_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
+  async createSalaryWithdrawal(data: { employee_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
     return mapSalaryWithdrawal(await this.post('/payroll/withdrawals', {
-      workerId: data.worker_id,
+      employeeId: data.employee_id,
       amount: data.amount,
       withdrawnAt: data.withdrawn_at,
       notes: data.notes ?? null,
     }));
   }
-  async updateSalaryWithdrawal(id: string, data: { worker_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
+  async updateSalaryWithdrawal(id: string, data: { employee_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
     return mapSalaryWithdrawal(await this.patch(`/payroll/withdrawals/${encodeURIComponent(id)}`, {
-      workerId: data.worker_id,
+      employeeId: data.employee_id,
       amount: data.amount,
       withdrawnAt: data.withdrawn_at,
       notes: data.notes ?? null,
