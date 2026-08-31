@@ -1,22 +1,14 @@
-/* These are static faces. WebView2 maps requested 500 to 400 and 600-900 to 700. */
+/* The supplied files contain one Normal face only (the other two are byte-identical copies). */
 @font-face {
-  font-family: "Alkaheli UI";
-  src: url("/fonts/beIN%20Normal.ttf") format("truetype");
+  font-family: "Alarabiya Font";
+  src: url("/fonts1/ArbFONTS-Alarabiya%20Normal%20Font.ttf") format("truetype");
   font-style: normal;
   font-weight: 400;
   font-display: swap;
 }
 
-@font-face {
-  font-family: "Alkaheli UI";
-  src: url("/fonts/beIN%20Black%20Black.ttf") format("truetype");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
 :root {
-  font-family: "Alkaheli UI", "Segoe UI", Tahoma, Arial, sans-serif;
+  font-family: "Alarabiya Font", "Segoe UI", Tahoma, Arial, sans-serif;
   color: #15243b;
   background: #eff8ff;
   font-synthesis: none;
@@ -101,7 +93,7 @@ html[data-theme='dark'] body {
   background: linear-gradient(145deg, var(--bg), var(--bg-deep));
 }
 
-button, input, select, textarea { font: inherit; }
+button, input, select, textarea, option { font: inherit; }
 button { color: inherit; }
 button:not(:disabled), a { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.64; }
@@ -236,13 +228,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .empty-state h3 { margin: 0; font-size: 16px; }
 .empty-state p { margin: 8px 0 16px; color: var(--muted); font-size: 14px; line-height: 1.75; }
 
-/* Arabic joining must not be altered by display-oriented tracking. */
-:lang(ar) .eyebrow,
-:lang(ar) .page-header h1,
-:lang(ar) .section-card h2,
-:lang(ar) .auth-intro h1,
-:lang(ar) .nav-group > p {
+/* Arabic joining must not be altered by display-oriented tracking anywhere in the ERP. */
+:lang(ar) {
   letter-spacing: normal;
+  word-spacing: normal;
 }
 
 .status-badge { display: inline-flex; align-items: center; justify-content: center; gap: 5px; width: fit-content; padding: 5px 9px; border: 1px solid transparent; border-radius: 999px; font-size: 13px; font-weight: 800; white-space: nowrap; }
