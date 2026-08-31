@@ -1,26 +1,28 @@
+/* These are static faces. WebView2 maps requested 500 to 400 and 600-900 to 700. */
 @font-face {
   font-family: "Alkaheli UI";
   src: url("/fonts/beIN%20Normal.ttf") format("truetype");
   font-style: normal;
-  font-weight: 100 500;
+  font-weight: 400;
   font-display: swap;
-  unicode-range: U+0000-0029, U+002B-066C, U+066E-10FFFF;
 }
 
 @font-face {
   font-family: "Alkaheli UI";
   src: url("/fonts/beIN%20Black%20Black.ttf") format("truetype");
   font-style: normal;
-  font-weight: 600 900;
+  font-weight: 700;
   font-display: swap;
-  unicode-range: U+0000-0029, U+002B-066C, U+066E-10FFFF;
 }
 
 :root {
-  font-family: "Alkaheli UI", Tahoma, "Segoe UI", Arial, sans-serif;
+  font-family: "Alkaheli UI", "Segoe UI", Tahoma, Arial, sans-serif;
   color: #15243b;
   background: #eff8ff;
   font-synthesis: none;
+  font-feature-settings: normal;
+  font-kerning: normal;
+  font-variant-ligatures: common-ligatures contextual;
   text-rendering: optimizeLegibility;
   font-variant-numeric: lining-nums tabular-nums;
   --bg: #eff8ff;
@@ -156,7 +158,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border-radius: 12px;
   font-size: 15px;
   font-weight: 800;
-  line-height: 1;
+  line-height: 1.4;
   transition: transform .18s ease, box-shadow .18s ease, background .18s ease, border .18s ease;
 }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
@@ -233,6 +235,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .empty-state__icon { display: grid; place-items: center; width: 53px; height: 53px; margin-bottom: 11px; color: var(--blue); border-radius: 18px; background: var(--blue-soft); }
 .empty-state h3 { margin: 0; font-size: 16px; }
 .empty-state p { margin: 8px 0 16px; color: var(--muted); font-size: 14px; line-height: 1.75; }
+
+/* Arabic joining must not be altered by display-oriented tracking. */
+:lang(ar) .eyebrow,
+:lang(ar) .page-header h1,
+:lang(ar) .section-card h2,
+:lang(ar) .auth-intro h1,
+:lang(ar) .nav-group > p {
+  letter-spacing: normal;
+}
 
 .status-badge { display: inline-flex; align-items: center; justify-content: center; gap: 5px; width: fit-content; padding: 5px 9px; border: 1px solid transparent; border-radius: 999px; font-size: 13px; font-weight: 800; white-space: nowrap; }
 .status-badge--neutral { color: var(--muted-strong); border-color: var(--border); background: var(--surface-soft); }

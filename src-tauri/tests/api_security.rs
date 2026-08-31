@@ -810,7 +810,8 @@ async fn sqlite_records_and_theme_preference_persist_after_reopen() {
     let test_app = TestApp::new();
     let data_dir = test_app.data_dir.clone();
     let manager_token = bootstrap_manager(&test_app.router).await;
-    create_worker(&test_app.router, &manager_token, "عامل الاستمرارية").await;
+    let persisted_arabic_name = "انور النعاس";
+    create_worker(&test_app.router, &manager_token, persisted_arabic_name).await;
 
     let (status, _) = request_json(
         &test_app.router,
@@ -845,13 +846,11 @@ async fn sqlite_records_and_theme_preference_persist_after_reopen() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        workers["data"]["items"]
-            .as_array()
-            .expect("worker list")
-            .len(),
-        1
-    );
+    let persisted_workers = workers["data"]["items"]
+        .as_array()
+        .expect("worker list");
+    assert_eq!(persisted_workers.len(), 1);
+    assert_eq!(persisted_workers[0]["fullName"], persisted_arabic_name);
 
     drop(reopened);
     let _ = fs::remove_dir_all(data_dir);

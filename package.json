@@ -8,10 +8,11 @@
     "dev:web": "npm run dev",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "build:web": "tsc -b && vite build",
+    "build:web": "tsc -b && vite build && npm run verify:fonts",
     "build": "tauri build --bundles nsis,msi",
     "dist:win": "tauri build --ci --bundles nsis --target x86_64-pc-windows-msvc && node scripts/stage-windows-installer.mjs",
     "test:api": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "verify:fonts": "node scripts/verify-arabic-font-assets.mjs",
     "test": "npm run test:api && npm run build:web",
     "lint": "tsc -b --noEmit"
   },
