@@ -863,19 +863,6 @@ function DashboardView({ selectedDate, isManager, canFinancial, canWrite, naviga
             {isManager && finance?.net_profit_today !== undefined && <MetricCard label="صافي ربح اليوم" value={money(finance.net_profit_today)} note="ربح عمليات الزبائن بعد عمولة العامل" icon={<Sparkles size={21} />} tone="teal" />}
             {isManager && finance?.showroom_net_profit_today !== undefined && <MetricCard label="صافي ربح المعارض اليوم" value={money(finance.showroom_net_profit_today)} note="ربح عمليات المعارض بعد عمولة العامل" icon={<ArrowUpLeft size={21} />} tone="violet" />}
           </div>
-          {canFinancial && (
-            <section className="dashboard-finance glass-card">
-              <div className="dashboard-finance__header"><div><p className="eyebrow">ملخص الإدارة</p><h2>المؤشرات المالية لهذا الشهر</h2></div><button onClick={() => navigate('finance')}>التفاصيل المالية <ChevronLeft size={16} /></button></div>
-              <div className="dashboard-finance__grid">
-                <FinanceMini label="الإيراد الشهري" value={finance?.revenue_month} icon={<ArrowUpLeft size={17} />} />
-                <FinanceMini label="حصة الأعمال" value={finance?.business_share_month} icon={<Banknote size={17} />} />
-                <FinanceMini label="صافي الربح" value={finance?.net_profit_month} icon={<Sparkles size={17} />} accent />
-                <FinanceMini label="مستحقات العمال" value={finance?.worker_payables} icon={<UsersRound size={17} />} />
-                <FinanceMini label="مصاريف الشهر" value={finance?.expenses_month} icon={<ReceiptText size={17} />} />
-                <FinanceMini label="ديون المعارض" value={finance?.showroom_outstanding} icon={<Building2 size={17} />} />
-              </div>
-            </section>
-          )}
           <div className="dashboard-lower-grid">
             <SectionCard title="أحدث عمليات الغسيل" subtitle="آخر العمليات المسجلة في النظام" action={<button className="text-button" onClick={() => navigate('washes')}>عرض الكل <ChevronLeft size={15} /></button>}>
               {recent.length === 0 ? <EmptyState icon={<Car size={28} />} title="لا توجد عمليات بعد" description="ابدأ بإضافة أول عملية غسيل لهذا اليوم." action={<Button onClick={() => navigate('washes')} icon={<Plus size={17} />}>إضافة عملية</Button>} /> : <WashList washes={recent.slice(0, 5)} compact />}
@@ -892,10 +879,6 @@ function DashboardView({ selectedDate, isManager, canFinancial, canWrite, naviga
       )}
     </>
   );
-}
-
-function FinanceMini({ label, value, icon, accent = false }: { label: string; value: number | string | undefined; icon: ReactNode; accent?: boolean }) {
-  return <div className={`finance-mini ${accent ? 'finance-mini--accent' : ''}`}><span>{icon}{label}</span><strong>{money(value)}</strong></div>;
 }
 
 function FlowStep({ number, title, text }: { number: string; title: string; text: string }) {
@@ -1795,7 +1778,6 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
   const [showrooms, setShowrooms] = useState<Showroom[]>([]);
   const [showroomPayments, setShowroomPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'overview' | 'showroomPayments'>('overview');
   const [modal, setModal] = useState<'showroomPayment' | null>(null);
   const [editingShowroomPayment, setEditingShowroomPayment] = useState<PaymentRecord | null>(null);
 
@@ -1839,7 +1821,6 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
             <MetricCard label="صافي الربح اليومي" value={money(overview.net_profit_before_expenses)} note="إيراد الغسيل ناقص عمولات العمال" icon={<Sparkles size={22} />} tone="blue" />
             <MetricCard label="صافي الربح بعد المصروفات" value={money(overview.net_profit_after_expenses)} note="بعد خصم مصروفات الأعمال" icon={<ReceiptText size={22} />} tone="amber" />
             <MetricCard label="إجمالي إيراد الغسيل" value={money(overview.revenue)} note="نقدي وحسابات المعارض" icon={<ArrowUpLeft size={22} />} tone="teal" />
-            <MetricCard label="مستحقات العمال" value={money(overview.worker_payables)} note="بعد الاستقطاعات المالية" icon={<UsersRound size={22} />} tone="violet" />
             <MetricCard label="ديون المعارض" value={money(overview.showroom_outstanding)} note="أرصدة مستحقة التحصيل" icon={<Building2 size={22} />} tone="amber" />
           </div>
           <section className="finance-breakdown glass-card">
@@ -1850,22 +1831,13 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
             <div className="calculation-row calculation-row--subtract"><span>مصروفات الأعمال</span><strong>− {money(overview.business_expenses)}</strong></div>
             <div className="calculation-row calculation-row--result"><span>صافي الربح بعد المصروفات</span><strong>{money(overview.net_profit_after_expenses)}</strong></div>
           </section>
-          <div className="finance-tabs" role="tablist">
-            <button className={tab === 'overview' ? 'is-active' : ''} onClick={() => setTab('overview')}>الملخص</button>
-            <button className={tab === 'showroomPayments' ? 'is-active' : ''} onClick={() => setTab('showroomPayments')}>دفعات المعارض</button>
-          </div>
-          {tab === 'overview' && <FinanceOverviewPanel overview={overview} />}
-          {tab === 'showroomPayments' && <PaymentsPanel title="دفعات المعارض" records={showroomPayments} personLabel="المعرض" onAdd={() => setModal('showroomPayment')} onEdit={setEditingShowroomPayment} onDelete={(record) => { void deleteShowroomPayment(record); }} empty="لم تسجّل أي دفعة من المعارض بعد." />}
+          <div className="finance-payments-section"><PaymentsPanel title="دفعات المعارض" records={showroomPayments} personLabel="المعرض" onAdd={() => setModal('showroomPayment')} onEdit={setEditingShowroomPayment} onDelete={(record) => { void deleteShowroomPayment(record); }} empty="لم تسجّل أي دفعة من المعارض بعد." /></div>
         </>
       )}
       {modal === 'showroomPayment' && <ShowroomPaymentModal showrooms={showrooms} onClose={() => setModal(null)} onNotify={onNotify} onSaved={(record) => { setShowroomPayments((current) => [record, ...current]); setModal(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تسجيل دفعة المعرض وتحديث رصيده.' }); void load(); }} />}
       {editingShowroomPayment && <ShowroomPaymentModal payment={editingShowroomPayment} showrooms={showrooms} onClose={() => setEditingShowroomPayment(null)} onNotify={onNotify} onSaved={(record) => { setShowroomPayments((current) => current.map((item) => item.id === record.id ? record : item)); setEditingShowroomPayment(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تعديل دفعة المعرض وتحديث رصيده.' }); void load(); }} />}
     </>
   );
-}
-
-function FinanceOverviewPanel({ overview }: { overview: FinanceOverview }) {
-  return <SectionCard title="تركيبة الإيراد" className="finance-overview-panel"><div className="finance-overview-list"><div><span><Banknote size={17} /> إيراد نقدي</span><strong>{money(overview.cash_revenue)}</strong></div><div><span><Building2 size={17} /> إيراد على حساب المعارض</span><strong>{money(overview.showroom_revenue)}</strong></div><div><span><UsersRound size={17} /> عمولات العمال</span><strong>{money(overview.worker_commissions)}</strong></div></div></SectionCard>;
 }
 
 function PaymentsPanel({ title, records, personLabel, onAdd, onEdit, onDelete, empty }: { title: string; records: PaymentRecord[]; personLabel: string; onAdd: () => void; onEdit?: (record: PaymentRecord) => void; onDelete?: (record: PaymentRecord) => void; empty: string }) {
