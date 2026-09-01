@@ -70,25 +70,28 @@ jobs:
             throw "Installed application was not found at $application"
           }
 
-          $process = Start-Process -FilePath $application -PassThru
+          $stdoutPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stdout.log"
+          $stderrPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stderr.log"
+          $process = Start-Process -FilePath $application -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
           try {
             $healthy = $false
-            for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $lastProbeExitCode = $null
+            for ($attempt = 0; $attempt -lt 90; $attempt += 1) {
               Start-Sleep -Seconds 1
+              $process.Refresh()
               if ($process.HasExited) {
                 throw "Installed application exited before becoming ready"
               }
-              try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/health" -TimeoutSec 2
-                if ($health.ok -eq $true -and $health.data.status -eq "ok") {
-                  $healthy = $true
-                  break
-                }
-              } catch {
-                # The local service may still be starting.
+              $health = & curl.exe --noproxy "*" --fail --silent --max-time 2 "http://127.0.0.1:8787/api/health"
+              $lastProbeExitCode = $LASTEXITCODE
+              if ($lastProbeExitCode -eq 0 -and $health -match '"status":"ok"') {
+                $healthy = $true
+                break
               }
             }
             if (-not $healthy) {
+              $stderr = if (Test-Path $stderrPath) { (Get-Content $stderrPath -Raw) } else { "" }
+              Write-Output "::error title=Installed application health check failed::curl exit code: $lastProbeExitCode; stderr: $stderr"
               throw "Installed application did not pass its startup health check"
             }
           } finally {
