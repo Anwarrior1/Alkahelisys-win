@@ -422,6 +422,74 @@ async fn showroom_payments_reduce_debt_and_edit_delete_persist_without_touching_
 }
 
 #[tokio::test]
+async fn showroom_debt_report_range_filters_operation_dates_and_recalculates_totals() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل تقرير فترة المعرض").await;
+    let (status, showroom) = request_json(
+        &test_app.router, Method::POST, "/api/showrooms", Some(&manager_token),
+        Some(json!({"name":"معرض اختبار فترة التقرير","isActive":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let showroom_id = showroom["data"]["id"].as_str().unwrap().to_owned();
+
+    for (occurred_at, price, plate) in [
+        ("2026-08-10T09:00:00Z", "100", "أغسطس 10"),
+        ("2026-08-20T18:30:00Z", "200", "أغسطس 20"),
+        ("2026-08-31T22:00:00Z", "300", "سبتمبر 01"),
+    ] {
+        let (status, _) = request_json(
+            &test_app.router, Method::POST, "/api/washes", Some(&manager_token),
+            Some(json!({
+                "vehicleMake":"Toyota","vehicleModel":"Test","licensePlate":plate,
+                "price":price,"workerId":worker_id,"paymentType":"showroom","showroomId":showroom_id,
+                "showroomPaymentMethod":"cash","occurredAt":occurred_at,
+                "clientRequestId":Uuid::new_v4().to_string()
+            })),
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, _) = request_json(
+        &test_app.router, Method::POST, "/api/showroom-payments", Some(&manager_token),
+        Some(json!({"showroomId":showroom_id,"amount":"50","paidAt":"2026-08-15T12:00:00Z","notes":"دفعة أغسطس"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Africa/Tripoli is UTC+02:00, so this is the inclusive local range
+    // 2026-08-01 00:00:00 through 2026-08-31 23:59:59.999.
+    let august_url = format!(
+        "/api/showroom-debts/{showroom_id}?from=2026-07-31T22:00:00.000Z&to=2026-08-31T21:59:59.999Z"
+    );
+    let (status, august) = request_json(
+        &test_app.router, Method::GET, &august_url, Some(&manager_token), None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(august["data"]["outstandingWashCount"], 2);
+    assert_eq!(august["data"]["totalChargesMilli"], 300_000);
+    assert_eq!(august["data"]["totalPaymentsMilli"], 50_000);
+    assert_eq!(august["data"]["totalOutstandingMilli"], 250_000);
+    let operations = august["data"]["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 2);
+    assert!(operations.iter().any(|operation| operation["licensePlate"] == "أغسطس 10"));
+    assert!(operations.iter().any(|operation| operation["licensePlate"] == "أغسطس 20"));
+    assert!(!operations.iter().any(|operation| operation["licensePlate"] == "سبتمبر 01"));
+
+    let all_time_url = format!(
+        "/api/showroom-debts/{showroom_id}?from=0000-01-01T00:00:00Z&to=9999-12-31T23:59:59Z"
+    );
+    let (_, unchanged) = request_json(
+        &test_app.router, Method::GET, &all_time_url, Some(&manager_token), None,
+    ).await;
+    assert_eq!(unchanged["data"]["operations"].as_array().unwrap().len(), 3);
+    assert_eq!(unchanged["data"]["payments"].as_array().unwrap().len(), 1);
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_history() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;

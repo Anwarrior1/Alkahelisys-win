@@ -1353,22 +1353,26 @@ function ShowroomDebtCard({ item, onClick }: { item: ShowroomDebtSummary; onClic
 }
 
 function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClose, onNotify }: { showroomId: string; selectedDate: string; reportIssuer: string; onClose: () => void; onNotify: (message: ToastMessage) => void }) {
-  const range = selectedDateRange(selectedDate);
+  const [range, setRange] = useState<DateRange>(() => selectedDateRange(selectedDate));
   const [profile, setProfile] = useState<ShowroomDebtProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [editingPayment, setEditingPayment] = useState<PaymentRecord | null>(null);
+  const rangeIsComplete = Boolean(range.from && range.to);
+  const rangeIsValid = rangeIsComplete && range.from <= range.to;
+  useEffect(() => { setRange(selectedDateRange(selectedDate)); }, [selectedDate]);
   useEffect(() => {
+    if (!rangeIsValid) { setLoading(false); return; }
     let mounted = true;
     setLoading(true);
     setError(null);
-    api.showroomDebt(showroomId, selectedDate)
+    api.showroomDebt(showroomId, range)
       .then((result) => { if (mounted) setProfile(result); })
       .catch((requestError) => { if (mounted) { setError(friendlyError(requestError)); onNotify({ tone: 'error', text: friendlyError(requestError) }); } })
       .finally(() => { if (mounted) setLoading(false); });
     return () => { mounted = false; };
-  }, [showroomId, selectedDate, refreshKey]);
+  }, [showroomId, range.from, range.to, rangeIsValid, refreshKey]);
   useEffect(() => {
     const handleRefresh = () => setRefreshKey((current) => current + 1);
     window.addEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
@@ -1381,8 +1385,14 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
     <div className="showroom-debt-profile">
       <div className="profile-heading"><div className="profile-heading__avatar profile-heading__avatar--showroom"><Building2 size={26} /></div><div><h2>{profile.showroom.name}</h2><span>{profile.showroom.contact_name || 'معرض شريك'}</span></div></div>
       <div className="mini-metric-grid showroom-debt-summary"><div className="mini-metric"><span>عدد السيارات القائمة</span><strong>{formatNumber(profile.outstanding_wash_count)} سيارة</strong></div><MiniMetric label="إجمالي قيمة الغسيل" value={profile.total_charges} /><MiniMetric label="إجمالي الدفعات" value={profile.total_payments} tone="success" /><MiniMetric label="الرصيد المتبقي" value={profile.total_outstanding} tone="warning" /></div>
-      <SectionCard title="تاريخ تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تتبع تاريخ العمل العالمي."><div className="date-filter"><CalendarDays size={17} /><span>تاريخ العمل:</span><strong>{workingDateFormat(selectedDate)}</strong></div></SectionCard>
-      <SectionCard title="عمليات الغسيل الآجلة" subtitle={`${formatNumber(profile.outstanding_wash_count)} عملية في اليوم المحدد.`} action={<Button onClick={() => window.print()} disabled={loading} icon={<Printer size={17} />}>طباعة تقرير الدين</Button>}>
+      <SectionCard title="فترة تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تعتمد على تاريخ عملية الغسيل الفعلي." action={<div className="showroom-debt-print-controls">
+        <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => setRange((current) => ({ ...current, from: event.target.value }))} /></label>
+        <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => setRange((current) => ({ ...current, to: event.target.value }))} /></label>
+        <Button onClick={() => window.print()} disabled={loading || !rangeIsValid} icon={loading ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>طباعة تقرير الدين</Button>
+      </div>}>
+        {!rangeIsComplete ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> يرجى تحديد تاريخ البداية وتاريخ النهاية.</div> : range.from > range.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="date-filter"><CalendarDays size={17} /><span>الفترة المختارة:</span><strong>{workingDateFormat(range.from)} — {workingDateFormat(range.to)}</strong></div>}
+      </SectionCard>
+      <SectionCard title="عمليات الغسيل الآجلة" subtitle={`${formatNumber(profile.outstanding_wash_count)} عملية ضمن الفترة المحددة.`}>
         {loading ? <LoadingBlock label="جارٍ تحديث الفترة..." /> : profile.operations.length === 0 ? <EmptyState icon={<Car size={28} />} title="لا توجد عمليات دين ضمن الفترة المحددة" /> : <div className="data-table-wrap"><table className="data-table showroom-debt-table"><thead><tr><th>السيارة</th><th>اللوحة</th><th>اللون</th><th>العامل</th><th>طريقة السداد</th><th>التاريخ والوقت</th><th>السعر</th></tr></thead><tbody>{profile.operations.map((operation) => <tr key={operation.id}><td><strong>{operation.vehicle_make} {operation.vehicle_model}</strong><small>{operation.manufacturing_year || '—'}</small></td><td>{operation.license_plate || '—'}</td><td>{operation.car_color || '—'}</td><td>{operation.worker_name || '—'}</td><td>{operation.showroom_payment_method === 'bank' ? 'مصرفي' : 'نقدي'}</td><td>{dateFormat(operation.performed_at, true)}</td><td className="money-cell">{money(operation.price)}</td></tr>)}</tbody></table></div>}
       </SectionCard>
       <SectionCard title="سجل دفعات المعرض" subtitle={`${profile.payments.length} دفعة ضمن الفترة المحددة.`}>
@@ -1556,17 +1566,19 @@ function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotif
   return <SidePanel title="ملف المعرض" onClose={onClose}>
     <div className="profile-heading"><div className="profile-heading__avatar profile-heading__avatar--showroom"><Building2 size={26} /></div><div><h2>{showroom.name}</h2><span>{showroom.contact_name || 'معرض شريك'}</span></div></div>
     <div className="showroom-details"><span><Phone size={16} /> {showroom.phone || 'لا يوجد رقم اتصال'}</span>{showroom.address && <span>الموقع: {showroom.address}</span>}</div>
-    {isManager && finance && <section className="profile-financials"><div className="sensitive-label"><LockKeyhole size={14} /> تفاصيل مالية مخولة</div><div className="mini-metric-grid"><MiniMetric label="إجمالي الرسوم" value={finance.total_charges} /><MiniMetric label="المدفوعات" value={finance.total_payments} tone="success" /><MiniMetric label="الرصيد المستحق" value={finance.outstanding_balance} tone="warning" /></div></section>}
-    {isManager && <SectionCard title="سجل دفعات المعرض" subtitle="دفعات منفصلة مرتبطة بهذا المعرض فقط.">{showroom.payments?.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th></tr></thead><tbody>{showroom.payments.map((payment) => <tr key={payment.id}><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td></tr>)}</tbody></table></div> : <EmptyState icon={<Banknote size={26} />} title="لا توجد دفعات مسجلة لهذا المعرض" />}</SectionCard>}
-    <SectionCard title="إحصائيات السيارات" subtitle="العدد الفعلي للعمليات حسب التاريخ وطريقة الدفع.">
+    <div className="exhibition-profile-card-stack">
+      {isManager && finance && <section className="profile-financials"><div className="sensitive-label"><LockKeyhole size={14} /> تفاصيل مالية مخولة</div><div className="mini-metric-grid"><MiniMetric label="إجمالي الرسوم" value={finance.total_charges} /><MiniMetric label="المدفوعات" value={finance.total_payments} tone="success" /><MiniMetric label="الرصيد المستحق" value={finance.outstanding_balance} tone="warning" /></div></section>}
+      {isManager && <SectionCard title="سجل دفعات المعرض" subtitle="دفعات منفصلة مرتبطة بهذا المعرض فقط.">{showroom.payments?.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th></tr></thead><tbody>{showroom.payments.map((payment) => <tr key={payment.id}><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td></tr>)}</tbody></table></div> : <EmptyState icon={<Banknote size={26} />} title="لا توجد دفعات مسجلة لهذا المعرض" />}</SectionCard>}
+      <SectionCard title="إحصائيات السيارات" subtitle="العدد الفعلي للعمليات حسب التاريخ وطريقة الدفع.">
       <div className="showroom-statistics-filters">
         <FormField label="من تاريخ"><input type="date" value={statisticsRange.from} onChange={(event) => setStatisticsRange((current) => ({ ...current, from: event.target.value }))} /></FormField>
         <FormField label="إلى تاريخ"><input type="date" value={statisticsRange.to} onChange={(event) => setStatisticsRange((current) => ({ ...current, to: event.target.value }))} /></FormField>
         <FormField label="طريقة الدفع"><select value={paymentType} onChange={(event) => setPaymentType(event.target.value as typeof paymentType)}><option value="all">الكل</option><option value="cash">نقدي</option><option value="debt">دين</option></select></FormField>
       </div>
       {statisticsRange.from > statisticsRange.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="showroom-statistics-result"><Car size={20} /><span>عدد السيارات</span><strong>{statisticsLoading ? '...' : formatNumber(carCount)}</strong></div>}
-    </SectionCard>
-    <section className="profile-history"><div className="profile-section-heading"><h3>سجل الغسيل</h3><span>{showroom.washes?.length ?? 0} عملية</span></div>{showroom.washes?.length ? <WashList washes={showroom.washes} compact /> : <EmptyState title="لا توجد عمليات مسجلة" />}</section>
+      </SectionCard>
+      <section className="profile-history"><div className="profile-section-heading"><h3>سجل الغسيل</h3><span>{showroom.washes?.length ?? 0} عملية</span></div>{showroom.washes?.length ? <WashList washes={showroom.washes} compact /> : <EmptyState title="لا توجد عمليات مسجلة" />}</section>
+    </div>
   </SidePanel>;
 }
 

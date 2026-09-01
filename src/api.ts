@@ -535,8 +535,8 @@ class ApiClient {
       latest_wash_at: text(item.latestWashAt) || null,
     }));
   }
-  async showroomDebt(id: string, selectedDate: string): Promise<ShowroomDebtProfile> {
-    const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}${query({ date: selectedDate })}`));
+  async showroomDebt(id: string, range: DateRange): Promise<ShowroomDebtProfile> {
+    const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}${query({ from: range.from, to: range.to })}`));
     return {
       showroom: mapShowroom(value.showroom),
       from: text(value.from),
