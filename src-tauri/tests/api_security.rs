@@ -4,7 +4,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use chrono::{Duration, Local, Utc};
+use chrono::{Duration, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
@@ -17,6 +17,12 @@ const ALL_TIME_RANGE: &str = "from=0000-01-01T00:00:00Z&to=9999-12-31T23:59:59Z"
 
 fn all_time_endpoint(path: &str) -> String {
     format!("{path}?{ALL_TIME_RANGE}")
+}
+
+fn business_today_key() -> String {
+    (Utc::now() + Duration::hours(2))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 struct TestApp {
@@ -774,7 +780,7 @@ async fn create_cash_wash_at(router: &Router, token: &str, worker_id: &str, pric
 }
 
 async fn create_employee_cash_wash(router: &Router, token: &str, worker_id: &str, plate: &str) -> String {
-    let occurred_at = format!("{}T10:00:00Z", Local::now().format("%Y-%m-%d"));
+    let occurred_at = format!("{}T10:00:00Z", business_today_key());
     let (status, payload) = request_json(
         router,
         Method::POST,
@@ -1518,7 +1524,7 @@ async fn daily_revenue_permission_controls_dashboard_card_data_per_employee() {
         Some(json!({"permissionCodes":["operational.read","operational.write","dashboard.daily_revenue.read"]})),
     ).await;
     assert_eq!(status, StatusCode::OK);
-    let today = Local::now().format("%Y-%m-%d").to_string();
+    let today = business_today_key();
     create_cash_wash_at(&test_app.router, &employee_token, &worker_id, "80", &format!("{today}T10:00:00Z")).await;
     let (status, _) = request_json(
         &test_app.router, Method::POST, "/api/washes", Some(&employee_token),
@@ -1557,8 +1563,9 @@ async fn worker_daily_value_is_permission_scoped_and_stored_per_worker_and_date(
     let manager_token = bootstrap_manager(&test_app.router).await;
     let worker_a = create_worker(&test_app.router, &manager_token, "عامل القيمة أ").await;
     let worker_b = create_worker(&test_app.router, &manager_token, "عامل القيمة ب").await;
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Local::now() + Duration::days(1)).format("%Y-%m-%d").to_string();
+    let business_now = Utc::now() + Duration::hours(2);
+    let today = business_now.format("%Y-%m-%d").to_string();
+    let tomorrow = (business_now + Duration::days(1)).format("%Y-%m-%d").to_string();
 
     let (status, _) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_a}"), Some(&manager_token), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -2062,7 +2069,7 @@ async fn employee_operations_are_account_scoped_and_user_deletion_preserves_hist
     let wash_a = create_employee_cash_wash(&test_app.router, &employee_tokens[0], &worker_id, "1111 أ ب").await;
     let wash_b = create_employee_cash_wash(&test_app.router, &employee_tokens[1], &worker_id, "2222 أ ب").await;
 
-    let today = Local::now().format("%Y-%m-%d").to_string();
+    let today = business_today_key();
     let endpoint = format!("/api/washes?from={today}T00:00:00Z&to={today}T23:59:59Z");
     let (_, employee_a_washes) = request_json(&test_app.router, Method::GET, &endpoint, Some(&employee_tokens[0]), None).await;
     let (_, employee_b_washes) = request_json(&test_app.router, Method::GET, &endpoint, Some(&employee_tokens[1]), None).await;
