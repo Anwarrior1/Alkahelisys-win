@@ -154,6 +154,7 @@ export interface FinanceOverview {
   revenue?: Money;
   cash_revenue?: Money;
   showroom_revenue?: Money;
+  showroom_net_profit?: Money;
   worker_commissions?: Money;
   worker_deductions?: Money;
   worker_payables?: Money;
@@ -253,6 +254,8 @@ export type ExpenseAllocation = 'business_only' | 'workers_only' | 'shared';
 export interface ExpenseRecord {
   id: string;
   description: string;
+  category?: string;
+  payment_method?: 'cash' | 'bank';
   amount: Money;
   spent_at?: string;
   date?: string;

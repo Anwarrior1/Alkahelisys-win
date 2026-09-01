@@ -4020,6 +4020,7 @@ async fn create_showroom_payment(
 struct ExpenseInput {
     description: String,
     category: String,
+    payment_method: Option<String>,
     amount: String,
     occurred_at: Option<String>,
     notes: Option<String>,
@@ -4039,8 +4040,8 @@ async fn list_expenses(
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT e.id,e.description,e.category,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_bps,e.workers_bps,e.business_amount_milli,e.workers_amount_milli,u.full_name FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.occurred_at BETWEEN ?1 AND ?2 ORDER BY e.occurred_at DESC").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"amountMilli":row.get::<_,i64>(3)?,"occurredAt":row.get::<_,String>(4)?,"notes":row.get::<_,Option<String>>(5)?,"allocationType":row.get::<_,String>(6)?,"businessBps":row.get::<_,i64>(7)?,"workersBps":row.get::<_,i64>(8)?,"businessAmountMilli":row.get::<_,i64>(9)?,"workersAmountMilli":row.get::<_,i64>(10)?,"recordedBy":row.get::<_,String>(11)?}))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT e.id,e.description,e.category,e.payment_method,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_bps,e.workers_bps,e.business_amount_milli,e.workers_amount_milli,u.full_name FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.occurred_at BETWEEN ?1 AND ?2 ORDER BY e.occurred_at DESC").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"paymentMethod":row.get::<_,String>(3)?,"amountMilli":row.get::<_,i64>(4)?,"occurredAt":row.get::<_,String>(5)?,"notes":row.get::<_,Option<String>>(6)?,"allocationType":row.get::<_,String>(7)?,"businessBps":row.get::<_,i64>(8)?,"workersBps":row.get::<_,i64>(9)?,"businessAmountMilli":row.get::<_,i64>(10)?,"workersAmountMilli":row.get::<_,i64>(11)?,"recordedBy":row.get::<_,String>(12)?}))).map_err(ApiError::internal)?;
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
@@ -4055,6 +4056,10 @@ async fn create_expense(
     let principal = authorize(&state, &headers, "financial.manage")?;
     let description = trim_required(&input.description, "وصف المصروف")?;
     let category = trim_required(&input.category, "فئة المصروف")?;
+    let payment_method = input.payment_method.as_deref().unwrap_or("cash");
+    if !matches!(payment_method, "cash" | "bank") {
+        return Err(ApiError::bad("طريقة دفع المصروف غير صالحة"));
+    }
     let amount = parse_milli(&input.amount)?;
     let occurred_at = payment_time(&input.occurred_at)?;
     let (business_bps, workers_bps) = match input.allocation_type.as_str() {
@@ -4096,7 +4101,7 @@ async fn create_expense(
     }
     let id = new_id();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
-    tx.execute("INSERT INTO expenses(id,description,category,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![id,description,category,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,principal.id,now()]).map_err(ApiError::internal)?;
+    tx.execute("INSERT INTO expenses(id,description,category,payment_method,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![id,description,category,payment_method,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,principal.id,now()]).map_err(ApiError::internal)?;
     if workers_amount > 0 {
         let each = workers_amount / workers.len() as i64;
         let remainder = workers_amount % workers.len() as i64;
@@ -4124,7 +4129,7 @@ async fn create_expense(
         "expense",
         Some(&id),
         "تم تسجيل مصروف وتوزيعه",
-        Some(&json!({"allocationType":input.allocation_type,"workerCount":workers.len()})),
+        Some(&json!({"allocationType":input.allocation_type,"workerCount":workers.len(),"category":category,"paymentMethod":payment_method})),
     )?;
     if workers_amount > 0 {
         insert_audit_tx(
@@ -4153,7 +4158,7 @@ async fn expense_detail(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let expense = db.conn.query_row("SELECT e.id,e.description,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_amount_milli,e.workers_amount_milli,u.full_name,e.created_at FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"amountMilli":row.get::<_,i64>(2)?,"occurredAt":row.get::<_,String>(3)?,"notes":row.get::<_,Option<String>>(4)?,"allocationType":row.get::<_,String>(5)?,"businessAmountMilli":row.get::<_,i64>(6)?,"workersAmountMilli":row.get::<_,i64>(7)?,"recordedBy":row.get::<_,String>(8)?,"createdAt":row.get::<_,String>(9)?}))).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)?;
+    let expense = db.conn.query_row("SELECT e.id,e.description,e.category,e.payment_method,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_amount_milli,e.workers_amount_milli,u.full_name,e.created_at FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"paymentMethod":row.get::<_,String>(3)?,"amountMilli":row.get::<_,i64>(4)?,"occurredAt":row.get::<_,String>(5)?,"notes":row.get::<_,Option<String>>(6)?,"allocationType":row.get::<_,String>(7)?,"businessAmountMilli":row.get::<_,i64>(8)?,"workersAmountMilli":row.get::<_,i64>(9)?,"recordedBy":row.get::<_,String>(10)?,"createdAt":row.get::<_,String>(11)?}))).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)?;
     let mut allocations = Vec::new();
     let mut statement=db.conn.prepare("SELECT ea.worker_id,w.full_name,ea.amount_milli,ea.created_at FROM expense_allocations ea JOIN workers w ON w.id=ea.worker_id WHERE ea.expense_id=?1 ORDER BY ea.allocation_order").map_err(ApiError::internal)?;
     let rows=statement.query_map([id],|row|Ok(json!({"workerId":row.get::<_,String>(0)?,"workerName":row.get::<_,String>(1)?,"amountMilli":row.get::<_,i64>(2)?,"createdAt":row.get::<_,String>(3)?}))).map_err(ApiError::internal)?;
@@ -4171,6 +4176,11 @@ async fn update_expense(
 ) -> ApiResult {
     let principal = authorize(&state, &headers, "financial.manage")?;
     let description = trim_required(&input.description, "وصف المصروف")?;
+    let category = trim_required(&input.category, "فئة المصروف")?;
+    let payment_method = input.payment_method.as_deref().unwrap_or("cash");
+    if !matches!(payment_method, "cash" | "bank") {
+        return Err(ApiError::bad("طريقة دفع المصروف غير صالحة"));
+    }
     let amount = parse_milli(&input.amount)?;
     let occurred_at = payment_time(&input.occurred_at)?;
     let (business_bps, workers_bps) = match input.allocation_type.as_str() {
@@ -4234,7 +4244,7 @@ async fn update_expense(
             tx.execute("INSERT INTO expense_allocations(id,expense_id,worker_id,amount_milli,allocation_order,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![new_id(),id,worker_id,share,order as i64,now()]).map_err(ApiError::internal)?;
         }
     }
-    tx.execute("UPDATE expenses SET description=?1,amount_milli=?2,occurred_at=?3,notes=?4,allocation_type=?5,business_bps=?6,workers_bps=?7,business_amount_milli=?8,workers_amount_milli=?9 WHERE id=?10",params![description,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,id]).map_err(ApiError::internal)?;
+    tx.execute("UPDATE expenses SET description=?1,category=?2,payment_method=?3,amount_milli=?4,occurred_at=?5,notes=?6,allocation_type=?7,business_bps=?8,workers_bps=?9,business_amount_milli=?10,workers_amount_milli=?11 WHERE id=?12",params![description,category,payment_method,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,id]).map_err(ApiError::internal)?;
     add_financial_transaction(
         &tx,
         "expense_edit_post",
@@ -4254,7 +4264,7 @@ async fn update_expense(
         "expense",
         Some(&id),
         "تم تعديل المصروف وإعادة توزيع الاستقطاعات على لقطة العمال الأصلية",
-        Some(&json!({"workerCount":workers.len()})),
+        Some(&json!({"workerCount":workers.len(),"category":category,"paymentMethod":payment_method})),
     )?;
     if old.2 > 0 {
         insert_audit_tx(
@@ -4346,6 +4356,7 @@ fn financial_summary(
     let revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let cash=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let showroom_revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
+    let showroom_commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let business_share=total_for(conn,"SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let expenses = total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
@@ -4356,7 +4367,7 @@ fn financial_summary(
     let outstanding_worker=total_for(conn,"SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)-COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)),0))",params![from,to,owner_id])?;
     let outstanding_showroom=total_for(conn,"SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3))-(SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)",params![from,to,owner_id])?;
     Ok(
-        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"showroomRevenueMilli":showroom_revenue,"businessShareMilli":business_share,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":business_share,"netProfitAfterExpensesMilli":business_share-business_expenses,"netBusinessProfitMilli":business_share-business_expenses}),
+        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":business_share,"netProfitAfterExpensesMilli":business_share-business_expenses,"netBusinessProfitMilli":business_share-business_expenses}),
     )
 }
 

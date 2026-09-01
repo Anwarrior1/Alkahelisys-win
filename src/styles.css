@@ -453,8 +453,8 @@ html[data-theme='dark'] .topbar__utility .theme-toggle:hover { color: #1059ad; b
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
 /* dashboard */
-.metric-grid, .finance-hero-grid, .report-finance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-.finance-hero-grid, .report-finance-grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.metric-grid, .report-finance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.report-finance-grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
 .metric-card { position: relative; display: flex; align-items: flex-start; gap: 11px; min-height: 121px; padding: 17px; overflow: hidden; border: 1px solid var(--border); border-radius: 19px; background: var(--surface); box-shadow: var(--shadow-soft); backdrop-filter: blur(16px); }
 .metric-card::after { position: absolute; top: -24px; left: -20px; width: 80px; height: 80px; border-radius: 50%; content: ''; background: currentColor; opacity: .035; }
 .metric-card--blue { color: var(--blue); }
@@ -654,18 +654,9 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; padding-top: 14px; border-top: 1px solid var(--border); }
 
 /* finance */
-.finance-hero-grid { margin-bottom: 17px; }
-.finance-breakdown { padding: 21px; }
-.finance-breakdown__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 17px; margin-bottom: 14px; }
-.finance-breakdown__header h2 { margin: 0; font-size: 21px; }
-.calculation-note { max-width: 310px; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.calculation-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 11px 2px; border-bottom: 1px solid var(--border); color: var(--muted-strong); font-size: 14px; }
-.calculation-row strong { color: var(--text); font-size: 15px; white-space: nowrap; }
-.calculation-row--subtract strong { color: var(--danger); }
-.calculation-row--subtotal { padding-inline: 11px; color: var(--blue-deep); border-radius: 10px; background: var(--blue-tint); font-weight: 800; }
-.calculation-row--result { margin-top: 6px; padding: 14px; color: white; border: 0; border-radius: 13px; background: linear-gradient(135deg, #268ee8, #1163bf); }
-.calculation-row--result strong { color: white; font-size: 18px; }
-.finance-payments-section { margin-top: 17px; }
+.financial-execution-sections { display: grid; gap: 17px; }
+.expense-history-table td:nth-child(3) { min-width: 190px; }
+.expense-history-table td:nth-child(3) small { display: block; margin-top: 3px; color: var(--muted); }
 .report-manager-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 17px; margin-top: 17px; }
 .finance-overview-list { display: grid; }
 .finance-overview-list > div { display: flex; align-items: center; justify-content: space-between; gap: 11px; padding: 12px 1px; border-bottom: 1px solid var(--border); }
@@ -771,8 +762,8 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .access-denied p { max-width: 360px; margin: 0 0 19px; color: var(--muted); font-size: 15px; line-height: 1.8; }
 
 @media (max-width: 1230px) {
-  .metric-grid, .finance-hero-grid, .report-finance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .finance-hero-grid > .metric-card:last-child:nth-child(odd), .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .metric-grid, .report-finance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .worker-grid, .showroom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wash-page-grid { grid-template-columns: minmax(0, 1fr) 235px; }
 }
@@ -811,7 +802,7 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
   .page-header { align-items: flex-start; flex-direction: column; gap: 12px; margin-bottom: 18px; }
   .page-header__actions { align-self: stretch; }
   .page-header__actions .button { width: 100%; }
-  .metric-grid, .finance-hero-grid, .report-finance-grid { gap: 10px; }
+  .metric-grid, .report-finance-grid { gap: 10px; }
   .payroll-metrics { grid-template-columns: 1fr; }
   .payroll-filter .filter-hint { width: 100%; margin-inline-start: 0; }
   .settings-grid, .report-manager-details, .backup-grid { grid-template-columns: 1fr; }
@@ -844,15 +835,13 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
   .auth-card__heading { margin-bottom: 23px; }
   .auth-card__heading h2 { font-size: 24px; }
   .auth-form { gap: 16px; }
-  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .profile-operational-metrics, .worker-ledger-summary, .paid-cars-summary, .finance-hero-grid, .report-finance-grid { grid-template-columns: 1fr; }
-  .finance-hero-grid > .metric-card:last-child:nth-child(odd), .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: auto; }
+  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .profile-operational-metrics, .worker-ledger-summary, .paid-cars-summary, .report-finance-grid { grid-template-columns: 1fr; }
+  .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: auto; }
   .section-card { padding: 16px; border-radius: 19px; }
   .metric-card { min-height: 106px; padding: 14px; }
   .metric-card__icon { width: 35px; height: 35px; }
   .metric-card__content strong { font-size: 20px; }
   .metric-card__content small { display: none; }
-  .finance-breakdown { padding: 16px; }
-  .finance-breakdown__header { display: grid; gap: 7px; }
   .showroom-selection, .shared-expense-fields { grid-template-columns: 1fr; }
   .form-actions { align-items: stretch; flex-direction: column; }
   .form-actions .button { width: 100%; }
@@ -915,7 +904,6 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .sensitive-label,
 .mini-metric span,
 .profile-section-heading span,
-.calculation-note,
 .allocation-preview span,
 .allocation-preview small,
 .report-filter span,
@@ -977,7 +965,6 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .wash-row__price,
 .worker-ledger-entry strong,
 .mini-metric strong,
-.calculation-row,
 .finance-overview-list strong,
 .report-filter strong,
 .report-headline strong,

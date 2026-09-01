@@ -236,6 +236,7 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 description TEXT NOT NULL,
                 category TEXT NOT NULL,
+                payment_method TEXT NOT NULL DEFAULT 'cash' CHECK(payment_method IN ('cash','bank')),
                 amount_milli INTEGER NOT NULL CHECK(amount_milli > 0),
                 occurred_at TEXT NOT NULL,
                 notes TEXT,
@@ -781,6 +782,22 @@ impl Database {
                 [now()],
             )?;
         }
+        let expense_payment_method_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=20",
+            [],
+            |row| row.get(0),
+        )?;
+        if expense_payment_method_added == 0 {
+            self.ensure_column(
+                "expenses",
+                "payment_method",
+                "payment_method TEXT NOT NULL DEFAULT 'cash' CHECK(payment_method IN ('cash','bank'))",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(20, ?1)",
+                [now()],
+            )?;
+        }
         Ok(())
     }
 
@@ -926,6 +943,36 @@ pub fn default_commission_bps(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expense_payment_method_migration_preserves_existing_expenses() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-expense-payment-method-migration-tests")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&data_dir).unwrap();
+        let database = Database::open(&data_dir).unwrap();
+        database.conn.execute(
+            "INSERT INTO users(id,full_name,username_norm,password_hash,is_active,created_at,updated_at) VALUES('legacy-user','Legacy Manager','legacy.manager','unused',1,'2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        database.conn.execute_batch(
+            "DELETE FROM schema_migrations WHERE version=20;
+             ALTER TABLE expenses DROP COLUMN payment_method;
+             INSERT INTO expenses(id,description,category,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at)
+             VALUES('legacy-expense','Legacy expense','Legacy category',42000,'2026-08-01T12:00:00Z','preserve me','business',10000,0,42000,0,'legacy-user','2026-08-01T12:00:00Z');",
+        ).unwrap();
+        drop(database);
+
+        let reopened = Database::open(&data_dir).unwrap();
+        let stored: (String, String, i64, String, String) = reopened.conn.query_row(
+            "SELECT description,category,amount_milli,notes,payment_method FROM expenses WHERE id='legacy-expense'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(stored, ("Legacy expense".to_owned(), "Legacy category".to_owned(), 42_000, "preserve me".to_owned(), "cash".to_owned()));
+        drop(reopened);
+        let _ = fs::remove_dir_all(data_dir);
+    }
 
     #[test]
     fn migrations_preserve_workers_and_separate_legacy_payroll_records() {

@@ -236,6 +236,8 @@ function mapExpense(raw: unknown): ExpenseRecord {
   return {
     id: text(value.id),
     description: text(value.description),
+    category: text(value.category, 'أخرى'),
+    payment_method: value.paymentMethod === 'bank' ? 'bank' : 'cash',
     amount: money(value.amountMilli),
     spent_at: text(value.occurredAt) || undefined,
     notes: value.notes === null || value.notes === undefined ? null : text(value.notes),
@@ -254,6 +256,7 @@ function mapFinance(raw: unknown): FinanceOverview {
     revenue: money(value.totalWashRevenueMilli),
     cash_revenue: money(value.cashRevenueMilli),
     showroom_revenue: money(value.showroomRevenueMilli),
+    showroom_net_profit: money(value.showroomNetProfitMilli),
     worker_commissions: money(value.workerCommissionsMilli),
     worker_deductions: money(value.workerDeductionsMilli),
     worker_payables: money(value.outstandingWorkerBalancesMilli),
@@ -675,9 +678,10 @@ class ApiClient {
   async expenses(params?: Record<string, string | number | boolean | undefined | null>): Promise<ExpenseRecord[]> { return records(await this.get(`/expenses${query(params)}`)).map(mapExpense); }
   async createExpense(data: Record<string, unknown>): Promise<ExpenseRecord> {
     const allocation = text(data.allocation);
-    const payload = { description: text(data.description), category: 'أخرى', amount: text(data.amount), occurredAt: data.spent_at ?? undefined, notes: data.notes ?? null, allocationType: allocation === 'business_only' ? 'business' : allocation === 'workers_only' ? 'workers' : 'shared', businessBps: Math.round(number(data.business_percentage) * 100) };
+    const paymentMethod: 'cash' | 'bank' = data.payment_method === 'bank' ? 'bank' : 'cash';
+    const payload = { description: text(data.description), category: text(data.category, 'أخرى'), paymentMethod, amount: text(data.amount), occurredAt: data.spent_at ?? undefined, notes: data.notes ?? null, allocationType: allocation === 'business_only' ? 'business' : allocation === 'workers_only' ? 'workers' : 'shared', businessBps: Math.round(number(data.business_percentage) * 100) };
     const saved = record(await this.post('/expenses', payload));
-    return { id: text(saved.id), description: payload.description, amount: number(payload.amount), spent_at: text(payload.occurredAt), notes: payload.notes === null ? null : text(payload.notes), allocation: allocation as ExpenseRecord['allocation'], business_percentage: payload.businessBps / 100, workers_percentage: 100 - payload.businessBps / 100, business_amount: money(saved.businessAmountMilli), workers_amount: money(saved.workersAmountMilli) };
+    return { id: text(saved.id), description: payload.description, category: payload.category, payment_method: payload.paymentMethod, amount: number(payload.amount), spent_at: text(payload.occurredAt), notes: payload.notes === null ? null : text(payload.notes), allocation: allocation as ExpenseRecord['allocation'], business_percentage: payload.businessBps / 100, workers_percentage: 100 - payload.businessBps / 100, business_amount: money(saved.businessAmountMilli), workers_amount: money(saved.workersAmountMilli) };
   }
   async expense(id: string): Promise<ExpenseRecord> {
     const value = record(await this.get(`/expenses/${encodeURIComponent(id)}`));
@@ -688,7 +692,7 @@ class ApiClient {
   }
   async updateExpense(id: string, data: Record<string, unknown>): Promise<void> {
     const allocation = data.allocation === 'shared' ? 'shared' : 'business';
-    await this.patch(`/expenses/${encodeURIComponent(id)}`, { description: data.description, category: 'أخرى', amount: text(data.amount), occurredAt: data.spent_at, notes: data.notes ?? null, allocationType: allocation, businessBps: allocation === 'shared' ? 5000 : 10000 });
+    await this.patch(`/expenses/${encodeURIComponent(id)}`, { description: data.description, category: text(data.category, 'أخرى'), paymentMethod: data.payment_method === 'bank' ? 'bank' : 'cash', amount: text(data.amount), occurredAt: data.spent_at, notes: data.notes ?? null, allocationType: allocation, businessBps: allocation === 'shared' ? 5000 : 10000 });
   }
   async deleteExpense(id: string): Promise<void> { await this.delete(`/expenses/${encodeURIComponent(id)}`); }
 
