@@ -858,7 +858,6 @@ function DashboardView({ selectedDate, isManager, canFinancial, canWrite, naviga
           <div className="metric-grid">
             <MetricCard label="السيارات اليوم" value={data.operational?.cars_today ?? 0} note="عملية مسجلة اليوم" icon={<Car size={21} />} />
             <MetricCard label="السيارات هذا الشهر" value={data.operational?.cars_this_month ?? 0} note="إجمالي عمليات الشهر" icon={<CalendarDays size={21} />} tone="teal" />
-            <MetricCard label="العمال النشطون" value={data.operational?.active_workers ?? 0} note="جاهزون للعمل" icon={<UsersRound size={21} />} tone="violet" />
             {finance?.revenue_today !== undefined && <MetricCard label="إيراد اليوم" value={money(finance.revenue_today)} note={isManager ? 'إجمالي عمليات الزبائن والمعارض' : 'إجمالي عملياتك المكتملة اليوم'} icon={<CircleDollarSign size={21} />} tone="amber" />}
             {isManager && finance?.showroom_revenue_today !== undefined && <MetricCard label="إيراد المعارض اليوم" value={money(finance.showroom_revenue_today)} note="عمليات المعارض الآجلة فقط" icon={<Building2 size={21} />} tone="blue" />}
             {isManager && finance?.net_profit_today !== undefined && <MetricCard label="صافي ربح اليوم" value={money(finance.net_profit_today)} note="ربح عمليات الزبائن بعد عمولة العامل" icon={<Sparkles size={21} />} tone="teal" />}
@@ -1359,8 +1358,13 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [editingPayment, setEditingPayment] = useState<PaymentRecord | null>(null);
+  const [reportGeneratedAt, setReportGeneratedAt] = useState(() => new Date());
   const rangeIsComplete = Boolean(range.from && range.to);
   const rangeIsValid = rangeIsComplete && range.from <= range.to;
+  const printDebtReport = () => {
+    setReportGeneratedAt(new Date());
+    window.requestAnimationFrame(() => window.print());
+  };
   useEffect(() => { setRange(selectedDateRange(selectedDate)); }, [selectedDate]);
   useEffect(() => {
     if (!rangeIsValid) { setLoading(false); return; }
@@ -1388,7 +1392,7 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
       <SectionCard title="فترة تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تعتمد على تاريخ عملية الغسيل الفعلي." action={<div className="showroom-debt-print-controls">
         <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => setRange((current) => ({ ...current, from: event.target.value }))} /></label>
         <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => setRange((current) => ({ ...current, to: event.target.value }))} /></label>
-        <Button onClick={() => window.print()} disabled={loading || !rangeIsValid} icon={loading ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>طباعة تقرير الدين</Button>
+        <Button onClick={printDebtReport} disabled={loading || !rangeIsValid} icon={loading ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>طباعة تقرير الدين</Button>
       </div>}>
         {!rangeIsComplete ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> يرجى تحديد تاريخ البداية وتاريخ النهاية.</div> : range.from > range.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="date-filter"><CalendarDays size={17} /><span>الفترة المختارة:</span><strong>{workingDateFormat(range.from)} — {workingDateFormat(range.to)}</strong></div>}
       </SectionCard>
@@ -1399,12 +1403,12 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
         {profile.payments.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد دفعات ضمن الفترة المحددة" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{profile.payments.map((payment) => <tr key={payment.id}><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td><td><div className="row-actions"><button type="button" onClick={() => setEditingPayment(payment)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button><button type="button" className="danger-action" onClick={async () => { if (!window.confirm('هل تريد حذف هذه الدفعة؟ سيعود المبلغ إلى رصيد المعرض.')) return; try { await api.deleteShowroomPayment(payment.id); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم حذف الدفعة وإعادة احتساب رصيد المعرض.' }); } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); } }} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
       </SectionCard>
     </div>
-    <ShowroomDebtPrintReport profile={profile} range={range} reportIssuer={reportIssuer} />
+    <ShowroomDebtPrintReport profile={profile} range={range} reportIssuer={reportIssuer} generatedAt={reportGeneratedAt} />
     {editingPayment && <ShowroomPaymentModal payment={editingPayment} showrooms={[profile.showroom]} onClose={() => setEditingPayment(null)} onNotify={onNotify} onSaved={() => { setEditingPayment(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تعديل الدفعة وإعادة احتساب رصيد المعرض.' }); }} />}
   </Modal>;
 }
 
-function ShowroomDebtPrintReport({ profile, range, reportIssuer }: { profile: ShowroomDebtProfile; range: DateRange; reportIssuer: string }) {
+function ShowroomDebtPrintReport({ profile, range, reportIssuer, generatedAt }: { profile: ShowroomDebtProfile; range: DateRange; reportIssuer: string; generatedAt: Date }) {
   let unappliedPayments = Math.max(0, safeNumber(profile.total_payments));
   const paidByOperation = new Map<string, number>();
   [...profile.operations]
@@ -1427,7 +1431,6 @@ function ShowroomDebtPrintReport({ profile, range, reportIssuer }: { profile: Sh
     { label: '61 - 90 يوماً', color: '#ef5350', amount: 0 },
     { label: 'أكثر من 90 يوماً', color: '#c81d25', amount: 0 },
   ];
-  const generatedAt = new Date(`${range.to}T12:00:00+02:00`);
   reportRows.forEach(({ operation, remaining }) => {
     const washDate = new Date(operation.performed_at);
     const ageDays = Number.isNaN(washDate.getTime()) ? 0 : Math.max(0, Math.floor((generatedAt.getTime() - washDate.getTime()) / 86_400_000));
@@ -1448,7 +1451,7 @@ function ShowroomDebtPrintReport({ profile, range, reportIssuer }: { profile: Sh
   return <section className="showroom-debt-print" dir="rtl">
     <header className="showroom-debt-print__header">
       <div className="showroom-debt-print__mark"><span>صدر بواسطة</span><strong>{reportIssuer}</strong></div>
-      <div className="showroom-debt-print__title"><h1>تقرير دين المعرض</h1><p><CalendarDays size={15} /> التاريخ: <strong>{dateFormat(generatedAt.toISOString())}</strong></p></div>
+      <div className="showroom-debt-print__title"><h1>تقرير دين المعرض</h1><p><CalendarDays size={15} /> تاريخ إصدار التقرير: <strong>{workingDateFormat(businessDateKey(generatedAt))}</strong></p></div>
       <div className="showroom-debt-print__business"><strong>{DEBT_REPORT_BUSINESS_NAME}</strong></div>
     </header>
 
