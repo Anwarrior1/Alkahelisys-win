@@ -95,21 +95,21 @@ async fn wash_type_is_created_listed_edited_and_persisted_after_restart() {
     assert_eq!(completed["data"]["items"][0]["id"], wash_id);
     assert_eq!(completed["data"]["items"][0]["washType"], "Inside Only");
 
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &paid_status_endpoint,
+        Some(&manager_token),
+        Some(json!({"isPaid":false})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+
     let (status, overnight_marked) = request_json(
         &test_app.router,
         Method::PATCH,
-        &format!("/api/washes/{wash_id}"),
+        &format!("/api/washes/{wash_id}/overnight"),
         Some(&manager_token),
-        Some(json!({
-            "vehicleMake":"Toyota",
-            "vehicleModel":"Camry",
-            "washType":"Inside Only",
-            "price":"50",
-            "workerId":worker_id,
-            "paymentType":"cash",
-            "occurredAt":occurred_at,
-            "markAsOvernight":true
-        })),
+        Some(json!({"isOvernight":true})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(overnight_marked["data"]["wash"]["washType"], "Inside Only");
@@ -138,22 +138,13 @@ async fn wash_type_is_created_listed_edited_and_persisted_after_restart() {
             "price":"50",
             "workerId":worker_id,
             "paymentType":"cash",
-            "occurredAt":occurred_at,
-            "markAsOvernight":true
+            "occurredAt":occurred_at
         })),
     ).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(updated["data"]["wash"]["washType"], "Inside Only Updated");
     assert_eq!(updated["data"]["wash"]["commissionMilli"], 25_000);
 
-    let (_, completed_after_edit) = request_json(
-        &test_app.router,
-        Method::GET,
-        &paid_cars_endpoint,
-        Some(&manager_token),
-        None,
-    ).await;
-    assert_eq!(completed_after_edit["data"]["items"][0]["washType"], "Inside Only Updated");
     let (_, overnight_after_edit) = request_json(
         &test_app.router,
         Method::GET,
@@ -162,6 +153,31 @@ async fn wash_type_is_created_listed_edited_and_persisted_after_restart() {
         None,
     ).await;
     assert_eq!(overnight_after_edit["data"]["items"][0]["wash"]["washType"], "Inside Only Updated");
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &paid_status_endpoint,
+        Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, completed_after_edit) = request_json(
+        &test_app.router,
+        Method::GET,
+        &paid_cars_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(completed_after_edit["data"]["items"][0]["washType"], "Inside Only Updated");
+    let (_, inactive_overnight_after_paid) = request_json(
+        &test_app.router,
+        Method::GET,
+        &overnight_endpoint,
+        Some(&manager_token),
+        None,
+    ).await;
+    assert!(inactive_overnight_after_paid["data"]["items"].as_array().unwrap().is_empty());
 
     let TestApp { router, data_dir } = test_app;
     drop(router);
@@ -182,7 +198,7 @@ async fn wash_type_is_created_listed_edited_and_persisted_after_restart() {
         Some(&reopened_token),
         None,
     ).await;
-    assert_eq!(overnight_after_restart["data"]["items"][0]["wash"]["washType"], "Inside Only Updated");
+    assert!(overnight_after_restart["data"]["items"].as_array().unwrap().is_empty());
     drop(reopened);
 
     let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
@@ -1839,8 +1855,8 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     create_cash_wash_at(&test_app.router, &manager_token, &worker_id, "90", &following_midnight).await;
 
     let (status, _) = request_json(
-        &test_app.router, Method::PATCH, &format!("/api/washes/{second_id}"), Some(&manager_token),
-        Some(json!({"vehicleMake":"Toyota","vehicleModel":"Global B","price":"40","workerId":worker_id,"paymentType":"cash","occurredAt":selected_evening,"markAsOvernight":true})),
+        &test_app.router, Method::PATCH, &format!("/api/washes/{second_id}/overnight"), Some(&manager_token),
+        Some(json!({"isOvernight":true})),
     ).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = request_json(
@@ -1848,22 +1864,6 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
         Some(json!({"isPaid":true})),
     ).await;
     assert_eq!(status, StatusCode::OK);
-
-    // Paying and marking an overnight car are real transactions of their own. The
-    // public mutation endpoints correctly stamp the actual time, so move only those
-    // two timestamps into the historical fixture before exercising historical views.
-    // This is test setup, not behavior performed by the selected-date feature.
-    {
-        let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
-        connection.execute(
-            "UPDATE wash_operations SET paid_at=?1 WHERE id=?2",
-            params![selected_evening, second_id],
-        ).unwrap();
-        connection.execute(
-            "UPDATE overnight_cars SET marked_at=?1 WHERE wash_id=?2",
-            params![selected_evening, second_id],
-        ).unwrap();
-    }
 
     for (date, amount) in [(&selected_key, "110"), (&following_key, "220")] {
         let (status, _) = request_json(
@@ -1956,7 +1956,7 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     assert_eq!(paid["data"]["items"].as_array().unwrap().len(), 1);
     assert_eq!(paid["data"]["settlementMilli"], 40_000);
     let (_, overnight) = request_json(&test_app.router, Method::GET, &format!("/api/overnight-cars?{selected_query}"), Some(&manager_token), None).await;
-    assert_eq!(overnight["data"]["items"].as_array().unwrap().len(), 1);
+    assert!(overnight["data"]["items"].as_array().unwrap().is_empty(), "completed overnight cars are not active");
     let (_, workers) = request_json(&test_app.router, Method::GET, &format!("/api/workers?{selected_query}"), Some(&manager_token), None).await;
     assert_eq!(workers["data"]["items"][0]["washCount"], 3);
     let (_, worker) = request_json(&test_app.router, Method::GET, &format!("/api/workers/{worker_id}?{selected_query}"), Some(&manager_token), None).await;
@@ -2013,8 +2013,11 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     assert!(paid_after_revert["data"]["items"].as_array().unwrap().is_empty());
     assert_eq!(paid_after_revert["data"]["settlementMilli"], 0);
     let (_, latest_after_revert) = request_json(&test_app.router, Method::GET, &format!("/api/washes?{selected_query}"), Some(&manager_token), None).await;
-    assert_eq!(latest_after_revert["data"]["items"].as_array().unwrap().len(), 3);
-    assert!(latest_after_revert["data"]["items"].as_array().unwrap().iter().any(|item| item["id"] == second_id));
+    assert_eq!(latest_after_revert["data"]["items"].as_array().unwrap().len(), 2);
+    assert!(!latest_after_revert["data"]["items"].as_array().unwrap().iter().any(|item| item["id"] == second_id));
+    let (_, overnight_after_revert) = request_json(&test_app.router, Method::GET, &format!("/api/overnight-cars?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(overnight_after_revert["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(overnight_after_revert["data"]["items"][0]["wash"]["id"], second_id);
 
     let (_, following_dashboard) = request_json(&test_app.router, Method::GET, &format!("/api/dashboard?date={following_key}"), Some(&manager_token), None).await;
     assert_eq!(following_dashboard["data"]["todayWashes"], 2);
@@ -2040,7 +2043,7 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     ).unwrap();
     assert_eq!(unchanged_operation_time, selected_morning);
     assert!(unchanged_paid_time.is_none(), "reverting paid status clears only paid metadata");
-    assert_eq!(unchanged_overnight_time, selected_evening);
+    assert_ne!(unchanged_overnight_time, selected_evening, "marking metadata may reflect the action time without changing the operation date");
     drop(connection);
     test_app.cleanup();
 }
@@ -2780,6 +2783,155 @@ async fn manager_edits_and_reversals_preserve_financial_integrity() {
 }
 
 #[tokio::test]
+async fn overnight_completion_preserves_original_operation_and_financial_date() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل دورة المبيت").await;
+    let business_today = (Utc::now() + Duration::hours(2)).date_naive();
+    let operation_day = business_today - Duration::days(2);
+    let following_day = operation_day + Duration::days(1);
+    let operation_key = operation_day.format("%Y-%m-%d").to_string();
+    let following_key = following_day.format("%Y-%m-%d").to_string();
+    let operation_start_utc = operation_day.and_hms_opt(0, 0, 0).unwrap() - Duration::hours(2);
+    let operation_at = format!("{}Z", (operation_start_utc + Duration::hours(10)).format("%Y-%m-%dT%H:%M:%S"));
+
+    let (status, created) = request_json(
+        &test_app.router, Method::POST, "/api/washes", Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Overnight Original","licensePlate":"OVERNIGHT-1",
+            "carColor":"أبيض","washType":"غسيل كامل","price":"50","workerId":worker_id,
+            "paymentType":"cash","occurredAt":operation_at,"clientRequestId":Uuid::new_v4().to_string()
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let wash_id = created["data"]["wash"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["data"]["wash"]["commissionMilli"], 25_000);
+
+    let selected_query = format!("date={operation_key}");
+    let (_, recent_before) = request_json(&test_app.router, Method::GET, &format!("/api/washes?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(recent_before["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(recent_before["data"]["items"][0]["id"], wash_id);
+
+    let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    let transactions_before: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM financial_transactions WHERE source_id=?1", [&wash_id], |row| row.get(0),
+    ).unwrap();
+    drop(connection);
+    assert_eq!(transactions_before, 1);
+
+    let (status, marked) = request_json(
+        &test_app.router, Method::PATCH, &format!("/api/washes/{wash_id}/overnight"), Some(&manager_token),
+        Some(json!({"isOvernight":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(marked["data"]["wash"]["id"], wash_id);
+    assert_eq!(marked["data"]["wash"]["occurredAt"], operation_at);
+
+    let (_, recent_after_mark) = request_json(&test_app.router, Method::GET, &format!("/api/washes?{selected_query}"), Some(&manager_token), None).await;
+    assert!(recent_after_mark["data"]["items"].as_array().unwrap().is_empty());
+    let (_, dashboard_after_mark) = request_json(&test_app.router, Method::GET, &format!("/api/dashboard?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(dashboard_after_mark["data"]["todayWashes"], 1);
+    assert!(dashboard_after_mark["data"]["recentWashes"].as_array().unwrap().is_empty());
+    let (_, overnight) = request_json(&test_app.router, Method::GET, &format!("/api/overnight-cars?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(overnight["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(overnight["data"]["items"][0]["wash"]["id"], wash_id);
+    assert_eq!(overnight["data"]["items"][0]["wash"]["occurredAt"], operation_at);
+
+    let (status, completed) = request_json(
+        &test_app.router, Method::PATCH, &format!("/api/washes/{wash_id}/paid?{selected_query}"), Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(completed["data"]["wash"]["id"], wash_id);
+    assert_eq!(completed["data"]["wash"]["occurredAt"], operation_at);
+    assert_eq!(completed["data"]["settlementMilli"], 50_000);
+
+    let (_, active_overnight_after_paid) = request_json(&test_app.router, Method::GET, &format!("/api/overnight-cars?{selected_query}"), Some(&manager_token), None).await;
+    assert!(active_overnight_after_paid["data"]["items"].as_array().unwrap().is_empty());
+    let (_, paid_original_day) = request_json(&test_app.router, Method::GET, &format!("/api/paid-cars?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(paid_original_day["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(paid_original_day["data"]["items"][0]["id"], wash_id);
+    assert_eq!(paid_original_day["data"]["items"][0]["occurredAt"], operation_at);
+    assert_eq!(paid_original_day["data"]["settlementMilli"], 50_000);
+    let (_, paid_following_day) = request_json(&test_app.router, Method::GET, &format!("/api/paid-cars?date={following_key}"), Some(&manager_token), None).await;
+    assert!(paid_following_day["data"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(paid_following_day["data"]["settlementMilli"], 0);
+
+    let (_, finance_original_day) = request_json(&test_app.router, Method::GET, &format!("/api/finance/overview?{selected_query}"), Some(&manager_token), None).await;
+    assert_eq!(finance_original_day["data"]["totalWashRevenueMilli"], 50_000);
+    assert_eq!(finance_original_day["data"]["workerCommissionsMilli"], 25_000);
+    assert_eq!(finance_original_day["data"]["netProfitBeforeExpensesMilli"], 25_000);
+    let (_, finance_following_day) = request_json(&test_app.router, Method::GET, &format!("/api/finance/overview?date={following_key}"), Some(&manager_token), None).await;
+    assert_eq!(finance_following_day["data"]["totalWashRevenueMilli"], 0);
+    assert_eq!(finance_following_day["data"]["workerCommissionsMilli"], 0);
+
+    let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    let stored: (String, i64, i64, Option<String>, Option<String>) = connection.query_row(
+        "SELECT occurred_at,commission_milli,is_paid,paid_at,paid_by FROM wash_operations WHERE id=?1",
+        [&wash_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).unwrap();
+    assert_eq!(stored.0, operation_at);
+    assert_eq!(stored.1, 25_000);
+    assert_eq!(stored.2, 1);
+    assert!(stored.3.is_some(), "paidAt remains available as informational metadata");
+    assert!(stored.4.is_none(), "completion must not be financially associated with the clicking account");
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM wash_operations WHERE id=?1", [&wash_id], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM overnight_cars WHERE wash_id=?1", [&wash_id], |row| row.get::<_,i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM financial_transactions WHERE source_id=?1", [&wash_id], |row| row.get::<_,i64>(0)).unwrap(), transactions_before);
+    drop(connection);
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn finance_separates_profit_before_and_after_business_expenses_by_period() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل اختبار الربحين").await;
+    let business_today = (Utc::now() + Duration::hours(2)).date_naive();
+    let selected = business_today - Duration::days(2);
+    let unrelated = selected + Duration::days(1);
+    let selected_key = selected.format("%Y-%m-%d").to_string();
+    let unrelated_key = unrelated.format("%Y-%m-%d").to_string();
+    let selected_start_utc = selected.and_hms_opt(0, 0, 0).unwrap() - Duration::hours(2);
+    let unrelated_start_utc = unrelated.and_hms_opt(0, 0, 0).unwrap() - Duration::hours(2);
+    let wash_at = format!("{}Z", (selected_start_utc + Duration::hours(9)).format("%Y-%m-%dT%H:%M:%S"));
+    let selected_expense_at = format!("{}Z", (selected_start_utc + Duration::hours(12)).format("%Y-%m-%dT%H:%M:%S"));
+    let unrelated_expense_at = format!("{}Z", (unrelated_start_utc + Duration::hours(12)).format("%Y-%m-%dT%H:%M:%S"));
+    create_cash_wash_at(&test_app.router, &manager_token, &worker_id, "50", &wash_at).await;
+    for (description, amount, occurred_at) in [
+        ("مصروف الأعمال المحدد", "500", &selected_expense_at),
+        ("مصروف يوم آخر", "100", &unrelated_expense_at),
+    ] {
+        let (status, _) = request_json(
+            &test_app.router, Method::POST, "/api/expenses", Some(&manager_token),
+            Some(json!({"description":description,"category":"اختبار","amount":amount,"occurredAt":occurred_at,"allocationType":"business"})),
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (_, selected_finance) = request_json(&test_app.router, Method::GET, &format!("/api/finance/overview?date={selected_key}"), Some(&manager_token), None).await;
+    assert_eq!(selected_finance["data"]["totalWashRevenueMilli"], 50_000);
+    assert_eq!(selected_finance["data"]["workerCommissionsMilli"], 25_000);
+    assert_eq!(selected_finance["data"]["businessExpensesMilli"], 500_000);
+    assert_eq!(selected_finance["data"]["netProfitBeforeExpensesMilli"], 25_000);
+    assert_eq!(selected_finance["data"]["netProfitAfterExpensesMilli"], -475_000);
+
+    let (_, unrelated_finance) = request_json(&test_app.router, Method::GET, &format!("/api/finance/overview?date={unrelated_key}"), Some(&manager_token), None).await;
+    assert_eq!(unrelated_finance["data"]["netProfitBeforeExpensesMilli"], 0);
+    assert_eq!(unrelated_finance["data"]["netProfitAfterExpensesMilli"], -100_000);
+
+    let range_endpoint = format!(
+        "/api/finance/overview?from={}Z&to={}Z",
+        selected_start_utc.format("%Y-%m-%dT%H:%M:%S"),
+        (unrelated_start_utc + Duration::hours(24) - Duration::seconds(1)).format("%Y-%m-%dT%H:%M:%S")
+    );
+    let (_, range_finance) = request_json(&test_app.router, Method::GET, &range_endpoint, Some(&manager_token), None).await;
+    assert_eq!(range_finance["data"]["netProfitBeforeExpensesMilli"], 25_000);
+    assert_eq!(range_finance["data"]["netProfitAfterExpensesMilli"], -575_000);
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn overnight_cars_are_unique_linked_and_manager_only() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
@@ -2802,6 +2954,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
     assert_eq!(status, StatusCode::OK);
     let employee_token = login(&test_app.router, "overnight.employee", EMPLOYEE_PASSWORD).await;
     let employee_wash_id = create_employee_cash_wash(&test_app.router, &employee_token, &worker_id, "5678 أ ب").await;
+    let overnight_endpoint = all_time_endpoint("/api/overnight-cars");
 
     let edit_payload = json!({
         "vehicleMake":"Toyota",
@@ -2826,7 +2979,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
     let (status, _) = request_json(
         &test_app.router,
         Method::GET,
-        "/api/overnight-cars",
+        &overnight_endpoint,
         Some(&employee_token),
         None,
     ).await;
@@ -2855,7 +3008,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
     assert_eq!(employee_update["data"]["wash"]["worker"]["id"], worker_id);
     assert_eq!(employee_update["data"]["wash"]["priceMilli"], 40_000);
     assert!(employee_update["data"]["wash"].get("commissionMilli").is_none());
-    let (_, employee_overnight) = request_json(&test_app.router, Method::GET, "/api/overnight-cars", Some(&employee_token), None).await;
+    let (_, employee_overnight) = request_json(&test_app.router, Method::GET, &overnight_endpoint, Some(&employee_token), None).await;
     assert_eq!(employee_overnight["data"]["items"].as_array().unwrap().len(), 1);
     assert_eq!(employee_overnight["data"]["items"][0]["wash"]["id"], employee_wash_id);
     assert_eq!(employee_overnight["data"]["items"][0]["wash"]["priceMilli"], 40_000);
@@ -2885,7 +3038,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
         Some(unmark_payload),
     ).await;
     assert_eq!(status, StatusCode::OK);
-    let (_, after_unmark) = request_json(&test_app.router, Method::GET, "/api/overnight-cars", Some(&manager_token), None).await;
+    let (_, after_unmark) = request_json(&test_app.router, Method::GET, &overnight_endpoint, Some(&manager_token), None).await;
     assert_eq!(after_unmark["data"]["items"].as_array().unwrap().len(), 1);
 
     let (status, _) = request_json(
@@ -2900,7 +3053,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
     let (status, overnight) = request_json(
         &test_app.router,
         Method::GET,
-        "/api/overnight-cars",
+        &overnight_endpoint,
         Some(&manager_token),
         None,
     ).await;
@@ -2930,11 +3083,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
         Some(&manager_token),
         None,
     ).await;
-    let original = washes["data"]["items"].as_array().unwrap().iter()
-        .find(|wash| wash["id"] == wash_id).unwrap();
-    assert_eq!(original["isOvernight"], true);
-    assert_eq!(original["vehicleModel"], "Camry");
-    assert_eq!(original["carColor"], "أزرق");
+    assert!(!washes["data"]["items"].as_array().unwrap().iter().any(|wash| wash["id"] == wash_id), "overnight washes must leave Recent Operations");
 
     let (status, _) = request_json(
         &test_app.router,
@@ -2944,7 +3093,7 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
         None,
     ).await;
     assert_eq!(status, StatusCode::OK);
-    let (_, overnight_after_delete) = request_json(&test_app.router, Method::GET, "/api/overnight-cars", Some(&manager_token), None).await;
+    let (_, overnight_after_delete) = request_json(&test_app.router, Method::GET, &overnight_endpoint, Some(&manager_token), None).await;
     assert_eq!(overnight_after_delete["data"]["items"].as_array().unwrap().len(), 1);
     let (_, wash_after_delete) = request_json(&test_app.router, Method::GET, "/api/washes?from=2026-08-29T00:00:00Z&to=2026-08-29T23:59:59Z", Some(&manager_token), None).await;
     assert_eq!(wash_after_delete["data"]["items"][0]["id"], wash_id);

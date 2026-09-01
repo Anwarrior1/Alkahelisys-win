@@ -454,6 +454,7 @@ html[data-theme='dark'] .topbar__utility .theme-toggle:hover { color: #1059ad; b
 
 /* dashboard */
 .metric-grid, .finance-hero-grid, .report-finance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.finance-hero-grid, .report-finance-grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
 .metric-card { position: relative; display: flex; align-items: flex-start; gap: 11px; min-height: 121px; padding: 17px; overflow: hidden; border: 1px solid var(--border); border-radius: 19px; background: var(--surface); box-shadow: var(--shadow-soft); backdrop-filter: blur(16px); }
 .metric-card::after { position: absolute; top: -24px; left: -20px; width: 80px; height: 80px; border-radius: 50%; content: ''; background: currentColor; opacity: .035; }
 .metric-card--blue { color: var(--blue); }
@@ -506,6 +507,7 @@ html[data-theme='dark'] .finance-mini { background: rgba(0,0,0,.08); }
 .row-actions button { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; color: var(--blue); border: 1px solid var(--border); border-radius: 9px; background: var(--surface-soft); }
 .row-actions button:hover { border-color: var(--border-strong); background: var(--surface-hover); }
 .row-actions .paid-action { color: var(--muted-strong); }
+.row-actions .paid-action--labeled { display: inline-flex; width: auto; padding-inline: 10px; gap: 5px; white-space: nowrap; }
 .row-actions .paid-action.is-paid { color: var(--success); border-color: rgba(24, 130, 101, .28); background: rgba(24, 130, 101, .1); }
 .row-actions .danger-action { color: var(--danger); }
 .profile-actions { margin: 14px 0; flex-wrap: wrap; }
@@ -783,6 +785,7 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 
 @media (max-width: 1230px) {
   .metric-grid, .finance-hero-grid, .report-finance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .finance-hero-grid > .metric-card:last-child:nth-child(odd), .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .dashboard-finance__grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .worker-grid, .showroom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wash-page-grid { grid-template-columns: minmax(0, 1fr) 235px; }
@@ -856,7 +859,8 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
   .auth-card__heading { margin-bottom: 23px; }
   .auth-card__heading h2 { font-size: 24px; }
   .auth-form { gap: 16px; }
-  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .profile-operational-metrics, .worker-ledger-summary, .paid-cars-summary { grid-template-columns: 1fr; }
+  .form-grid--two, .worker-grid, .showroom-grid, .showroom-statistics-filters, .showroom-debt-summary, .showroom-debt-filters, .profile-operational-metrics, .worker-ledger-summary, .paid-cars-summary, .finance-hero-grid, .report-finance-grid { grid-template-columns: 1fr; }
+  .finance-hero-grid > .metric-card:last-child:nth-child(odd), .report-finance-grid > .metric-card:last-child:nth-child(odd) { grid-column: auto; }
   .section-card { padding: 16px; border-radius: 19px; }
   .metric-card { min-height: 106px; padding: 14px; }
   .metric-card__icon { width: 35px; height: 35px; }

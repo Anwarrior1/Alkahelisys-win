@@ -261,6 +261,8 @@ function mapFinance(raw: unknown): FinanceOverview {
     total_expenses: money(value.expensesMilli),
     business_expenses: money(value.businessExpensesMilli),
     workers_expenses: money(value.workerExpensesMilli),
+    net_profit_before_expenses: money(value.netProfitBeforeExpensesMilli ?? value.businessShareMilli),
+    net_profit_after_expenses: money(value.netProfitAfterExpensesMilli ?? value.netBusinessProfitMilli),
     net_business_profit: money(value.netBusinessProfitMilli),
     showroom_outstanding: money(value.outstandingShowroomDebtMilli),
   };
@@ -349,6 +351,11 @@ class ApiClient {
     return { wash: mapWash(value.wash), settlement: money(value.settlementMilli) };
   }
 
+  async setWashOvernight(id: string, isOvernight: boolean): Promise<Wash> {
+    const value = record(await this.patch(`/washes/${encodeURIComponent(id)}/overnight`, { isOvernight }));
+    return mapWash(value.wash);
+  }
+
   async createWash(data: Record<string, unknown>): Promise<Wash> {
     const input = {
       vehicleMake: text(data.vehicle_make), vehicleModel: text(data.vehicle_model), manufactureYear: data.manufacturing_year ?? null,
@@ -385,7 +392,7 @@ class ApiClient {
       paymentType: data.payment_type === 'showroom_account' ? 'showroom' : 'cash', showroomId: data.showroom_id ?? null,
       showroomPaymentMethod: data.payment_type === 'showroom_account' ? data.showroom_payment_method ?? null : null,
       occurredAt: data.performed_at ?? undefined,
-      markAsOvernight: data.mark_as_overnight === true,
+      ...(typeof data.mark_as_overnight === 'boolean' ? { markAsOvernight: data.mark_as_overnight } : {}),
     };
     const saved = record(await this.patch(`/washes/${encodeURIComponent(id)}`, input));
     const wash = record(saved.wash);
@@ -405,7 +412,7 @@ class ApiClient {
       showroom_payment_method: input.showroomPaymentMethod === 'bank' ? 'bank' : input.showroomPaymentMethod === 'cash' ? 'cash' : null,
       performed_at: text(input.occurredAt),
       status: 'posted',
-      is_overnight: input.markAsOvernight,
+      is_overnight: 'markAsOvernight' in input ? input.markAsOvernight : undefined,
     };
   }
 

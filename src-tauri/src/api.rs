@@ -128,6 +128,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/dashboard", get(dashboard))
         .route("/api/washes", get(list_washes).post(create_wash))
         .route("/api/washes/:id", patch(update_wash))
+        .route("/api/washes/:id/overnight", patch(set_wash_overnight))
         .route("/api/washes/:id/paid", patch(set_wash_paid))
         .route("/api/washes/:id/void", post(void_wash))
         .route("/api/paid-cars", get(list_paid_cars))
@@ -876,7 +877,9 @@ async fn dashboard(
     let mut statement = db.conn.prepare(
         "SELECT w.id, w.vehicle_make, w.vehicle_model, w.license_plate, w.price_milli, w.occurred_at, w.payment_type, w.status, worker.full_name, w.commission_milli
          FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id
-         WHERE w.status='posted' AND w.is_paid=0 AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4)
+         WHERE w.status='posted' AND w.is_paid=0
+               AND NOT EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id)
+               AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4)
          ORDER BY w.occurred_at DESC LIMIT 8",
     ).map_err(ApiError::internal)?;
     let can_view_financial = principal.has_permission("financial.manage");
@@ -997,7 +1000,9 @@ async fn list_washes(
                     worker.id,worker.full_name,showroom.id,showroom.name,w.commission_bps,w.commission_milli,w.business_share_milli,w.showroom_payment_method,
                     EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id),w.is_paid,w.paid_at,w.wash_type
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
-             WHERE w.status='posted' AND w.is_paid=0 AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
+             WHERE w.status='posted' AND w.is_paid=0
+                   AND NOT EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id)
+                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
         ).map_err(ApiError::internal)?;
         let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], move |row| {
             let mut item = json!({
@@ -1027,7 +1032,9 @@ async fn list_washes(
             "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,w.occurred_at,w.payment_type,w.status,
                     worker.id,worker.full_name,showroom.id,showroom.name,w.showroom_payment_method,w.is_paid,w.paid_at,w.wash_type
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
-             WHERE w.status='posted' AND w.is_paid=0 AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
+             WHERE w.status='posted' AND w.is_paid=0
+                   AND NOT EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id)
+                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
         ).map_err(ApiError::internal)?;
         let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], |row| Ok(json!({
             "id": row.get::<_, String>(0)?, "vehicleMake": row.get::<_, String>(1)?, "vehicleModel": row.get::<_, String>(2)?,
@@ -1070,9 +1077,9 @@ async fn list_paid_cars(
          JOIN workers worker ON worker.id=w.worker_id
          LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
          JOIN users creator ON creator.id=w.created_by
-         WHERE w.status='posted' AND w.is_paid=1 AND COALESCE(w.paid_at,w.occurred_at) BETWEEN ?1 AND ?2
+         WHERE w.status='posted' AND w.is_paid=1 AND w.occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR w.created_by=?4)
-         ORDER BY COALESCE(w.paid_at,w.occurred_at) DESC,w.occurred_at DESC
+         ORDER BY w.occurred_at DESC
          LIMIT 500",
     ).map_err(ApiError::internal)?;
     let rows = statement.query_map(
@@ -1104,11 +1111,73 @@ async fn list_paid_cars(
         &db.conn,
         "SELECT COALESCE(SUM(price_milli),0)
          FROM wash_operations
-         WHERE status='posted' AND is_paid=1 AND COALESCE(paid_at,occurred_at) BETWEEN ?1 AND ?2
+         WHERE status='posted' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR created_by=?4)",
         params![&from, &to, if can_view_all { 1 } else { 0 }, owner_id],
     )?;
     Ok(ok(json!({"items":items,"settlementMilli":settlement})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OvernightStatusInput {
+    is_overnight: bool,
+}
+
+async fn set_wash_overnight(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<OvernightStatusInput>,
+) -> ApiResult {
+    let principal = authorize(&state, &headers, "operational.write")?;
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let (created_by, status, is_paid): (String, String, i64) = db.conn.query_row(
+        "SELECT created_by,status,is_paid FROM wash_operations WHERE id=?1",
+        [id.clone()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)?;
+    if !principal.is_manager() && created_by != principal.id {
+        return Err(ApiError::forbidden());
+    }
+    if status != "posted" {
+        return Err(ApiError::bad("لا يمكن تغيير حالة المبيت لعملية ملغاة"));
+    }
+    if input.is_overnight && is_paid == 1 {
+        return Err(ApiError::bad("أعد السيارة إلى غير خالصة قبل تعليمها كسيارة مبيتة"));
+    }
+    let tx = db.conn.transaction().map_err(ApiError::internal)?;
+    let changed = if input.is_overnight {
+        tx.execute(
+            "INSERT OR IGNORE INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES(?1,?2,?3,?4)",
+            params![new_id(), &id, &principal.id, now()],
+        ).map_err(ApiError::internal)? == 1
+    } else {
+        tx.execute("DELETE FROM overnight_cars WHERE wash_id=?1", [&id])
+            .map_err(ApiError::internal)? == 1
+    };
+    if changed {
+        let (action, description) = if input.is_overnight {
+            ("OVERNIGHT_CAR_MARKED", "تم تعليم السيارة كسيارة مبيتة وربطها بعملية الغسيل الأصلية")
+        } else {
+            ("OVERNIGHT_CAR_UNMARKED", "تم إلغاء تعليم السيارة كسيارة مبيتة مع الاحتفاظ بعملية الغسيل الأصلية")
+        };
+        insert_audit_tx(
+            &tx,
+            Some(&principal.id),
+            action,
+            "overnight_car",
+            Some(&id),
+            description,
+            Some(&json!({"washId":&id,"isOvernight":input.is_overnight})),
+        )?;
+    }
+    tx.commit().map_err(ApiError::internal)?;
+    let wash = wash_item_by_id(&db.conn, &id, principal.has_permission("financial.manage"))?;
+    Ok(ok(json!({"updated":changed,"wash":wash})))
 }
 
 #[derive(Deserialize)]
@@ -1155,11 +1224,6 @@ async fn set_wash_paid(
     let desired = if input.is_paid { 1 } else { 0 };
     if operation.2 != desired {
         let changed_at = now();
-        let paid_by = if input.is_paid {
-            Some(principal.id.clone())
-        } else {
-            None
-        };
         let tx = db.conn.transaction().map_err(ApiError::internal)?;
         tx.execute(
             "UPDATE wash_operations
@@ -1172,7 +1236,7 @@ async fn set_wash_paid(
                 } else {
                     None::<String>
                 },
-                paid_by,
+                None::<String>,
                 changed_at,
                 &principal.id,
                 &id,
@@ -1200,7 +1264,7 @@ async fn set_wash_paid(
         &db.conn,
         "SELECT COALESCE(SUM(price_milli),0)
          FROM wash_operations
-         WHERE status='posted' AND is_paid=1 AND COALESCE(paid_at,occurred_at) BETWEEN ?1 AND ?2
+         WHERE status='posted' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR created_by=?4)",
         params![
             from,
@@ -1665,36 +1729,38 @@ async fn update_wash(
     )?;
     tx.execute("UPDATE wash_operations SET vehicle_make=?1,vehicle_model=?2,manufacture_year=?3,license_plate=?4,car_color=?5,wash_type=?6,price_milli=?7,worker_id=?8,payment_type=?9,showroom_id=?10,showroom_payment_method=?11,occurred_at=?12,commission_bps=?13,commission_milli=?14,business_share_milli=?15,revision=revision+1,updated_at=?16,updated_by=?17 WHERE id=?18",
         params![vehicle_make,vehicle_model,input.manufacture_year,input.license_plate.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),car_color,wash_type,price,input.worker_id,input.payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission,business_share,now(),principal.id,id]).map_err(ApiError::internal)?;
-    if input.mark_as_overnight == Some(true) {
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES(?1,?2,?3,?4)",
-            params![new_id(), id, principal.id, now()],
-        ).map_err(ApiError::internal)?;
-        if inserted == 1 {
-            insert_audit_tx(
-                &tx,
-                Some(&principal.id),
-                "OVERNIGHT_CAR_MARKED",
-                "overnight_car",
-                Some(&id),
-                "تم تعليم السيارة كسيارة مبيتة وربطها بعملية الغسيل",
-                None,
-            )?;
-        }
-    } else {
-        let deleted = tx
-            .execute("DELETE FROM overnight_cars WHERE wash_id=?1", [id.clone()])
-            .map_err(ApiError::internal)?;
-        if deleted == 1 {
-            insert_audit_tx(
-                &tx,
-                Some(&principal.id),
-                "OVERNIGHT_CAR_UNMARKED",
-                "overnight_car",
-                Some(&id),
-                "تم إلغاء تعليم السيارة كسيارة مبيتة مع الاحتفاظ بعملية الغسيل",
-                None,
-            )?;
+    if let Some(mark_as_overnight) = input.mark_as_overnight {
+        if mark_as_overnight {
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES(?1,?2,?3,?4)",
+                params![new_id(), id, principal.id, now()],
+            ).map_err(ApiError::internal)?;
+            if inserted == 1 {
+                insert_audit_tx(
+                    &tx,
+                    Some(&principal.id),
+                    "OVERNIGHT_CAR_MARKED",
+                    "overnight_car",
+                    Some(&id),
+                    "تم تعليم السيارة كسيارة مبيتة وربطها بعملية الغسيل",
+                    None,
+                )?;
+            }
+        } else {
+            let deleted = tx
+                .execute("DELETE FROM overnight_cars WHERE wash_id=?1", [id.clone()])
+                .map_err(ApiError::internal)?;
+            if deleted == 1 {
+                insert_audit_tx(
+                    &tx,
+                    Some(&principal.id),
+                    "OVERNIGHT_CAR_UNMARKED",
+                    "overnight_car",
+                    Some(&id),
+                    "تم إلغاء تعليم السيارة كسيارة مبيتة مع الاحتفاظ بعملية الغسيل",
+                    None,
+                )?;
+            }
         }
     }
     insert_audit_tx(
@@ -1734,9 +1800,9 @@ async fn list_overnight_cars(
          JOIN workers worker ON worker.id=wash.worker_id
          LEFT JOIN showrooms showroom ON showroom.id=wash.showroom_id
          JOIN users marker ON marker.id=overnight.marked_by
-         WHERE wash.status='posted' AND overnight.marked_at BETWEEN ?1 AND ?2
+         WHERE wash.status='posted' AND wash.is_paid=0 AND wash.occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR wash.created_by=?4)
-         ORDER BY overnight.marked_at DESC"
+         ORDER BY wash.occurred_at DESC"
     ).map_err(ApiError::internal)?;
     let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], move |row| {
         let mut wash = json!({
@@ -4290,7 +4356,7 @@ fn financial_summary(
     let outstanding_worker=total_for(conn,"SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)-COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)),0))",params![from,to,owner_id])?;
     let outstanding_showroom=total_for(conn,"SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3))-(SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)",params![from,to,owner_id])?;
     Ok(
-        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"showroomRevenueMilli":showroom_revenue,"businessShareMilli":business_share,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netBusinessProfitMilli":business_share-business_expenses}),
+        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"showroomRevenueMilli":showroom_revenue,"businessShareMilli":business_share,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":business_share,"netProfitAfterExpensesMilli":business_share-business_expenses,"netBusinessProfitMilli":business_share-business_expenses}),
     )
 }
 

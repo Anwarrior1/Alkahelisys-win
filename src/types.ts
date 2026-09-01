@@ -161,6 +161,8 @@ export interface FinanceOverview {
   total_expenses?: Money;
   business_expenses?: Money;
   workers_expenses?: Money;
+  net_profit_before_expenses?: Money;
+  net_profit_after_expenses?: Money;
   net_business_profit?: Money;
   showroom_outstanding?: Money;
   period_label?: string;
