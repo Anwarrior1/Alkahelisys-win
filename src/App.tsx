@@ -149,15 +149,10 @@ const SECTION_PERMISSION_OPTIONS: { code: SectionPermissionCode; name: string; d
 ];
 
 const FEATURE_PERMISSION_OPTIONS: { code: FeaturePermissionCode; name: string; description: string }[] = [
-  { code: 'operational.read', name: 'عرض أقسام التشغيل', description: 'لوحة المتابعة وعمليات الغسيل والعمال والمعارض والتقارير التشغيلية.' },
   { code: 'operational.write', name: 'إضافة وتعديل بيانات التشغيل', description: 'تسجيل عمليات الغسيل وتعديلها وإدارة العمال والمعارض.' },
-  { code: 'financial.manage', name: 'عرض وإدارة البيانات المالية', description: 'التنفيذ المالي وديون المعارض والتقارير المالية والتفاصيل المحمية.' },
   { code: 'dashboard.daily_revenue.read', name: 'عرض الإيراد اليومي', description: 'إظهار بطاقة إيراد اليوم وقيمتها في لوحة المتابعة.' },
   { code: 'worker.daily_value.manage', name: 'إدارة القيمة اليومية للعامل', description: 'عرض وتحديث القيمة اليومية داخل ملفات العمال.' },
-  { code: 'settings.manage', name: 'إدارة إعدادات المركز', description: 'اسم المركز والعملة ونسبة العمولة الافتراضية.' },
   { code: 'users.manage', name: 'إدارة حسابات المستخدمين', description: 'إنشاء حسابات الموظفين وتعديلها وتعطيلها.' },
-  { code: 'audit.read', name: 'عرض سجل التدقيق', description: 'مراجعة سجل الإجراءات والتغييرات المهمة.' },
-  { code: 'backup.manage', name: 'إدارة النسخ الاحتياطية', description: 'إنشاء النسخ الاحتياطية واستعادتها.' },
 ];
 
 const dashboardFallback: DashboardData = {
