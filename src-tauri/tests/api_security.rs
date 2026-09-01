@@ -1493,6 +1493,164 @@ async fn employee_account_is_independent_from_workers_and_financial_access() {
 }
 
 #[tokio::test]
+async fn employee_section_permissions_are_independent_and_preserve_specialized_controls() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل صلاحيات الأقسام").await;
+    let (status, employee) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/users",
+        Some(&manager_token),
+        Some(json!({
+            "fullName":"موظف صلاحيات الأقسام","username":"sections.employee",
+            "password":EMPLOYEE_PASSWORD,"roleCode":"employee","isActive":true
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let employee_id = employee["data"]["id"].as_str().unwrap().to_owned();
+    let employee_token = login(&test_app.router, "sections.employee", EMPLOYEE_PASSWORD).await;
+
+    let requested = [
+        "section.dashboard.access",
+        "section.washes.access",
+        "section.workers.access",
+        "section.reports.access",
+        "operational.write",
+        "dashboard.daily_revenue.read",
+        "worker.daily_value.manage",
+    ];
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/users/{employee_id}/permissions"),
+        Some(&manager_token),
+        Some(json!({"permissionCodes":requested})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, me) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&employee_token),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let permissions = me["data"]["permissions"].as_array().unwrap();
+    for visible in [
+        "section.dashboard.access",
+        "section.washes.access",
+        "section.workers.access",
+        "section.reports.access",
+    ] {
+        assert!(permissions.iter().any(|code| code == visible));
+    }
+    for hidden in [
+        "section.paid_cars.access",
+        "section.overnight.access",
+        "section.showrooms.access",
+        "section.finance.access",
+    ] {
+        assert!(!permissions.iter().any(|code| code == hidden));
+    }
+    assert!(permissions.iter().any(|code| code == "operational.read"));
+    assert!(permissions.iter().any(|code| code == "financial.manage"));
+    assert!(permissions.iter().any(|code| code == "dashboard.daily_revenue.read"));
+    assert!(permissions.iter().any(|code| code == "worker.daily_value.manage"));
+
+    let (status, dashboard) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard",
+        Some(&employee_token),
+        None,
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dashboard["data"]["financial"].get("todayRevenue").is_some());
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/workers/{worker_id}/daily-value"),
+        Some(&employee_token),
+        Some(json!({"valueDate":business_today_key(),"amount":"15"})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reenabled = [
+        "section.dashboard.access",
+        "section.washes.access",
+        "section.workers.access",
+        "section.showrooms.access",
+        "section.reports.access",
+        "operational.write",
+        "dashboard.daily_revenue.read",
+        "worker.daily_value.manage",
+    ];
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/users/{employee_id}/permissions"),
+        Some(&manager_token),
+        Some(json!({"permissionCodes":reenabled})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, reenabled_me) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&employee_token),
+        None,
+    ).await;
+    let reenabled_permissions = reenabled_me["data"]["permissions"].as_array().unwrap();
+    assert!(reenabled_permissions.iter().any(|code| code == "section.showrooms.access"));
+    assert!(reenabled_permissions.iter().any(|code| code == "dashboard.daily_revenue.read"));
+    assert!(reenabled_permissions.iter().any(|code| code == "worker.daily_value.manage"));
+
+    let without_specialized = [
+        "section.dashboard.access",
+        "section.washes.access",
+        "section.workers.access",
+        "section.reports.access",
+        "operational.write",
+    ];
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/users/{employee_id}/permissions"),
+        Some(&manager_token),
+        Some(json!({"permissionCodes":without_specialized})),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, dashboard_without_daily_revenue) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard",
+        Some(&employee_token),
+        None,
+    ).await;
+    assert!(dashboard_without_daily_revenue["data"]["financial"].get("todayRevenue").is_none());
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/workers/{worker_id}/daily-value"),
+        Some(&employee_token),
+        Some(json!({"valueDate":business_today_key(),"amount":"20"})),
+    ).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (_, manager_me) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&manager_token),
+        None,
+    ).await;
+    assert_eq!(manager_me["data"]["roleCode"], "manager");
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn role_permission_switches_change_real_api_access_immediately() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;

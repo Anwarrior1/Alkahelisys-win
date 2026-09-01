@@ -710,6 +710,8 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .role-row strong { font-size: 14px; }
 .role-row span, .role-row small { color: var(--muted); font-size: 12px; }
 .role-row .table-action { flex: 0 0 auto; }
+.permission-editor-groups { display: grid; gap: 20px; }
+.permission-editor-groups .eyebrow { margin: 0 0 9px; }
 .permission-toggle-list { display: grid; gap: 9px; }
 .permission-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 14px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-soft); }
 .permission-toggle-row > div { display: grid; gap: 4px; }

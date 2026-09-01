@@ -798,6 +798,113 @@ impl Database {
                 [now()],
             )?;
         }
+        let section_permissions_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=21",
+            [],
+            |row| row.get(0),
+        )?;
+        if section_permissions_added == 0 {
+            let operational_sections = [
+                "section.dashboard.access",
+                "section.washes.access",
+                "section.paid_cars.access",
+                "section.overnight.access",
+                "section.workers.access",
+                "section.showrooms.access",
+                "section.reports.access",
+            ];
+            let financial_sections = [
+                "section.finance.access",
+                "section.showroom_debts.access",
+                "section.salaries.access",
+            ];
+            for code in operational_sections {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO role_permissions(role_id,permission_id)
+                     SELECT rp.role_id,p.id FROM role_permissions rp
+                     JOIN permissions legacy ON legacy.id=rp.permission_id
+                     JOIN permissions p ON p.code=?1
+                     WHERE legacy.code='operational.read'",
+                    [code],
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions(user_id,permission_id)
+                     SELECT up.user_id,p.id FROM user_permissions up
+                     JOIN permissions legacy ON legacy.id=up.permission_id
+                     JOIN permissions p ON p.code=?1
+                     JOIN user_permission_profiles profile ON profile.user_id=up.user_id
+                     WHERE legacy.code='operational.read'",
+                    [code],
+                )?;
+            }
+            for code in financial_sections {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO role_permissions(role_id,permission_id)
+                     SELECT rp.role_id,p.id FROM role_permissions rp
+                     JOIN permissions legacy ON legacy.id=rp.permission_id
+                     JOIN permissions p ON p.code=?1
+                     WHERE legacy.code='financial.manage'",
+                    [code],
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions(user_id,permission_id)
+                     SELECT up.user_id,p.id FROM user_permissions up
+                     JOIN permissions legacy ON legacy.id=up.permission_id
+                     JOIN permissions p ON p.code=?1
+                     JOIN user_permission_profiles profile ON profile.user_id=up.user_id
+                     WHERE legacy.code='financial.manage'",
+                    [code],
+                )?;
+            }
+            for (section_code, legacy_codes) in [
+                ("section.settings.access", ["settings.manage", "users.manage"]),
+                ("section.audit.access", ["audit.read", "audit.read"]),
+                ("section.backup.access", ["backup.manage", "backup.manage"]),
+            ] {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO role_permissions(role_id,permission_id)
+                     SELECT rp.role_id,p.id FROM role_permissions rp
+                     JOIN permissions legacy ON legacy.id=rp.permission_id
+                     JOIN permissions p ON p.code=?1
+                     WHERE legacy.code IN (?2,?3)",
+                    (section_code, legacy_codes[0], legacy_codes[1]),
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions(user_id,permission_id)
+                     SELECT up.user_id,p.id FROM user_permissions up
+                     JOIN permissions legacy ON legacy.id=up.permission_id
+                     JOIN permissions p ON p.code=?1
+                     JOIN user_permission_profiles profile ON profile.user_id=up.user_id
+                     WHERE legacy.code IN (?2,?3)",
+                    (section_code, legacy_codes[0], legacy_codes[1]),
+                )?;
+            }
+            for code in [
+                "section.dashboard.access",
+                "section.washes.access",
+                "section.paid_cars.access",
+                "section.overnight.access",
+                "section.workers.access",
+                "section.showrooms.access",
+                "section.reports.access",
+                "section.finance.access",
+                "section.showroom_debts.access",
+                "section.salaries.access",
+                "section.settings.access",
+                "section.audit.access",
+                "section.backup.access",
+            ] {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO role_permissions(role_id,permission_id)
+                     SELECT 'role-manager',id FROM permissions WHERE code=?1",
+                    [code],
+                )?;
+            }
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(21, ?1)",
+                [now()],
+            )?;
+        }
         Ok(())
     }
 
@@ -892,6 +999,19 @@ impl Database {
                 "administration",
                 "النسخ الاحتياطي والاستعادة",
             ),
+            ("perm-section-dashboard", "section.dashboard.access", "sections", "لوحة المتابعة"),
+            ("perm-section-washes", "section.washes.access", "sections", "عمليات الغسيل"),
+            ("perm-section-paid-cars", "section.paid_cars.access", "sections", "السيارات الخالصة"),
+            ("perm-section-overnight", "section.overnight.access", "sections", "سيارات المبيت"),
+            ("perm-section-workers", "section.workers.access", "sections", "العمال"),
+            ("perm-section-showrooms", "section.showrooms.access", "sections", "المعارض"),
+            ("perm-section-reports", "section.reports.access", "sections", "التقارير المالية"),
+            ("perm-section-finance", "section.finance.access", "sections", "التنفيذ المالي"),
+            ("perm-section-showroom-debts", "section.showroom_debts.access", "sections", "ديون المعارض"),
+            ("perm-section-salaries", "section.salaries.access", "sections", "المرتبات"),
+            ("perm-section-settings", "section.settings.access", "sections", "الإعدادات"),
+            ("perm-section-audit", "section.audit.access", "sections", "سجل التدقيق"),
+            ("perm-section-backup", "section.backup.access", "sections", "النسخ الاحتياطي"),
         ] {
             self.conn.execute(
                 "INSERT OR IGNORE INTO permissions(id, code, group_code, name_ar) VALUES(?1, ?2, ?3, ?4)",
@@ -970,6 +1090,73 @@ mod tests {
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).unwrap();
         assert_eq!(stored, ("Legacy expense".to_owned(), "Legacy category".to_owned(), 42_000, "preserve me".to_owned(), "cash".to_owned()));
+        drop(reopened);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn section_permission_migration_preserves_explicit_employee_permissions() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-section-permission-migration-tests")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&data_dir).unwrap();
+        let database = Database::open(&data_dir).unwrap();
+        database.conn.execute(
+            "INSERT INTO users(id,full_name,username_norm,password_hash,is_active,created_at,updated_at) VALUES('section-user','Section Employee','section.employee','unused',1,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        database.conn.execute(
+            "INSERT INTO user_roles(user_id,role_id) VALUES('section-user','role-employee')",
+            [],
+        ).unwrap();
+        database.conn.execute(
+            "INSERT INTO user_permission_profiles(user_id,updated_at) VALUES('section-user','2026-09-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        for code in [
+            "operational.read",
+            "operational.write",
+            "dashboard.daily_revenue.read",
+            "worker.daily_value.manage",
+        ] {
+            database.conn.execute(
+                "INSERT INTO user_permissions(user_id,permission_id) SELECT 'section-user',id FROM permissions WHERE code=?1",
+                [code],
+            ).unwrap();
+        }
+        database.conn.execute_batch(
+            "DELETE FROM schema_migrations WHERE version=21;
+             DELETE FROM permissions WHERE group_code='sections';",
+        ).unwrap();
+        drop(database);
+
+        let reopened = Database::open(&data_dir).unwrap();
+        let mut statement = reopened.conn.prepare(
+            "SELECT p.code FROM user_permissions up JOIN permissions p ON p.id=up.permission_id WHERE up.user_id='section-user' ORDER BY p.code",
+        ).unwrap();
+        let permissions = statement.query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        for preserved in [
+            "operational.read",
+            "operational.write",
+            "dashboard.daily_revenue.read",
+            "worker.daily_value.manage",
+        ] {
+            assert!(permissions.iter().any(|code| code == preserved));
+        }
+        for migrated in [
+            "section.dashboard.access",
+            "section.washes.access",
+            "section.paid_cars.access",
+            "section.overnight.access",
+            "section.workers.access",
+            "section.showrooms.access",
+            "section.reports.access",
+        ] {
+            assert!(permissions.iter().any(|code| code == migrated));
+        }
+        assert!(!permissions.iter().any(|code| code == "section.finance.access"));
+        drop(statement);
         drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }

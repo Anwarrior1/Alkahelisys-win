@@ -128,9 +128,27 @@ const ALL_VIEWS: View[] = [
   'audit',
   'backup',
 ];
-type PermissionCode = 'operational.read' | 'operational.write' | 'financial.manage' | 'dashboard.daily_revenue.read' | 'worker.daily_value.manage' | 'settings.manage' | 'users.manage' | 'audit.read' | 'backup.manage';
+type SectionPermissionCode = 'section.dashboard.access' | 'section.washes.access' | 'section.paid_cars.access' | 'section.overnight.access' | 'section.workers.access' | 'section.showrooms.access' | 'section.reports.access' | 'section.finance.access' | 'section.showroom_debts.access' | 'section.salaries.access' | 'section.settings.access' | 'section.audit.access' | 'section.backup.access';
+type FeaturePermissionCode = 'operational.read' | 'operational.write' | 'financial.manage' | 'dashboard.daily_revenue.read' | 'worker.daily_value.manage' | 'settings.manage' | 'users.manage' | 'audit.read' | 'backup.manage';
+type PermissionCode = SectionPermissionCode | FeaturePermissionCode;
 
-const PERMISSION_OPTIONS: { code: PermissionCode; name: string; description: string }[] = [
+const SECTION_PERMISSION_OPTIONS: { code: SectionPermissionCode; name: string; description: string }[] = [
+  { code: 'section.dashboard.access', name: 'لوحة المتابعة', description: 'إظهار وفتح لوحة المتابعة في حساب الموظف.' },
+  { code: 'section.washes.access', name: 'عمليات الغسيل', description: 'إظهار وفتح قسم عمليات الغسيل.' },
+  { code: 'section.paid_cars.access', name: 'السيارات الخالصة', description: 'إظهار وفتح سجل السيارات الخالصة.' },
+  { code: 'section.overnight.access', name: 'سيارات المبيت', description: 'إظهار وفتح سجل سيارات المبيت.' },
+  { code: 'section.workers.access', name: 'العمال', description: 'إظهار وفتح قسم العمال وملفاتهم.' },
+  { code: 'section.showrooms.access', name: 'المعارض', description: 'إظهار وفتح قسم المعارض.' },
+  { code: 'section.reports.access', name: 'التقارير المالية', description: 'إظهار وفتح صفحة التقارير المالية.' },
+  { code: 'section.finance.access', name: 'التنفيذ المالي', description: 'إظهار وفتح قسم المصروفات ودفعات المعارض.' },
+  { code: 'section.showroom_debts.access', name: 'ديون المعارض', description: 'إظهار وفتح تقارير ديون المعارض.' },
+  { code: 'section.salaries.access', name: 'المرتبات', description: 'إظهار وفتح قسم المرتبات.' },
+  { code: 'section.settings.access', name: 'الإعدادات', description: 'إظهار وفتح قسم الإعدادات والإدارة.' },
+  { code: 'section.audit.access', name: 'سجل التدقيق', description: 'إظهار وفتح سجل التدقيق.' },
+  { code: 'section.backup.access', name: 'النسخ الاحتياطي', description: 'إظهار وفتح قسم النسخ الاحتياطي.' },
+];
+
+const FEATURE_PERMISSION_OPTIONS: { code: FeaturePermissionCode; name: string; description: string }[] = [
   { code: 'operational.read', name: 'عرض أقسام التشغيل', description: 'لوحة المتابعة وعمليات الغسيل والعمال والمعارض والتقارير التشغيلية.' },
   { code: 'operational.write', name: 'إضافة وتعديل بيانات التشغيل', description: 'تسجيل عمليات الغسيل وتعديلها وإدارة العمال والمعارض.' },
   { code: 'financial.manage', name: 'عرض وإدارة البيانات المالية', description: 'التنفيذ المالي وديون المعارض والتقارير المالية والتفاصيل المحمية.' },
@@ -155,13 +173,10 @@ function hasPermission(user: AuthUser, permission: PermissionCode) {
 }
 
 function canAccessView(user: AuthUser, view: View) {
-  if (view === 'overnight' || view === 'paidCars') return hasPermission(user, 'operational.read');
-  if (['dashboard', 'washes', 'workers', 'showrooms', 'reports'].includes(view)) return hasPermission(user, 'operational.read');
-  if (view === 'finance' || view === 'showroomDebts' || view === 'salaries') return hasPermission(user, 'financial.manage');
-  if (view === 'settings') return hasPermission(user, 'settings.manage') || hasPermission(user, 'users.manage');
-  if (view === 'audit') return hasPermission(user, 'audit.read');
-  if (view === 'backup') return hasPermission(user, 'backup.manage');
-  return false;
+  const sectionPermission: Record<View, SectionPermissionCode> = {
+    dashboard: 'section.dashboard.access', washes: 'section.washes.access', paidCars: 'section.paid_cars.access', overnight: 'section.overnight.access', workers: 'section.workers.access', showrooms: 'section.showrooms.access', showroomDebts: 'section.showroom_debts.access', reports: 'section.reports.access', finance: 'section.finance.access', salaries: 'section.salaries.access', settings: 'section.settings.access', audit: 'section.audit.access', backup: 'section.backup.access',
+  };
+  return hasPermission(user, sectionPermission[view]);
 }
 
 function firstAccessibleView(user: AuthUser): View {
@@ -592,13 +607,21 @@ function AuthScreen({
 
 function AppShell({ user, theme, onThemeChange, onLogout }: { user: AuthUser; theme: Theme; onThemeChange: (theme: Theme) => void; onLogout: () => void }) {
   const isManager = managerOf(user);
-  const canRead = hasPermission(user, 'operational.read');
   const canWrite = hasPermission(user, 'operational.write');
   const canFinancial = hasPermission(user, 'financial.manage');
-  const canSettings = hasPermission(user, 'settings.manage');
-  const canUsers = hasPermission(user, 'users.manage');
-  const canAudit = hasPermission(user, 'audit.read');
-  const canBackup = hasPermission(user, 'backup.manage');
+  const canDashboard = hasPermission(user, 'section.dashboard.access');
+  const canWashes = hasPermission(user, 'section.washes.access');
+  const canPaidCars = hasPermission(user, 'section.paid_cars.access');
+  const canOvernight = hasPermission(user, 'section.overnight.access');
+  const canWorkers = hasPermission(user, 'section.workers.access');
+  const canShowrooms = hasPermission(user, 'section.showrooms.access');
+  const canReports = hasPermission(user, 'section.reports.access');
+  const canFinanceSection = hasPermission(user, 'section.finance.access');
+  const canShowroomDebts = hasPermission(user, 'section.showroom_debts.access');
+  const canSalaries = hasPermission(user, 'section.salaries.access');
+  const canSettingsSection = hasPermission(user, 'section.settings.access');
+  const canAuditSection = hasPermission(user, 'section.audit.access');
+  const canBackupSection = hasPermission(user, 'section.backup.access');
   const [view, setView] = useState<View>(viewFromHash());
   const [sideOpen, setSideOpen] = useState(false);
   const [toast, setToast] = useState<ToastMessage>(null);
@@ -667,22 +690,22 @@ function AppShell({ user, theme, onThemeChange, onLogout }: { user: AuthUser; th
         </div>
         <nav className="sidebar__nav" aria-label="التنقل الرئيسي">
           <NavGroup label=" ">
-            {canRead && <><NavButton active={view === 'dashboard'} onClick={() => selectView('dashboard')} icon={<LayoutDashboard size={19} />}>لوحة المتابعة</NavButton>
-            <NavButton active={view === 'washes'} onClick={() => selectView('washes')} icon={<Car size={19} />}>عمليات الغسيل</NavButton>
-            <NavButton active={view === 'paidCars'} onClick={() => selectView('paidCars')} icon={<CheckCircle2 size={19} />}>السيارات الخالصة</NavButton>
-            {canRead && <NavButton active={view === 'overnight'} onClick={() => selectView('overnight')} icon={<Moon size={19} />}>سيارات المبيت</NavButton>}
-            <NavButton active={view === 'workers'} onClick={() => selectView('workers')} icon={<UsersRound size={19} />}>العمال</NavButton>
-            <NavButton active={view === 'showrooms'} onClick={() => selectView('showrooms')} icon={<Building2 size={19} />}>المعارض</NavButton></>}
+            {canDashboard && <NavButton active={view === 'dashboard'} onClick={() => selectView('dashboard')} icon={<LayoutDashboard size={19} />}>لوحة المتابعة</NavButton>}
+            {canWashes && <NavButton active={view === 'washes'} onClick={() => selectView('washes')} icon={<Car size={19} />}>عمليات الغسيل</NavButton>}
+            {canPaidCars && <NavButton active={view === 'paidCars'} onClick={() => selectView('paidCars')} icon={<CheckCircle2 size={19} />}>السيارات الخالصة</NavButton>}
+            {canOvernight && <NavButton active={view === 'overnight'} onClick={() => selectView('overnight')} icon={<Moon size={19} />}>سيارات المبيت</NavButton>}
+            {canWorkers && <NavButton active={view === 'workers'} onClick={() => selectView('workers')} icon={<UsersRound size={19} />}>العمال</NavButton>}
+            {canShowrooms && <NavButton active={view === 'showrooms'} onClick={() => selectView('showrooms')} icon={<Building2 size={19} />}>المعارض</NavButton>}
           </NavGroup>
-          {(canRead || canFinancial || canSettings || canUsers || canAudit || canBackup) && (
+          {(canReports || canFinanceSection || canShowroomDebts || canSalaries || canSettingsSection || canAuditSection || canBackupSection) && (
             <NavGroup label="الإدارة والمالية">
-              {canRead && <NavButton active={view === 'reports'} onClick={() => selectView('reports')} icon={<BarChart3 size={19} />}>التقارير المالية</NavButton>}
-              {canFinancial && <><NavButton active={view === 'finance'} onClick={() => selectView('finance')} icon={<WalletCards size={19} />}>التنفيذ المالي</NavButton>
-              <NavButton active={view === 'showroomDebts'} onClick={() => selectView('showroomDebts')} icon={<Building2 size={19} />}>ديون المعارض</NavButton>
-              <NavButton active={view === 'salaries'} onClick={() => selectView('salaries')} icon={<Banknote size={19} />}>المرتبات</NavButton></>}
-              {(canSettings || canUsers) && <NavButton active={view === 'settings'} onClick={() => selectView('settings')} icon={<Settings size={19} />}>الإعدادات</NavButton>}
-              {canAudit && <NavButton active={view === 'audit'} onClick={() => selectView('audit')} icon={<History size={19} />}>سجل التدقيق</NavButton>}
-              {canBackup && <NavButton active={view === 'backup'} onClick={() => selectView('backup')} icon={<DatabaseBackup size={19} />}>النسخ الاحتياطي</NavButton>}
+              {canReports && <NavButton active={view === 'reports'} onClick={() => selectView('reports')} icon={<BarChart3 size={19} />}>التقارير المالية</NavButton>}
+              {canFinanceSection && <NavButton active={view === 'finance'} onClick={() => selectView('finance')} icon={<WalletCards size={19} />}>التنفيذ المالي</NavButton>}
+              {canShowroomDebts && <NavButton active={view === 'showroomDebts'} onClick={() => selectView('showroomDebts')} icon={<Building2 size={19} />}>ديون المعارض</NavButton>}
+              {canSalaries && <NavButton active={view === 'salaries'} onClick={() => selectView('salaries')} icon={<Banknote size={19} />}>المرتبات</NavButton>}
+              {canSettingsSection && <NavButton active={view === 'settings'} onClick={() => selectView('settings')} icon={<Settings size={19} />}>الإعدادات</NavButton>}
+              {canAuditSection && <NavButton active={view === 'audit'} onClick={() => selectView('audit')} icon={<History size={19} />}>سجل التدقيق</NavButton>}
+              {canBackupSection && <NavButton active={view === 'backup'} onClick={() => selectView('backup')} icon={<DatabaseBackup size={19} />}>النسخ الاحتياطي</NavButton>}
             </NavGroup>
           )}
         </nav>
@@ -1821,7 +1844,7 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
 
 function PaymentsPanel({ title, records, personLabel, onAdd, onEdit, onDelete, empty }: { title: string; records: PaymentRecord[]; personLabel: string; onAdd: () => void; onEdit?: (record: PaymentRecord) => void; onDelete?: (record: PaymentRecord) => void; empty: string }) {
   return <SectionCard title={title} subtitle="كل دفعة تحفظ باسم المستخدم الذي سجلها." action={<Button onClick={onAdd} icon={<Plus size={17} />}>تسجيل دفعة</Button>}>
-    {records.length === 0 ? <EmptyState icon={<Banknote size={28} />} title={empty} action={<Button onClick={onAdd} icon={<Plus size={17} />}>تسجيل دفعة</Button>} /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>{personLabel}</th><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th>{(onEdit || onDelete) && <th>إجراءات</th>}</tr></thead><tbody>{records.map((record) => <tr key={record.id}><td>{record.worker_name || record.showroom_name || '—'}</td><td className="money-cell">{money(record.amount)}</td><td>{dateFormat(record.paid_at || record.date, true)}</td><td>{record.notes || '—'}</td><td>{record.created_by_name || '—'}</td>{(onEdit || onDelete) && <td><div className="row-actions">{onEdit && <button type="button" onClick={() => onEdit(record)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button>}{onDelete && <button type="button" className="danger-action" onClick={() => onDelete(record)} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button>}</div></td>}</tr>)}</tbody></table></div>}
+    {records.length === 0 ? <EmptyState icon={<Banknote size={28} />} title={empty} /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>{personLabel}</th><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th>{(onEdit || onDelete) && <th>إجراءات</th>}</tr></thead><tbody>{records.map((record) => <tr key={record.id}><td>{record.worker_name || record.showroom_name || '—'}</td><td className="money-cell">{money(record.amount)}</td><td>{dateFormat(record.paid_at || record.date, true)}</td><td>{record.notes || '—'}</td><td>{record.created_by_name || '—'}</td>{(onEdit || onDelete) && <td><div className="row-actions">{onEdit && <button type="button" onClick={() => onEdit(record)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button>}{onDelete && <button type="button" className="danger-action" onClick={() => onDelete(record)} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button>}</div></td>}</tr>)}</tbody></table></div>}
   </SectionCard>;
 }
 
@@ -1853,7 +1876,7 @@ function ExpensesPanel({selectedDate,onNotify}:{selectedDate:string;onNotify:(me
   const openDetail=async(item:ExpenseRecord)=>{try{setSelected(await api.expense(item.id));}catch(error){onNotify({tone:'error',text:friendlyError(error)});}};
   const remove=async(item:ExpenseRecord)=>{if(!window.confirm(`هل تريد حذف المصروف «${item.description}»؟ سيتم عكس جميع استقطاعات العمال المرتبطة به.`))return;try{await api.deleteExpense(item.id);setItems(current=>current.filter(record=>record.id!==item.id));setSelected(null);setEditing(null);refreshFinancialViews();onNotify({tone:'success',text:'تم حذف المصروف وتحديث التقارير المالية.'});}catch(error){onNotify({tone:'error',text:friendlyError(error)});}};
   const saved=async(message:string)=>{setAdding(false);setEditing(null);setSelected(null);await load();refreshFinancialViews();onNotify({tone:'success',text:message});};
-  return <><SectionCard title="المصروفات" subtitle={`سجل المصروفات ليوم ${workingDateFormat(selectedDate)}؛ وهو السجل نفسه المستخدم في التقارير المالية.`} action={<Button onClick={()=>setAdding(true)} icon={<Plus size={17}/>}>تسجيل مصروف جديد</Button>}>{loading?<LoadingBlock/>:items.length===0?<EmptyState icon={<ReceiptText size={28}/>} title="لا توجد مصروفات في اليوم المحدد" action={<Button onClick={()=>setAdding(true)} icon={<Plus size={17}/>}>تسجيل مصروف جديد</Button>}/>:<div className="data-table-wrap"><table className="data-table expense-history-table"><thead><tr><th>التاريخ</th><th>نوع المصروف</th><th>الوصف</th><th>المبلغ</th><th>طريقة الدفع</th><th>التوزيع</th><th>إجراءات</th></tr></thead><tbody>{items.map(item=><tr key={item.id} className="clickable-row" onClick={()=>void openDetail(item)}><td>{dateFormat(item.spent_at)}</td><td>{item.category||'أخرى'}</td><td><strong>{item.description}</strong>{item.notes&&<small>{item.notes}</small>}</td><td className="money-cell">{money(item.amount)}</td><td>{item.payment_method==='bank'?'مصرفي':'نقدي'}</td><td>{item.allocation==='shared'?'المركز والعمال':'المركز فقط'}</td><td><div className="row-actions"><button type="button" onClick={e=>{e.stopPropagation();setEditing(item)}} aria-label="تعديل المصروف" title="تعديل المصروف"><Pencil size={15}/></button><button type="button" className="danger-action" onClick={e=>{e.stopPropagation();void remove(item)}} aria-label="حذف المصروف" title="حذف المصروف"><Trash2 size={15}/></button></div></td></tr>)}</tbody></table></div>}</SectionCard>{adding&&<ExpenseModal onClose={()=>setAdding(false)} onSaved={()=>{void saved('تم تسجيل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {editing&&<EditExpenseModal expense={editing} onClose={()=>setEditing(null)} onSaved={()=>{void saved('تم تعديل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {selected&&<ExpenseDetails expense={selected} onClose={()=>setSelected(null)} onEdit={()=>{setEditing(selected);setSelected(null)}} onDelete={()=>void remove(selected)}/>}</>;
+  return <><SectionCard title="المصروفات" subtitle={`سجل المصروفات ليوم ${workingDateFormat(selectedDate)}؛ وهو السجل نفسه المستخدم في التقارير المالية.`} action={<Button onClick={()=>setAdding(true)} icon={<Plus size={17}/>}>تسجيل مصروف جديد</Button>}>{loading?<LoadingBlock/>:items.length===0?<EmptyState icon={<ReceiptText size={28}/>} title="لا توجد مصروفات في اليوم المحدد"/>:<div className="data-table-wrap"><table className="data-table expense-history-table"><thead><tr><th>التاريخ</th><th>نوع المصروف</th><th>الوصف</th><th>المبلغ</th><th>طريقة الدفع</th><th>التوزيع</th><th>إجراءات</th></tr></thead><tbody>{items.map(item=><tr key={item.id} className="clickable-row" onClick={()=>void openDetail(item)}><td>{dateFormat(item.spent_at)}</td><td>{item.category||'أخرى'}</td><td><strong>{item.description}</strong>{item.notes&&<small>{item.notes}</small>}</td><td className="money-cell">{money(item.amount)}</td><td>{item.payment_method==='bank'?'مصرفي':'نقدي'}</td><td>{item.allocation==='shared'?'المركز والعمال':'المركز فقط'}</td><td><div className="row-actions"><button type="button" onClick={e=>{e.stopPropagation();setEditing(item)}} aria-label="تعديل المصروف" title="تعديل المصروف"><Pencil size={15}/></button><button type="button" className="danger-action" onClick={e=>{e.stopPropagation();void remove(item)}} aria-label="حذف المصروف" title="حذف المصروف"><Trash2 size={15}/></button></div></td></tr>)}</tbody></table></div>}</SectionCard>{adding&&<ExpenseModal onClose={()=>setAdding(false)} onSaved={()=>{void saved('تم تسجيل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {editing&&<EditExpenseModal expense={editing} onClose={()=>setEditing(null)} onSaved={()=>{void saved('تم تعديل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {selected&&<ExpenseDetails expense={selected} onClose={()=>setSelected(null)} onEdit={()=>{setEditing(selected);setSelected(null)}} onDelete={()=>void remove(selected)}/>}</>;
 }
 
 function EditExpenseModal({expense,onClose,onSaved,onNotify}:{expense:ExpenseRecord;onClose:()=>void;onSaved:()=>void;onNotify:(message:ToastMessage)=>void}){const[form,setForm]=useState({description:expense.description,category:expense.category||'أخرى',payment_method:expense.payment_method||'cash',amount:String(expense.amount),spent_at:(expense.spent_at??'').slice(0,10),notes:expense.notes??'',allocation:expense.allocation==='shared'?'shared':'business_only'});const[saving,setSaving]=useState(false);const submit=async(e:FormEvent)=>{e.preventDefault();setSaving(true);try{await api.updateExpense(expense.id,{...form,spent_at:new Date(`${form.spent_at}T12:00:00`).toISOString(),notes:form.notes.trim()||null});onSaved();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setSaving(false);}};return <Modal title="تعديل المصروف" subtitle="يُحدّث السجل نفسه وتنعكس النتيجة في التقارير المالية دون إنشاء مصروف جديد." onClose={onClose}><form className="entry-form" onSubmit={submit}><div className="form-grid form-grid--two"><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={e=>setForm(c=>({...c,amount:e.target.value}))} type="number" min="0.01" step="0.01" required/></FormField><FormField label="نوع المصروف / التصنيف" required><input list="edit-expense-category-options" value={form.category} onChange={e=>setForm(c=>({...c,category:e.target.value}))} required/><datalist id="edit-expense-category-options">{EXPENSE_CATEGORIES.map(category=><option key={category} value={category}/>)}</datalist></FormField><FormField label="التاريخ" required><input value={form.spent_at} onChange={e=>setForm(c=>({...c,spent_at:e.target.value}))} type="date" required/></FormField><FormField label="طريقة الدفع" required><select value={form.payment_method} onChange={e=>setForm(c=>({...c,payment_method:e.target.value as 'cash'|'bank'}))}><option value="cash">نقدي</option><option value="bank">مصرفي</option></select></FormField></div><FormField label="الوصف" required><input value={form.description} onChange={e=>setForm(c=>({...c,description:e.target.value}))} required/></FormField><FormField label="الملاحظات"><textarea value={form.notes} onChange={e=>setForm(c=>({...c,notes:e.target.value}))}/></FormField><FormField label="تخصيص المصروف"><select value={form.allocation} onChange={e=>setForm(c=>({...c,allocation:e.target.value}))}><option value="business_only">المركز فقط</option><option value="shared">المركز والعمال (50/50)</option></select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>}
@@ -2009,11 +2032,22 @@ function updatedPermissions(current: string[], code: PermissionCode) {
   let next = enabled ? current.filter((value) => value !== code) : [...current, code];
   if (code === 'operational.read' && enabled) next = next.filter((value) => value !== 'operational.write');
   if (code === 'operational.write' && !enabled && !next.includes('operational.read')) next.push('operational.read');
+  const operationalSections: SectionPermissionCode[] = ['section.dashboard.access', 'section.washes.access', 'section.paid_cars.access', 'section.overnight.access', 'section.workers.access', 'section.showrooms.access', 'section.reports.access'];
+  const financialSections: SectionPermissionCode[] = ['section.reports.access', 'section.finance.access', 'section.showroom_debts.access', 'section.salaries.access'];
+  if (operationalSections.some((section) => next.includes(section)) && !next.includes('operational.read')) next.push('operational.read');
+  if (financialSections.some((section) => next.includes(section)) && !next.includes('financial.manage')) next.push('financial.manage');
+  if (next.includes('section.settings.access') && !next.includes('settings.manage') && !next.includes('users.manage')) next.push('settings.manage');
+  if (next.includes('section.audit.access') && !next.includes('audit.read')) next.push('audit.read');
+  if (next.includes('section.backup.access') && !next.includes('backup.manage')) next.push('backup.manage');
   return next;
 }
 
+function PermissionToggleRows({ options, permissions, onToggle }: { options: { code: PermissionCode; name: string; description: string }[]; permissions: string[]; onToggle: (code: PermissionCode) => void }) {
+  return <div className="permission-toggle-list">{options.map((permission) => { const enabled = permissions.includes(permission.code); return <div className="permission-toggle-row" key={permission.code}><div><strong>{permission.name}</strong><span>{permission.description}</span></div><button type="button" className={`permission-switch ${enabled ? 'is-on' : ''}`} role="switch" aria-checked={enabled} onClick={() => onToggle(permission.code)}><span>{enabled ? 'مفعّل' : 'متوقف'}</span><i aria-hidden="true" /></button></div>; })}</div>;
+}
+
 function PermissionToggleList({ permissions, onToggle }: { permissions: string[]; onToggle: (code: PermissionCode) => void }) {
-  return <div className="permission-toggle-list">{PERMISSION_OPTIONS.map((permission) => { const enabled = permissions.includes(permission.code); return <div className="permission-toggle-row" key={permission.code}><div><strong>{permission.name}</strong><span>{permission.description}</span></div><button type="button" className={`permission-switch ${enabled ? 'is-on' : ''}`} role="switch" aria-checked={enabled} onClick={() => onToggle(permission.code)}><span>{enabled ? 'مفعّل' : 'متوقف'}</span><i aria-hidden="true" /></button></div>; })}</div>;
+  return <div className="permission-editor-groups"><div><p className="eyebrow">أقسام حساب الموظف</p><PermissionToggleRows options={SECTION_PERMISSION_OPTIONS} permissions={permissions} onToggle={onToggle}/></div><div><p className="eyebrow">صلاحيات الميزات والإجراءات</p><PermissionToggleRows options={FEATURE_PERMISSION_OPTIONS} permissions={permissions} onToggle={onToggle}/></div></div>;
 }
 
 function EmployeePermissionsModal({ user, onClose, onSaved, onNotify }: { user: AuthUser; onClose: () => void; onSaved: (user: AuthUser) => void; onNotify: (message: ToastMessage) => void }) {

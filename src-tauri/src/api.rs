@@ -4864,7 +4864,7 @@ async fn update_user_permissions(
     .map_err(ApiError::internal)?;
     tx.execute("DELETE FROM user_permissions WHERE user_id=?1", params![id])
         .map_err(ApiError::internal)?;
-    for code in input.permission_codes {
+    for code in normalized_permission_codes(input.permission_codes) {
         let permission: Option<String> = tx
             .query_row("SELECT id FROM permissions WHERE code=?1", [code], |row| {
                 row.get(0)
@@ -4912,6 +4912,53 @@ struct RolePermissionsInput {
     permission_codes: Vec<String>,
 }
 
+fn normalized_permission_codes(mut codes: Vec<String>) -> Vec<String> {
+    codes.sort();
+    codes.dedup();
+    let has_any = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .any(|candidate| codes.iter().any(|code| code == candidate))
+    };
+    let mut required = Vec::new();
+    if has_any(&[
+        "section.dashboard.access",
+        "section.washes.access",
+        "section.paid_cars.access",
+        "section.overnight.access",
+        "section.workers.access",
+        "section.showrooms.access",
+        "section.reports.access",
+    ]) {
+        required.push("operational.read");
+    }
+    if has_any(&[
+        "section.reports.access",
+        "section.finance.access",
+        "section.showroom_debts.access",
+        "section.salaries.access",
+    ]) {
+        required.push("financial.manage");
+    }
+    if has_any(&["section.settings.access"])
+        && !has_any(&["settings.manage", "users.manage"])
+    {
+        required.push("settings.manage");
+    }
+    if has_any(&["section.audit.access"]) {
+        required.push("audit.read");
+    }
+    if has_any(&["section.backup.access"]) {
+        required.push("backup.manage");
+    }
+    for code in required {
+        if !codes.iter().any(|existing| existing == code) {
+            codes.push(code.to_owned());
+        }
+    }
+    codes
+}
+
 async fn update_role_permissions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4937,7 +4984,7 @@ async fn update_role_permissions(
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute("DELETE FROM role_permissions WHERE role_id=?1", params![id])
         .map_err(ApiError::internal)?;
-    for code in input.permission_codes {
+    for code in normalized_permission_codes(input.permission_codes) {
         let permission: Option<String> = tx
             .query_row("SELECT id FROM permissions WHERE code=?1", [code], |row| {
                 row.get(0)
