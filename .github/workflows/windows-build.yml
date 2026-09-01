@@ -54,6 +54,49 @@ jobs:
       - name: Build Windows x64 NSIS installer
         run: npm run dist:win
 
+      - name: Smoke-test installed Windows application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = (Resolve-Path "release/Alkahelisys-Windows-x64-Setup.exe").Path
+          $installDirectory = Join-Path $env:RUNNER_TEMP "AlkahelisysSmoke"
+          $install = Start-Process -FilePath $installer -ArgumentList @("/S", "/D=$installDirectory") -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "NSIS installer exited with code $($install.ExitCode)"
+          }
+
+          $application = Join-Path $installDirectory "Alkahelisys.exe"
+          if (-not (Test-Path $application)) {
+            throw "Installed application was not found at $application"
+          }
+
+          $process = Start-Process -FilePath $application -PassThru
+          try {
+            $healthy = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+              Start-Sleep -Seconds 1
+              if ($process.HasExited) {
+                throw "Installed application exited before becoming ready"
+              }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/health" -TimeoutSec 2
+                if ($health.ok -eq $true -and $health.data.status -eq "ok") {
+                  $healthy = $true
+                  break
+                }
+              } catch {
+                # The local service may still be starting.
+              }
+            }
+            if (-not $healthy) {
+              throw "Installed application did not pass its startup health check"
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v6
         with:
