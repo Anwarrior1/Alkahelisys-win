@@ -877,7 +877,6 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const pointerDragOrder = useRef<DashboardCardId[] | null>(null);
-  const pointerDragStartOrder = useRef<DashboardCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadSequence = useRef(0);
@@ -911,6 +910,19 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
       .catch(() => { if (active && !cardOrderChanged.current) setCardOrder([...DASHBOARD_CARD_IDS]); });
     return () => { active = false; };
   }, [userId]);
+  useEffect(() => {
+    if (!draggedCardId) return undefined;
+    const finishPointerDrag = () => {
+      pointerDragOrder.current = null;
+      setDraggedCardId(null);
+    };
+    window.addEventListener('pointerup', finishPointerDrag);
+    window.addEventListener('pointercancel', finishPointerDrag);
+    return () => {
+      window.removeEventListener('pointerup', finishPointerDrag);
+      window.removeEventListener('pointercancel', finishPointerDrag);
+    };
+  }, [draggedCardId]);
   const recent = data.operational?.recent_washes ?? [];
   const finance = data.financial;
   const applyCardOrder = (nextOrder: DashboardCardId[]) => {
@@ -928,7 +940,6 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
-    pointerDragStartOrder.current = cardOrder;
     pointerDragOrder.current = cardOrder;
     setDraggedCardId(cardId);
   };
@@ -941,22 +952,13 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
     if (!targetId || targetId === cardId || !DASHBOARD_CARD_IDS.includes(targetId)) return;
     const nextOrder = moveDashboardCard(currentOrder, cardId, currentOrder.indexOf(targetId));
     pointerDragOrder.current = nextOrder;
-    cardOrderChanged.current = true;
-    setCardOrder(nextOrder);
+    applyCardOrder(nextOrder);
   };
-  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cancelled = false) => {
+  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (!pointerDragOrder.current) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    const nextOrder = pointerDragOrder.current;
-    const startOrder = pointerDragStartOrder.current;
     pointerDragOrder.current = null;
-    pointerDragStartOrder.current = null;
     setDraggedCardId(null);
-    if (cancelled) {
-      if (startOrder) setCardOrder(startOrder);
-      return;
-    }
-    if (startOrder && nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
   };
   const dashboardCards: Record<DashboardCardId, Omit<MetricCardProps, 'reorder'> | null> = {
     carsToday: { label: 'السيارات اليوم', value: data.operational?.cars_today ?? 0, note: 'عملية مسجلة اليوم', icon: <Car size={21} /> },
@@ -983,7 +985,7 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
               onPointerDown: (event) => beginCardPointerDrag(event, cardId),
               onPointerMove: (event) => moveCardPointerDrag(event, cardId),
               onPointerUp: (event) => finishCardPointerDrag(event),
-              onPointerCancel: (event) => finishCardPointerDrag(event, true),
+              onPointerCancel: (event) => finishCardPointerDrag(event),
               onKeyDown: (event) => {
                 let targetVisibleIndex: number | null = null;
                 if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetVisibleIndex = visibleIndex - 1;
@@ -2045,7 +2047,6 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const pointerDragOrder = useRef<FinancialReportCardId[] | null>(null);
-  const pointerDragStartOrder = useRef<FinancialReportCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -2074,6 +2075,19 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
       .catch(() => { if (active && !cardOrderChanged.current) setCardOrder([...FINANCIAL_REPORT_CARD_IDS]); });
     return () => { active = false; };
   }, [isManager, userId]);
+  useEffect(() => {
+    if (!draggedCardId) return undefined;
+    const finishPointerDrag = () => {
+      pointerDragOrder.current = null;
+      setDraggedCardId(null);
+    };
+    window.addEventListener('pointerup', finishPointerDrag);
+    window.addEventListener('pointercancel', finishPointerDrag);
+    return () => {
+      window.removeEventListener('pointerup', finishPointerDrag);
+      window.removeEventListener('pointercancel', finishPointerDrag);
+    };
+  }, [draggedCardId]);
   const workerRows = isManager ? financial?.worker_performance : operational?.workers;
 
   const applyCardOrder = (nextOrder: FinancialReportCardId[]) => {
@@ -2097,7 +2111,6 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
-    pointerDragStartOrder.current = cardOrder;
     pointerDragOrder.current = cardOrder;
     setDraggedCardId(cardId);
   };
@@ -2110,22 +2123,13 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     if (!targetId || targetId === cardId || !FINANCIAL_REPORT_CARD_IDS.includes(targetId)) return;
     const nextOrder = moveFinancialReportCard(currentOrder, cardId, currentOrder.indexOf(targetId));
     pointerDragOrder.current = nextOrder;
-    cardOrderChanged.current = true;
-    setCardOrder(nextOrder);
+    applyCardOrder(nextOrder);
   };
-  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cancelled = false) => {
+  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (!pointerDragOrder.current) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    const nextOrder = pointerDragOrder.current;
-    const startOrder = pointerDragStartOrder.current;
     pointerDragOrder.current = null;
-    pointerDragStartOrder.current = null;
     setDraggedCardId(null);
-    if (cancelled) {
-      if (startOrder) setCardOrder(startOrder);
-      return;
-    }
-    if (startOrder && nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
   };
   const financialCards: Record<FinancialReportCardId, Omit<MetricCardProps, 'reorder'>> | null = financial ? {
     totalRevenue: { label: 'إجمالي الإيراد', value: money(financial.revenue), icon: <ArrowUpLeft size={20} /> },
@@ -2154,7 +2158,7 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
               onPointerDown: (event) => beginCardPointerDrag(event, cardId),
               onPointerMove: (event) => moveCardPointerDrag(event, cardId),
               onPointerUp: (event) => finishCardPointerDrag(event),
-              onPointerCancel: (event) => finishCardPointerDrag(event, true),
+              onPointerCancel: (event) => finishCardPointerDrag(event),
               onKeyDown: (event) => {
                 let targetIndex: number | null = null;
                 if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetIndex = index - 1;
