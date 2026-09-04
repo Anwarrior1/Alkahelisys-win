@@ -10,7 +10,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,7 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
+type LedgerEntry<'a> = (&'a str, &'a str, i64, Option<&'a str>, Option<&'a str>);
 
 fn ok(data: Value) -> Json<Value> {
     Json(json!({ "data": data }))
@@ -351,6 +352,19 @@ fn authorize(
 ) -> Result<Principal, ApiError> {
     let principal = principal_from_headers(state, headers)?;
     if !principal.has_permission(permission) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(principal)
+}
+
+fn authorize_section(
+    state: &AppState,
+    headers: &HeaderMap,
+    section: &str,
+    permission: &str,
+) -> Result<Principal, ApiError> {
+    let principal = authorize(state, headers, permission)?;
+    if !principal.has_permission(section) {
         return Err(ApiError::forbidden());
     }
     Ok(principal)
@@ -798,6 +812,16 @@ fn business_today() -> NaiveDate {
     (Utc::now() + Duration::hours(BUSINESS_UTC_OFFSET_HOURS)).date_naive()
 }
 
+fn canonical_timestamp(value: &str, error_message: &str) -> Result<String, ApiError> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        })
+        .map_err(|_| ApiError::bad(error_message))
+}
+
 fn selected_business_date(query: &HashMap<String, String>) -> Result<Option<NaiveDate>, ApiError> {
     let Some(value) = query
         .get("date")
@@ -833,14 +857,14 @@ fn date_range(query: &HashMap<String, String>) -> Result<(String, String), ApiEr
     if !query.contains_key("from") && !query.contains_key("to") {
         return business_day_range(business_today());
     }
-    let from = query
-        .get("from")
-        .cloned()
-        .unwrap_or_else(|| "0000-01-01T00:00:00Z".into());
-    let to = query
-        .get("to")
-        .cloned()
-        .unwrap_or_else(|| "9999-12-31T23:59:59Z".into());
+    let from = match query.get("from") {
+        Some(value) => canonical_timestamp(value, "بداية الفترة غير صالحة")?,
+        None => "0000-01-01T00:00:00Z".into(),
+    };
+    let to = match query.get("to") {
+        Some(value) => canonical_timestamp(value, "نهاية الفترة غير صالحة")?,
+        None => "9999-12-31T23:59:59Z".into(),
+    };
     Ok((from, to))
 }
 
@@ -858,7 +882,12 @@ async fn dashboard(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.dashboard.access",
+        "operational.read",
+    )?;
     let can_view_all = principal.is_manager();
     let owner_id = principal.id.clone();
     let selected_date = selected_business_date(&query)?.unwrap_or_else(business_today);
@@ -984,7 +1013,12 @@ async fn list_washes(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.washes.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -1059,7 +1093,12 @@ async fn list_paid_cars(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.paid_cars.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let can_view_all = principal.is_manager();
     let include_financials = principal.has_permission("financial.manage");
@@ -1130,16 +1169,26 @@ async fn set_wash_overnight(
     Path(id): Path<String>,
     Json(input): Json<OvernightStatusInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.overnight.access",
+        "operational.write",
+    )?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let (created_by, status, is_paid): (String, String, i64) = db.conn.query_row(
-        "SELECT created_by,status,is_paid FROM wash_operations WHERE id=?1",
-        [id.clone()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)?;
+    let (created_by, status, is_paid): (String, String, i64) = db
+        .conn
+        .query_row(
+            "SELECT created_by,status,is_paid FROM wash_operations WHERE id=?1",
+            [id.clone()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
     if !principal.is_manager() && created_by != principal.id {
         return Err(ApiError::forbidden());
     }
@@ -1147,7 +1196,9 @@ async fn set_wash_overnight(
         return Err(ApiError::bad("لا يمكن تغيير حالة المبيت لعملية ملغاة"));
     }
     if input.is_overnight && is_paid == 1 {
-        return Err(ApiError::bad("أعد السيارة إلى غير خالصة قبل تعليمها كسيارة مبيتة"));
+        return Err(ApiError::bad(
+            "أعد السيارة إلى غير خالصة قبل تعليمها كسيارة مبيتة",
+        ));
     }
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     let changed = if input.is_overnight {
@@ -1157,13 +1208,20 @@ async fn set_wash_overnight(
         ).map_err(ApiError::internal)? == 1
     } else {
         tx.execute("DELETE FROM overnight_cars WHERE wash_id=?1", [&id])
-            .map_err(ApiError::internal)? == 1
+            .map_err(ApiError::internal)?
+            == 1
     };
     if changed {
         let (action, description) = if input.is_overnight {
-            ("OVERNIGHT_CAR_MARKED", "تم تعليم السيارة كسيارة مبيتة وربطها بعملية الغسيل الأصلية")
+            (
+                "OVERNIGHT_CAR_MARKED",
+                "تم تعليم السيارة كسيارة مبيتة وربطها بعملية الغسيل الأصلية",
+            )
         } else {
-            ("OVERNIGHT_CAR_UNMARKED", "تم إلغاء تعليم السيارة كسيارة مبيتة مع الاحتفاظ بعملية الغسيل الأصلية")
+            (
+                "OVERNIGHT_CAR_UNMARKED",
+                "تم إلغاء تعليم السيارة كسيارة مبيتة مع الاحتفاظ بعملية الغسيل الأصلية",
+            )
         };
         insert_audit_tx(
             &tx,
@@ -1193,7 +1251,12 @@ async fn set_wash_paid(
     Query(query): Query<HashMap<String, String>>,
     Json(input): Json<PaidStatusInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.paid_cars.access",
+        "operational.write",
+    )?;
     let (from, to) = date_range(&query)?;
     let mut db = state
         .db
@@ -1322,7 +1385,7 @@ fn add_financial_transaction(
     source_id: &str,
     occurred_at: &str,
     created_by: &str,
-    entries: &[(&str, &str, i64, Option<&str>, Option<&str>)],
+    entries: &[LedgerEntry<'_>],
 ) -> Result<(), ApiError> {
     let transaction_id = new_id();
     tx.execute(
@@ -1347,7 +1410,12 @@ async fn create_wash(
     headers: HeaderMap,
     Json(input): Json<WashInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.washes.access",
+        "operational.write",
+    )?;
     let vehicle_make = trim_required(&input.vehicle_make, "اسم الشركة المصنعة")?;
     let vehicle_model = trim_required(&input.vehicle_model, "طراز المركبة")?;
     let car_color = input
@@ -1412,13 +1480,13 @@ async fn create_wash(
     if input.payment_type == "cash" && showroom_payment_method.is_some() {
         return Err(ApiError::bad("لا يمكن حفظ طريقة دفع معرض لزبون عادي"));
     }
-    let occurred_at = input
+    let raw_occurred_at = input
         .occurred_at
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .unwrap_or_else(now);
-    DateTime::parse_from_rfc3339(&occurred_at).map_err(|_| ApiError::bad("وقت الغسلة غير صالح"))?;
+    let occurred_at = canonical_timestamp(&raw_occurred_at, "وقت الغسلة غير صالح")?;
     let request_id = input.client_request_id.unwrap_or_else(new_id);
     if request_id.len() > 100 {
         return Err(ApiError::bad("معرف الطلب غير صالح"));
@@ -1538,7 +1606,12 @@ async fn update_wash(
     Path(id): Path<String>,
     Json(input): Json<WashInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.washes.access",
+        "operational.write",
+    )?;
     let vehicle_make = trim_required(&input.vehicle_make, "اسم الشركة المصنعة")?;
     let vehicle_model = trim_required(&input.vehicle_model, "طراز المركبة")?;
     let car_color = input
@@ -1600,13 +1673,13 @@ async fn update_wash(
     if input.payment_type == "cash" && showroom_payment_method.is_some() {
         return Err(ApiError::bad("لا يمكن حفظ طريقة دفع معرض لزبون عادي"));
     }
-    let occurred_at = input
+    let raw_occurred_at = input
         .occurred_at
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .map(str::to_owned)
         .unwrap_or_else(now);
-    DateTime::parse_from_rfc3339(&occurred_at).map_err(|_| ApiError::bad("وقت الغسلة غير صالح"))?;
+    let occurred_at = canonical_timestamp(&raw_occurred_at, "وقت الغسلة غير صالح")?;
     let mut db = state
         .db
         .lock()
@@ -1782,7 +1855,12 @@ async fn list_overnight_cars(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.overnight.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let can_view_all = principal.is_manager();
     let owner_id = principal.id.clone();
@@ -1832,7 +1910,12 @@ async fn delete_overnight_car(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.overnight.access",
+        "operational.write",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -1876,7 +1959,12 @@ async fn void_wash(
     Path(id): Path<String>,
     Json(input): Json<VoidInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.washes.access",
+        "operational.write",
+    )?;
     let reason = trim_required(&input.reason, "سبب الإلغاء")?;
     let mut db = state
         .db
@@ -1962,7 +2050,12 @@ async fn list_workers(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -2006,7 +2099,12 @@ async fn create_worker(
     headers: HeaderMap,
     Json(input): Json<WorkerInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "operational.write",
+    )?;
     let full_name = trim_required(&input.full_name, "اسم العامل")?;
     if input.commission_bps_override.is_some() && !principal.has_permission("financial.manage") {
         return Err(ApiError::forbidden());
@@ -2044,7 +2142,12 @@ async fn update_worker(
     Path(id): Path<String>,
     Json(input): Json<WorkerInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "operational.write",
+    )?;
     let full_name = trim_required(&input.full_name, "اسم العامل")?;
     if input.commission_bps_override.is_some() && !principal.has_permission("financial.manage") {
         return Err(ApiError::forbidden());
@@ -2151,7 +2254,12 @@ async fn worker_detail(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "operational.read")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -2159,13 +2267,16 @@ async fn worker_detail(
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let worker: Option<Value> = db.conn.query_row("SELECT id,full_name,phone,notes,is_active FROM workers WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,"isActive":row.get::<_,i64>(4)?==1}))).optional().map_err(ApiError::internal)?;
     let mut worker = worker.ok_or_else(ApiError::not_found)?;
-    let (wash_count, total_wash_value): (i64, i64) = db.conn.query_row(
-        "SELECT COUNT(*),COALESCE(SUM(price_milli),0)
+    let (wash_count, total_wash_value): (i64, i64) = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(price_milli),0)
          FROM wash_operations
          WHERE worker_id=?1 AND status='posted' AND occurred_at BETWEEN ?2 AND ?3",
-        params![id.clone(),from.clone(),to.clone()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(ApiError::internal)?;
+            params![id.clone(), from.clone(), to.clone()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(ApiError::internal)?;
     worker["washCount"] = json!(wash_count);
     worker["totalWashValueMilli"] = json!(total_wash_value);
     let value_date = selected_business_date(&query)?
@@ -2215,7 +2326,12 @@ async fn update_worker_daily_value(
     Path(worker_id): Path<String>,
     Json(input): Json<WorkerDailyValueInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "worker.daily_value.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "worker.daily_value.manage",
+    )?;
     let date = NaiveDate::parse_from_str(input.value_date.trim(), "%Y-%m-%d")
         .map_err(|_| ApiError::bad("تاريخ القيمة اليومية غير صالح"))?;
     let value_date = date.format("%Y-%m-%d").to_string();
@@ -2254,7 +2370,12 @@ async fn worker_financial(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.workers.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -2408,7 +2529,9 @@ async fn worker_withdrawal_returns(
         transactions.push(row.map_err(ApiError::internal)?);
     }
     transactions.sort_by(|left, right| {
-        right["occurredAt"].as_str().cmp(&left["occurredAt"].as_str())
+        right["occurredAt"]
+            .as_str()
+            .cmp(&left["occurredAt"].as_str())
     });
     Ok(ok(json!({
         "worker":{"id":id,"fullName":worker_name},"totalWithdrawalsMilli":totals.withdrawals,
@@ -2432,8 +2555,7 @@ async fn create_worker_withdrawal_return(
         return Err(ApiError::bad("نوع الحركة غير صالح"));
     }
     let amount = parse_milli(&input.amount)?;
-    DateTime::parse_from_rfc3339(&input.occurred_at)
-        .map_err(|_| ApiError::bad("تاريخ الحركة غير صالح"))?;
+    let occurred_at = canonical_timestamp(&input.occurred_at, "تاريخ الحركة غير صالح")?;
     let notes = input
         .notes
         .map(|value| value.trim().to_owned())
@@ -2458,7 +2580,10 @@ async fn create_worker_withdrawal_return(
         .optional()
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    if matches!(input.transaction_type.as_str(), "return" | "deduction_payment") {
+    if matches!(
+        input.transaction_type.as_str(),
+        "return" | "deduction_payment"
+    ) {
         let totals = worker_movement_totals(
             &db.conn,
             &worker_id,
@@ -2478,7 +2603,7 @@ async fn create_worker_withdrawal_return(
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
     tx.execute(
         "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![id,worker_id,input.transaction_type,amount,input.occurred_at,notes,principal.id,created_at],
+        params![id,worker_id,input.transaction_type,amount,occurred_at,notes,principal.id,created_at],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
@@ -2506,8 +2631,7 @@ async fn update_worker_deduction_payment(
         return Err(ApiError::bad("يمكن تعديل حركات تسديد الاستقطاع فقط"));
     }
     let amount = parse_milli(&input.amount)?;
-    DateTime::parse_from_rfc3339(&input.occurred_at)
-        .map_err(|_| ApiError::bad("تاريخ الحركة غير صالح"))?;
+    let occurred_at = canonical_timestamp(&input.occurred_at, "تاريخ الحركة غير صالح")?;
     let notes = input
         .notes
         .map(|value| value.trim().to_owned())
@@ -2551,7 +2675,7 @@ async fn update_worker_deduction_payment(
         "UPDATE worker_withdrawal_returns
          SET amount_milli=?1,occurred_at=?2,notes=?3
          WHERE id=?4 AND worker_id=?5 AND transaction_type='deduction_payment' AND deleted_at IS NULL",
-        params![amount,input.occurred_at,notes,movement_id,worker_id],
+        params![amount,occurred_at,notes,movement_id,worker_id],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
@@ -2560,7 +2684,9 @@ async fn update_worker_deduction_payment(
         "worker_withdrawal_return",
         Some(&movement_id),
         "تم تعديل حركة تسديد استقطاع وإعادة احتساب الرصيد من السجلات المحفوظة",
-        Some(&json!({"workerId":worker_id,"previousAmountMilli":previous_amount,"amountMilli":amount})),
+        Some(
+            &json!({"workerId":worker_id,"previousAmountMilli":previous_amount,"amountMilli":amount}),
+        ),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(json!({"id":movement_id,"updated":true})))
@@ -2573,8 +2699,7 @@ async fn settle_worker_withdrawal_returns(
     Json(input): Json<WorkerSettlementInput>,
 ) -> ApiResult {
     let principal = manager(&state, &headers)?;
-    DateTime::parse_from_rfc3339(&input.occurred_at)
-        .map_err(|_| ApiError::bad("تاريخ التصفية غير صالح"))?;
+    let occurred_at = canonical_timestamp(&input.occurred_at, "تاريخ التصفية غير صالح")?;
     let mut db = state
         .db
         .lock()
@@ -2594,7 +2719,8 @@ async fn settle_worker_withdrawal_returns(
         &worker_id,
         "0000-01-01T00:00:00Z",
         "9999-12-31T23:59:59Z",
-    )?.outstanding;
+    )?
+    .outstanding;
     if outstanding == 0 {
         return Err(ApiError::bad("لا يوجد رصيد قائم يحتاج إلى تصفية"));
     }
@@ -2604,7 +2730,7 @@ async fn settle_worker_withdrawal_returns(
     tx.execute(
         "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
          VALUES(?1,?2,'settlement',?3,?4,?5,?6,?7)",
-        params![id,worker_id,outstanding,input.occurred_at,"تصفية المستقطعات",principal.id,created_at],
+        params![id,worker_id,outstanding,occurred_at,"تصفية المستقطعات",principal.id,created_at],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
@@ -2616,7 +2742,9 @@ async fn settle_worker_withdrawal_returns(
         Some(&json!({"workerId":worker_id,"workerName":worker_name,"amountMilli":outstanding})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(json!({"id":id,"created":true,"amountMilli":outstanding,"outstandingBalanceMilli":0})))
+    Ok(ok(
+        json!({"id":id,"created":true,"amountMilli":outstanding,"outstandingBalanceMilli":0}),
+    ))
 }
 
 async fn delete_worker_withdrawal_return(
@@ -2635,7 +2763,7 @@ async fn delete_worker_withdrawal_return(
             "SELECT transaction_type,amount_milli
              FROM worker_withdrawal_returns
              WHERE id=?1 AND worker_id=?2 AND deleted_at IS NULL",
-            params![movement_id.clone(),worker_id.clone()],
+            params![movement_id.clone(), worker_id.clone()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
@@ -2646,8 +2774,9 @@ async fn delete_worker_withdrawal_return(
     tx.execute(
         "UPDATE worker_withdrawal_returns SET deleted_at=?1,deleted_by=?2
          WHERE id=?3 AND worker_id=?4 AND deleted_at IS NULL",
-        params![deleted_at,principal.id,movement_id,worker_id],
-    ).map_err(ApiError::internal)?;
+        params![deleted_at, principal.id, movement_id, worker_id],
+    )
+    .map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
         Some(&principal.id),
@@ -2676,7 +2805,12 @@ async fn list_showroom_debts(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.showroom_debts.access",
+        "financial.manage",
+    )?;
     let (_, to) = date_range(&query)?;
     let db = state
         .db
@@ -2726,7 +2860,12 @@ async fn showroom_debt_detail(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.showroom_debts.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     if from > to {
         return Err(ApiError::bad("تاريخ البداية يجب أن يسبق تاريخ النهاية"));
@@ -2822,7 +2961,12 @@ async fn list_showrooms(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -2850,7 +2994,12 @@ async fn create_showroom(
     headers: HeaderMap,
     Json(input): Json<ShowroomInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.write",
+    )?;
     let name = trim_required(&input.name, "اسم المعرض")?;
     let id = new_id();
     let db = state
@@ -2877,7 +3026,12 @@ async fn update_showroom(
     Path(id): Path<String>,
     Json(input): Json<ShowroomInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.write",
+    )?;
     let name = trim_required(&input.name, "اسم المعرض")?;
     let db = state
         .db
@@ -2919,7 +3073,12 @@ async fn delete_showroom(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.write")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.write",
+    )?;
     let db = state
         .db
         .lock()
@@ -2979,7 +3138,12 @@ async fn showroom_detail(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -3004,7 +3168,12 @@ async fn showroom_statistics(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     if from > to {
         return Err(ApiError::bad("تاريخ البداية يجب أن يسبق تاريخ النهاية"));
@@ -3050,7 +3219,12 @@ async fn showroom_financial(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.showrooms.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -3096,8 +3270,7 @@ fn payment_time(value: &Option<String>) -> Result<String, ApiError> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .unwrap_or_else(now);
-    DateTime::parse_from_rfc3339(&value).map_err(|_| ApiError::bad("تاريخ الدفع غير صالح"))?;
-    Ok(value)
+    canonical_timestamp(&value, "تاريخ الدفع غير صالح")
 }
 
 fn showroom_payment_item_by_id(conn: &Connection, id: &str) -> Result<Value, ApiError> {
@@ -3129,7 +3302,12 @@ async fn update_showroom_payment(
     Path(id): Path<String>,
     Json(input): Json<PaymentInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let showroom_id = input
         .showroom_id
         .as_deref()
@@ -3225,7 +3403,12 @@ async fn delete_showroom_payment(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -3303,7 +3486,12 @@ async fn payroll_summary(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let selected_date = selected_business_date(&query)?;
     let month = match selected_date {
         Some(date) => date.format("%Y-%m").to_string(),
@@ -3375,7 +3563,12 @@ async fn create_payroll_employee(
     headers: HeaderMap,
     Json(input): Json<PayrollEmployeeInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let full_name = trim_required(&input.full_name, "اسم الموظف")?;
     let month = parse_payroll_month(Some(&input.month))?;
     let salary = parse_milli(&input.salary)?;
@@ -3419,7 +3612,12 @@ async fn set_employee_salary(
     Path(employee_id): Path<String>,
     Json(input): Json<SalaryInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let month = parse_payroll_month(Some(&input.month))?;
     let salary = parse_milli(&input.salary)?;
     let mut db = state
@@ -3466,7 +3664,12 @@ async fn delete_payroll_employee(
     headers: HeaderMap,
     Path(employee_id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -3524,14 +3727,13 @@ struct SalaryDeductionInput {
 
 fn deduction_time(input: &SalaryDeductionInput) -> Result<(String, String), ApiError> {
     if let Some(value) = input.deducted_at.as_deref() {
-        let deducted_at = value.trim();
-        DateTime::parse_from_rfc3339(deducted_at)
-            .map_err(|_| ApiError::bad("تاريخ الخصم غير صالح"))?;
-        let deducted_at = deducted_at.to_owned();
+        let deducted_at = canonical_timestamp(value, "تاريخ الخصم غير صالح")?;
         return Ok((deducted_at[..7].to_owned(), deducted_at));
     }
     let month = parse_payroll_month(input.month.as_ref())?;
-    Ok((month.clone(), format!("{month}-01T12:00:00Z")))
+    let deducted_at =
+        canonical_timestamp(&format!("{month}-01T12:00:00Z"), "تاريخ الخصم غير صالح")?;
+    Ok((month, deducted_at))
 }
 
 async fn list_salary_deductions(
@@ -3539,7 +3741,12 @@ async fn list_salary_deductions(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let selected_date = selected_business_date(&query)?;
     let month = match selected_date {
         Some(date) => date.format("%Y-%m").to_string(),
@@ -3577,7 +3784,12 @@ async fn create_salary_deduction(
     headers: HeaderMap,
     Json(input): Json<SalaryDeductionInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let employee_id = input.employee_id.trim().to_owned();
     if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
@@ -3631,7 +3843,12 @@ async fn update_salary_deduction(
     Path(id): Path<String>,
     Json(input): Json<SalaryDeductionInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let employee_id = input.employee_id.trim().to_owned();
     if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
@@ -3685,7 +3902,12 @@ async fn delete_salary_deduction(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -3717,9 +3939,7 @@ async fn delete_salary_deduction(
 }
 
 fn withdrawal_time(value: &str) -> Result<String, ApiError> {
-    let value = value.trim();
-    DateTime::parse_from_rfc3339(value).map_err(|_| ApiError::bad("تاريخ المسحوب غير صالح"))?;
-    Ok(value.to_owned())
+    canonical_timestamp(value, "تاريخ المسحوب غير صالح")
 }
 
 async fn list_salary_withdrawals(
@@ -3727,7 +3947,12 @@ async fn list_salary_withdrawals(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let selected_date = selected_business_date(&query)?;
     let month = match selected_date {
         Some(date) => date.format("%Y-%m").to_string(),
@@ -3790,7 +4015,12 @@ async fn create_salary_withdrawal(
     headers: HeaderMap,
     Json(input): Json<SalaryWithdrawalInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let employee_id = input.employee_id.trim().to_owned();
     if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
@@ -3845,7 +4075,12 @@ async fn update_salary_withdrawal(
     Path(id): Path<String>,
     Json(input): Json<SalaryWithdrawalInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let employee_id = input.employee_id.trim().to_owned();
     if employee_id.is_empty() {
         return Err(ApiError::bad("اختر الموظف"));
@@ -3900,7 +4135,12 @@ async fn delete_salary_withdrawal(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.salaries.access",
+        "financial.manage",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -3936,7 +4176,12 @@ async fn list_showroom_payments(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -3956,7 +4201,12 @@ async fn create_showroom_payment(
     headers: HeaderMap,
     Json(input): Json<PaymentInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let showroom_id = input
         .showroom_id
         .as_deref()
@@ -4033,7 +4283,12 @@ async fn list_expenses(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -4053,7 +4308,12 @@ async fn create_expense(
     headers: HeaderMap,
     Json(input): Json<ExpenseInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let description = trim_required(&input.description, "وصف المصروف")?;
     let category = trim_required(&input.category, "فئة المصروف")?;
     let payment_method = input.payment_method.as_deref().unwrap_or("cash");
@@ -4129,7 +4389,9 @@ async fn create_expense(
         "expense",
         Some(&id),
         "تم تسجيل مصروف وتوزيعه",
-        Some(&json!({"allocationType":input.allocation_type,"workerCount":workers.len(),"category":category,"paymentMethod":payment_method})),
+        Some(
+            &json!({"allocationType":input.allocation_type,"workerCount":workers.len(),"category":category,"paymentMethod":payment_method}),
+        ),
     )?;
     if workers_amount > 0 {
         insert_audit_tx(
@@ -4153,7 +4415,12 @@ async fn expense_detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "financial.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let db = state
         .db
         .lock()
@@ -4174,7 +4441,12 @@ async fn update_expense(
     Path(id): Path<String>,
     Json(input): Json<ExpenseInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let description = trim_required(&input.description, "وصف المصروف")?;
     let category = trim_required(&input.category, "فئة المصروف")?;
     let payment_method = input.payment_method.as_deref().unwrap_or("cash");
@@ -4264,7 +4536,9 @@ async fn update_expense(
         "expense",
         Some(&id),
         "تم تعديل المصروف وإعادة توزيع الاستقطاعات على لقطة العمال الأصلية",
-        Some(&json!({"workerCount":workers.len(),"category":category,"paymentMethod":payment_method})),
+        Some(
+            &json!({"workerCount":workers.len(),"category":category,"paymentMethod":payment_method}),
+        ),
     )?;
     if old.2 > 0 {
         insert_audit_tx(
@@ -4297,7 +4571,12 @@ async fn delete_expense(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let mut db = state
         .db
         .lock()
@@ -4376,7 +4655,12 @@ async fn finance_overview(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.finance.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -4399,7 +4683,12 @@ async fn operational_report(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "operational.read")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.reports.access",
+        "operational.read",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -4430,7 +4719,12 @@ async fn financial_report(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "financial.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.reports.access",
+        "financial.manage",
+    )?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -4460,7 +4754,12 @@ async fn financial_report(
 }
 
 async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
-    let _principal = authorize(&state, &headers, "settings.manage")?;
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.settings.access",
+        "settings.manage",
+    )?;
     let db = state
         .db
         .lock()
@@ -4499,7 +4798,12 @@ async fn update_settings(
     headers: HeaderMap,
     Json(input): Json<SettingsInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "settings.manage")?;
+    let principal = authorize_section(
+        &state,
+        &headers,
+        "section.settings.access",
+        "settings.manage",
+    )?;
     if let Some(value) = input.default_worker_commission_bps {
         if !(0..=10000).contains(&value) {
             return Err(ApiError::bad("نسبة العمولة الافتراضية غير صالحة"));
@@ -4597,7 +4901,8 @@ fn role_id_for(conn: &Connection, role_code: &str) -> Result<String, ApiError> {
 }
 
 async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
-    let _principal = authorize(&state, &headers, "users.manage")?;
+    let _principal =
+        authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
     let db = state
         .db
         .lock()
@@ -4618,7 +4923,7 @@ async fn create_user(
     headers: HeaderMap,
     Json(input): Json<UserInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "users.manage")?;
+    let principal = authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
     if input.role_code == "manager" && !principal.is_manager() {
         return Err(ApiError::forbidden());
     }
@@ -4663,12 +4968,12 @@ async fn update_user(
     Path(id): Path<String>,
     Json(input): Json<UserUpdateInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "users.manage")?;
+    let principal = authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
     if id == principal.id && input.is_active == Some(false) {
         return Err(ApiError::bad("لا يمكنك تعطيل حسابك الحالي"));
     }
     if id == principal.id
-        && input.role_code.as_deref() != None
+        && input.role_code.as_deref().is_some()
         && input.role_code.as_deref() != Some("manager")
     {
         return Err(ApiError::bad("لا يمكنك خفض دور حسابك الحالي"));
@@ -4892,7 +5197,8 @@ async fn update_user_permissions(
 }
 
 async fn list_roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
-    let _principal = authorize(&state, &headers, "users.manage")?;
+    let _principal =
+        authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
     let db = state
         .db
         .lock()
@@ -4940,9 +5246,7 @@ fn normalized_permission_codes(mut codes: Vec<String>) -> Vec<String> {
     ]) {
         required.push("financial.manage");
     }
-    if has_any(&["section.settings.access"])
-        && !has_any(&["settings.manage", "users.manage"])
-    {
+    if has_any(&["section.settings.access"]) && !has_any(&["settings.manage", "users.manage"]) {
         required.push("settings.manage");
     }
     if has_any(&["section.audit.access"]) {
@@ -5016,7 +5320,7 @@ async fn list_audit_logs(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "audit.read")?;
+    let _principal = authorize_section(&state, &headers, "section.audit.access", "audit.read")?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -5046,12 +5350,11 @@ fn safe_backup_path(data_dir: &FsPath, requested: Option<&str>) -> Result<PathBu
         .map(|value| PathBuf::from(value.trim()))
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or(fallback);
-    if path
+    if !path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("db"))
         .unwrap_or(false)
-        == false
     {
         return Err(ApiError::bad("يجب أن يكون امتداد ملف النسخة الاحتياطية .db"));
     }
@@ -5085,7 +5388,7 @@ async fn list_backups(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "backup.manage")?;
+    let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let (from, to) = date_range(&query)?;
     let db = state
         .db
@@ -5130,7 +5433,7 @@ async fn create_backup(
     headers: HeaderMap,
     Json(input): Json<BackupInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "backup.manage")?;
+    let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let path = safe_backup_path(&state.data_dir, input.path.as_deref())?;
     let db = state
         .db
@@ -5174,7 +5477,7 @@ async fn download_backup(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let _principal = authorize(&state, &headers, "backup.manage")?;
+    let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let db = state
         .db
         .lock()
@@ -5207,7 +5510,7 @@ async fn delete_backup(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "backup.manage")?;
+    let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let db = state
         .db
         .lock()
@@ -5238,7 +5541,7 @@ async fn export_backup(
     Path(id): Path<String>,
     Json(input): Json<BackupInput>,
 ) -> ApiResult {
-    let _principal = authorize(&state, &headers, "backup.manage")?;
+    let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let target = safe_backup_path(&state.data_dir, input.path.as_deref())?;
     let db = state
         .db
@@ -5267,7 +5570,7 @@ async fn restore_backup(
     headers: HeaderMap,
     Json(input): Json<RestoreInput>,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "backup.manage")?;
+    let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     if input.confirmation.trim() != "RESTORE" {
         return Err(ApiError::bad(
             "اكتب RESTORE لتأكيد استعادة النسخة الاحتياطية",
@@ -5283,7 +5586,7 @@ async fn restore_backup_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult {
-    let principal = authorize(&state, &headers, "backup.manage")?;
+    let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let upload_dir = state.data_dir.join("restore-uploads");
     fs::create_dir_all(&upload_dir).map_err(ApiError::internal)?;
     let staged = upload_dir.join(format!("restore-upload-{}.db", new_id()));
@@ -5343,8 +5646,8 @@ fn apply_restore(
     let staged = state
         .data_dir
         .join(format!("restore-staged-{}.db", new_id()));
-    fs::copy(&source, &staged).map_err(ApiError::internal)?;
-    if let Err(_) = Database::verify_backup(&staged) {
+    fs::copy(source, &staged).map_err(ApiError::internal)?;
+    if Database::verify_backup(&staged).is_err() {
         let _ = fs::remove_file(&staged);
         return Err(ApiError::bad("تعذر التحقق من النسخة قبل الاستعادة"));
     }

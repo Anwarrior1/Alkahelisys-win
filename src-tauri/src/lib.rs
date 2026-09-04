@@ -2,12 +2,30 @@ pub mod api;
 pub mod db;
 
 use api::{build_router, AppState};
-use db::Database;
-use std::path::PathBuf;
+use db::{now, Database};
 use std::sync::{Arc, Mutex};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tauri::Manager;
 
 const LOCAL_API_ADDRESS: &str = "127.0.0.1:8787";
+
+fn log_app_event(data_dir: &Path, level: &str, message: &str) {
+    let log_dir = data_dir.join("logs");
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("app.log"))
+    {
+        let _ = writeln!(file, "{} [{}] {message}", now(), level);
+    }
+}
 
 pub fn create_state(data_dir: PathBuf) -> Result<AppState, String> {
     let database =
@@ -49,6 +67,12 @@ pub fn run() {
                 .map_err(|error| format!("تعذر تحديد مجلد بيانات التطبيق: {error}"))?
                 .join("AlkaheliCarWashERP");
             let state = create_state(data_dir)?;
+            let log_data_dir = state.data_dir.clone();
+            log_app_event(
+                &log_data_dir,
+                "INFO",
+                "بدء تشغيل خدمة التطبيق المحلية المدمجة",
+            );
             let handle = tauri::async_runtime::handle();
             match tauri::async_runtime::block_on(bind_local_api()) {
                 Ok(listener) => {
@@ -56,15 +80,20 @@ pub fn run() {
                     // cannot race the embedded API during application startup.
                     handle.spawn(async move {
                         if let Err(error) = serve_on_listener(state, listener).await {
+                            log_app_event(&log_data_dir, "ERROR", &error);
                             eprintln!("{error}");
                         }
                     });
                 }
                 Err(error) if cfg!(debug_assertions) => {
                     // `tauri dev` starts the shared development API in beforeDevCommand.
+                    log_app_event(&log_data_dir, "INFO", &error);
                     eprintln!("{error}; سيتم استخدام خدمة التطوير الحالية");
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    log_app_event(&log_data_dir, "ERROR", &error);
+                    return Err(error.into());
+                }
             }
             Ok(())
         })

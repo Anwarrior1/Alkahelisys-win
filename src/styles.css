@@ -999,7 +999,7 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 
 @media print {
   @page { size: A4 portrait; margin: 8mm; }
-  html, body { width: 210mm; min-width: 0; background: #fff !important; }
+  html, body { width: auto; min-width: 0; background: #fff !important; }
   body * { visibility: hidden !important; }
   .modal-layer:has(.showroom-debt-print),
   .modal-layer:has(.showroom-debt-print) .modal {

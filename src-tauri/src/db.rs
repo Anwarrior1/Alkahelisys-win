@@ -8,7 +8,7 @@ pub const MONEY_SCALE: i64 = 1000;
 pub const DEFAULT_COMMISSION_BPS: i64 = 5000;
 
 pub fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 pub fn new_id() -> String {
@@ -408,7 +408,7 @@ impl Database {
                 notes TEXT,
                 created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
                 created_at TEXT NOT NULL
-             );"
+             );",
         )?;
         self.ensure_column("salary_deductions", "deducted_at", "deducted_at TEXT")?;
         self.ensure_column(
@@ -567,7 +567,8 @@ impl Database {
                 |row| row.get(0),
             )?;
             let tx = self.conn.transaction()?;
-            if !movement_schema.contains("'settlement'") || !movement_schema.contains("deleted_at") {
+            if !movement_schema.contains("'settlement'") || !movement_schema.contains("deleted_at")
+            {
                 tx.execute_batch(
                     "DROP INDEX IF EXISTS idx_worker_withdrawal_returns_worker;
                      ALTER TABLE worker_withdrawal_returns RENAME TO worker_withdrawal_returns_legacy;
@@ -857,7 +858,10 @@ impl Database {
                 )?;
             }
             for (section_code, legacy_codes) in [
-                ("section.settings.access", ["settings.manage", "users.manage"]),
+                (
+                    "section.settings.access",
+                    ["settings.manage", "users.manage"],
+                ),
                 ("section.audit.access", ["audit.read", "audit.read"]),
                 ("section.backup.access", ["backup.manage", "backup.manage"]),
             ] {
@@ -902,6 +906,42 @@ impl Database {
             }
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(21, ?1)",
+                [now()],
+            )?;
+        }
+        let timestamps_normalized: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=22",
+            [],
+            |row| row.get(0),
+        )?;
+        if timestamps_normalized == 0 {
+            self.conn.execute_batch(
+                "UPDATE users SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at),deleted_at=strftime('%Y-%m-%dT%H:%M:%fZ',deleted_at);
+                 UPDATE user_profile_pictures SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE user_preferences SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE sessions SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ',expires_at),revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ',revoked_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE settings SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE workers SET deactivated_at=strftime('%Y-%m-%dT%H:%M:%fZ',deactivated_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE showrooms SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE wash_operations SET occurred_at=strftime('%Y-%m-%dT%H:%M:%fZ',occurred_at),paid_at=strftime('%Y-%m-%dT%H:%M:%fZ',paid_at),voided_at=strftime('%Y-%m-%dT%H:%M:%fZ',voided_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE worker_payments SET paid_at=strftime('%Y-%m-%dT%H:%M:%fZ',paid_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE salary_withdrawals SET withdrawn_at=strftime('%Y-%m-%dT%H:%M:%fZ',withdrawn_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE salary_deductions SET deducted_at=strftime('%Y-%m-%dT%H:%M:%fZ',deducted_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE showroom_payments SET paid_at=strftime('%Y-%m-%dT%H:%M:%fZ',paid_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE expenses SET occurred_at=strftime('%Y-%m-%dT%H:%M:%fZ',occurred_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE expense_allocations SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE financial_transactions SET occurred_at=strftime('%Y-%m-%dT%H:%M:%fZ',occurred_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE ledger_entries SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE audit_logs SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE backup_history SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at);
+                 UPDATE overnight_cars SET marked_at=strftime('%Y-%m-%dT%H:%M:%fZ',marked_at);
+                 UPDATE worker_withdrawal_returns SET occurred_at=strftime('%Y-%m-%dT%H:%M:%fZ',occurred_at),created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),deleted_at=strftime('%Y-%m-%dT%H:%M:%fZ',deleted_at);
+                 UPDATE worker_daily_values SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
+                 UPDATE payroll_employees SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at),archived_at=strftime('%Y-%m-%dT%H:%M:%fZ',archived_at);
+                 UPDATE payroll_salary_rates SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(22, ?1)",
                 [now()],
             )?;
         }
@@ -999,19 +1039,84 @@ impl Database {
                 "administration",
                 "النسخ الاحتياطي والاستعادة",
             ),
-            ("perm-section-dashboard", "section.dashboard.access", "sections", "لوحة المتابعة"),
-            ("perm-section-washes", "section.washes.access", "sections", "عمليات الغسيل"),
-            ("perm-section-paid-cars", "section.paid_cars.access", "sections", "السيارات الخالصة"),
-            ("perm-section-overnight", "section.overnight.access", "sections", "سيارات المبيت"),
-            ("perm-section-workers", "section.workers.access", "sections", "العمال"),
-            ("perm-section-showrooms", "section.showrooms.access", "sections", "المعارض"),
-            ("perm-section-reports", "section.reports.access", "sections", "التقارير المالية"),
-            ("perm-section-finance", "section.finance.access", "sections", "التنفيذ المالي"),
-            ("perm-section-showroom-debts", "section.showroom_debts.access", "sections", "ديون المعارض"),
-            ("perm-section-salaries", "section.salaries.access", "sections", "المرتبات"),
-            ("perm-section-settings", "section.settings.access", "sections", "الإعدادات"),
-            ("perm-section-audit", "section.audit.access", "sections", "سجل التدقيق"),
-            ("perm-section-backup", "section.backup.access", "sections", "النسخ الاحتياطي"),
+            (
+                "perm-section-dashboard",
+                "section.dashboard.access",
+                "sections",
+                "لوحة المتابعة",
+            ),
+            (
+                "perm-section-washes",
+                "section.washes.access",
+                "sections",
+                "عمليات الغسيل",
+            ),
+            (
+                "perm-section-paid-cars",
+                "section.paid_cars.access",
+                "sections",
+                "السيارات الخالصة",
+            ),
+            (
+                "perm-section-overnight",
+                "section.overnight.access",
+                "sections",
+                "سيارات المبيت",
+            ),
+            (
+                "perm-section-workers",
+                "section.workers.access",
+                "sections",
+                "العمال",
+            ),
+            (
+                "perm-section-showrooms",
+                "section.showrooms.access",
+                "sections",
+                "المعارض",
+            ),
+            (
+                "perm-section-reports",
+                "section.reports.access",
+                "sections",
+                "التقارير المالية",
+            ),
+            (
+                "perm-section-finance",
+                "section.finance.access",
+                "sections",
+                "التنفيذ المالي",
+            ),
+            (
+                "perm-section-showroom-debts",
+                "section.showroom_debts.access",
+                "sections",
+                "ديون المعارض",
+            ),
+            (
+                "perm-section-salaries",
+                "section.salaries.access",
+                "sections",
+                "المرتبات",
+            ),
+            (
+                "perm-section-settings",
+                "section.settings.access",
+                "sections",
+                "الإعدادات",
+            ),
+            (
+                "perm-section-audit",
+                "section.audit.access",
+                "sections",
+                "سجل التدقيق",
+            ),
+            (
+                "perm-section-backup",
+                "section.backup.access",
+                "sections",
+                "النسخ الاحتياطي",
+            ),
         ] {
             self.conn.execute(
                 "INSERT OR IGNORE INTO permissions(id, code, group_code, name_ar) VALUES(?1, ?2, ?3, ?4)",
@@ -1089,7 +1194,16 @@ mod tests {
             [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
         ).unwrap();
-        assert_eq!(stored, ("Legacy expense".to_owned(), "Legacy category".to_owned(), 42_000, "preserve me".to_owned(), "cash".to_owned()));
+        assert_eq!(
+            stored,
+            (
+                "Legacy expense".to_owned(),
+                "Legacy category".to_owned(),
+                42_000,
+                "preserve me".to_owned(),
+                "cash".to_owned()
+            )
+        );
         drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
     }
@@ -1105,10 +1219,13 @@ mod tests {
             "INSERT INTO users(id,full_name,username_norm,password_hash,is_active,created_at,updated_at) VALUES('section-user','Section Employee','section.employee','unused',1,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z')",
             [],
         ).unwrap();
-        database.conn.execute(
-            "INSERT INTO user_roles(user_id,role_id) VALUES('section-user','role-employee')",
-            [],
-        ).unwrap();
+        database
+            .conn
+            .execute(
+                "INSERT INTO user_roles(user_id,role_id) VALUES('section-user','role-employee')",
+                [],
+            )
+            .unwrap();
         database.conn.execute(
             "INSERT INTO user_permission_profiles(user_id,updated_at) VALUES('section-user','2026-09-01T00:00:00Z')",
             [],
@@ -1124,18 +1241,24 @@ mod tests {
                 [code],
             ).unwrap();
         }
-        database.conn.execute_batch(
-            "DELETE FROM schema_migrations WHERE version=21;
+        database
+            .conn
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version=21;
              DELETE FROM permissions WHERE group_code='sections';",
-        ).unwrap();
+            )
+            .unwrap();
         drop(database);
 
         let reopened = Database::open(&data_dir).unwrap();
         let mut statement = reopened.conn.prepare(
             "SELECT p.code FROM user_permissions up JOIN permissions p ON p.id=up.permission_id WHERE up.user_id='section-user' ORDER BY p.code",
         ).unwrap();
-        let permissions = statement.query_map([], |row| row.get::<_, String>(0)).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+        let permissions = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         for preserved in [
             "operational.read",
             "operational.write",
@@ -1155,7 +1278,9 @@ mod tests {
         ] {
             assert!(permissions.iter().any(|code| code == migrated));
         }
-        assert!(!permissions.iter().any(|code| code == "section.finance.access"));
+        assert!(!permissions
+            .iter()
+            .any(|code| code == "section.finance.access"));
         drop(statement);
         drop(reopened);
         let _ = fs::remove_dir_all(data_dir);
@@ -1260,7 +1385,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(worker, ("worker-existing".to_owned(), "عامل محفوظ".to_owned()));
+        assert_eq!(
+            worker,
+            ("worker-existing".to_owned(), "عامل محفوظ".to_owned())
+        );
         let has_worker_id: bool = {
             let mut statement = database.conn.prepare("PRAGMA table_info(users)").unwrap();
             let columns = statement
@@ -1292,18 +1420,28 @@ mod tests {
              VALUES('movement-deduction-payment','worker-existing','deduction_payment',100000,'2026-08-12T12:00:00Z','تسديد','user-existing','2026-08-12T12:00:00Z')",
             [],
         ).unwrap();
-        let migration_16: i64 = database.conn.query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=16",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let migration_16: i64 = database
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=16",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(migration_16, 1);
         let migrated_employee: (String, String, i64) = database.conn.query_row(
             "SELECT id,full_name,is_active FROM payroll_employees WHERE id='payroll-worker-existing'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert_eq!(migrated_employee, ("payroll-worker-existing".to_owned(), "عامل محفوظ".to_owned(), 1));
+        assert_eq!(
+            migrated_employee,
+            (
+                "payroll-worker-existing".to_owned(),
+                "عامل محفوظ".to_owned(),
+                1
+            )
+        );
         let migrated_salary: i64 = database.conn.query_row(
             "SELECT salary_milli FROM payroll_salary_rates WHERE employee_id='payroll-worker-existing' AND effective_month='2026-08'",
             [],
@@ -1328,29 +1466,45 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(legacy_salary_table, 0);
-        let migration_17: i64 = database.conn.query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=17",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let migration_17: i64 = database
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=17",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(migration_17, 1);
-        let migration_18: i64 = database.conn.query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=18",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let migration_18: i64 = database
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=18",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(migration_18, 1);
-        let migration_19: i64 = database.conn.query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=19",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let migration_19: i64 = database
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=19",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(migration_19, 1);
         let has_wash_type: bool = {
-            let mut statement = database.conn.prepare("PRAGMA table_info(wash_operations)").unwrap();
-            statement.query_map([], |row| row.get::<_, String>(1)).unwrap()
-                .collect::<Result<Vec<_>, _>>().unwrap()
-                .iter().any(|column| column == "wash_type")
+            let mut statement = database
+                .conn
+                .prepare("PRAGMA table_info(wash_operations)")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .iter()
+                .any(|column| column == "wash_type")
         };
         assert!(has_wash_type);
         drop(database);
