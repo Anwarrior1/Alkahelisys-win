@@ -468,7 +468,7 @@ html[data-theme='dark'] .topbar__utility .theme-toggle:hover { color: #1059ad; b
 .metric-card__content small { color: var(--muted); font-size: 12px; }
 .metric-card--reorderable { padding-inline-end: 43px; transition: opacity .16s ease, transform .16s ease, box-shadow .16s ease; }
 .metric-card--dragging { opacity: .55; transform: scale(.985); }
-.metric-card__drag-handle { position: absolute; z-index: 1; top: 11px; inset-inline-end: 10px; display: grid; place-items: center; width: 28px; height: 32px; padding: 0; color: var(--muted); border: 0; border-radius: 9px; background: transparent; cursor: grab; }
+.metric-card__drag-handle { position: absolute; z-index: 1; top: 11px; inset-inline-end: 10px; display: grid; place-items: center; width: 28px; height: 32px; padding: 0; color: var(--muted); border: 0; border-radius: 9px; background: transparent; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
 .metric-card__drag-handle:hover { color: currentColor; background: color-mix(in srgb, currentColor 9%, transparent); }
 .metric-card__drag-handle:focus-visible { color: currentColor; outline: 2px solid currentColor; outline-offset: 1px; }
 .metric-card__drag-handle:active { cursor: grabbing; }

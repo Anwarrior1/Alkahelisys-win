@@ -72,6 +72,7 @@ jobs:
 
           $stdoutPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stdout.log"
           $stderrPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stderr.log"
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9222"
           $process = Start-Process -FilePath $application -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
           try {
             $healthy = $false
@@ -94,9 +95,40 @@ jobs:
               Write-Output "::error title=Installed application health check failed::curl exit code: $lastProbeExitCode; stderr: $stderr"
               throw "Installed application did not pass its startup health check"
             }
+
+            $reorderState = Join-Path $env:RUNNER_TEMP "alkahelisys-card-order-smoke.json"
+            node scripts/verify-windows-card-reorder.mjs exercise $reorderState
           } finally {
             if (-not $process.HasExited) {
               Stop-Process -Id $process.Id -Force
+            }
+          }
+
+          Start-Sleep -Seconds 2
+          $reopenStdoutPath = Join-Path $env:RUNNER_TEMP "alkahelisys-reopen.stdout.log"
+          $reopenStderrPath = Join-Path $env:RUNNER_TEMP "alkahelisys-reopen.stderr.log"
+          $reopenedProcess = Start-Process -FilePath $application -RedirectStandardOutput $reopenStdoutPath -RedirectStandardError $reopenStderrPath -PassThru
+          try {
+            $reopenedHealthy = $false
+            for ($attempt = 0; $attempt -lt 90; $attempt += 1) {
+              Start-Sleep -Seconds 1
+              $reopenedProcess.Refresh()
+              if ($reopenedProcess.HasExited) {
+                throw "Installed application exited during restart verification"
+              }
+              $health = & curl.exe --noproxy "*" --fail --silent --max-time 2 "http://127.0.0.1:8787/api/health"
+              if ($LASTEXITCODE -eq 0 -and $health -match '"status":"ok"') {
+                $reopenedHealthy = $true
+                break
+              }
+            }
+            if (-not $reopenedHealthy) {
+              throw "Installed application did not become healthy after restart"
+            }
+            node scripts/verify-windows-card-reorder.mjs verify $reorderState
+          } finally {
+            if (-not $reopenedProcess.HasExited) {
+              Stop-Process -Id $reopenedProcess.Id -Force
             }
           }
 

@@ -4835,7 +4835,7 @@ fn financial_summary(
     let outstanding_worker=total_for(conn,"SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)-COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)),0))",params![from,to,owner_id])?;
     let outstanding_showroom=total_for(conn,"SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3))-(SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)",params![from,to,owner_id])?;
     Ok(
-        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"paidCustomerRevenueMilli":paid_customer_revenue,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"paidCarsProfitMilli":paid_cars_profit,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"workerWithdrawalsMilli":worker_withdrawals,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":paid_cars_profit,"netProfitAfterExpensesMilli":paid_cars_profit-business_expenses-worker_withdrawals,"netBusinessProfitMilli":business_share-business_expenses}),
+        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"paidCustomerRevenueMilli":paid_customer_revenue,"paidCustomerRevenueAfterDeductionsMilli":paid_customer_revenue-expenses-worker_withdrawals,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"paidCarsProfitMilli":paid_cars_profit,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"workerWithdrawalsMilli":worker_withdrawals,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":paid_cars_profit,"netProfitAfterExpensesMilli":paid_cars_profit-business_expenses-worker_withdrawals,"netBusinessProfitMilli":business_share-business_expenses}),
     )
 }
 
@@ -5944,6 +5944,242 @@ mod paid_cars_tests {
 
     fn response_data(payload: &Value) -> &Value {
         payload.get("data").expect("response data")
+    }
+
+    async fn financial_summary_for_uri(app: &Router, token: &str, uri: &str) -> Value {
+        let (status, report) = request_json(app, Method::GET, uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        response_data(&report)["summary"].clone()
+    }
+
+    async fn create_test_wash(
+        app: &Router,
+        token: &str,
+        worker_id: &str,
+        showroom_id: Option<&str>,
+        price: &str,
+        occurred_at: &str,
+        mark_paid: bool,
+    ) -> String {
+        let payment_type = if showroom_id.is_some() {
+            "showroom"
+        } else {
+            "cash"
+        };
+        let (status, wash) = request_json(
+            app,
+            Method::POST,
+            "/api/washes",
+            Some(token),
+            Some(json!({
+                "vehicleMake":"Test","vehicleModel":"Finance","price":price,
+                "workerId":worker_id,"paymentType":payment_type,"showroomId":showroom_id,
+                "showroomPaymentMethod":showroom_id.map(|_| "cash"),
+                "occurredAt":occurred_at,"clientRequestId":new_id()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{wash}");
+        let wash_id = response_data(&wash)["id"].as_str().unwrap().to_owned();
+        if mark_paid {
+            let (status, paid) = request_json(
+                app,
+                Method::PATCH,
+                &format!("/api/washes/{wash_id}/paid"),
+                Some(token),
+                Some(json!({"isPaid":true})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{paid}");
+        }
+        wash_id
+    }
+
+    #[tokio::test]
+    async fn paid_customer_revenue_after_deductions_excludes_showrooms_and_filters_dates() {
+        let data_dir =
+            std::env::temp_dir().join(format!("alkaheli-revenue-card-test-{}", new_id()));
+        let state = crate::create_state(data_dir.clone()).expect("test database");
+        let app = build_router(state.clone());
+
+        let (status, manager_setup) = request_json(
+            &app,
+            Method::POST,
+            "/api/setup/initial-manager",
+            None,
+            Some(json!({"fullName":"مدير التقارير","username":"finance-manager","password":"StrongPass123!"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = response_data(&manager_setup)["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (status, worker) = request_json(
+            &app,
+            Method::POST,
+            "/api/workers",
+            Some(&token),
+            Some(json!({"fullName":"عامل التقارير","commissionBpsOverride":5000})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let worker_id = response_data(&worker)["id"].as_str().unwrap().to_owned();
+
+        let (status, showroom) = request_json(
+            &app,
+            Method::POST,
+            "/api/showrooms",
+            Some(&token),
+            Some(json!({"name":"معرض اختبار التقارير"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let showroom_id = response_data(&showroom)["id"].as_str().unwrap().to_owned();
+
+        let (status, employee) = request_json(
+            &app,
+            Method::POST,
+            "/api/payroll/employees",
+            Some(&token),
+            Some(json!({"fullName":"موظف التقارير","month":"2025-01","salary":"1000"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{employee}");
+        let employee_id = response_data(&employee)["employee"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let day_ten = "/api/reports/financial?date=2025-01-10";
+        let zero = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(zero["paidCustomerRevenueMilli"], 0);
+        assert_eq!(zero["paidCustomerRevenueAfterDeductionsMilli"], 0);
+
+        create_test_wash(
+            &app,
+            &token,
+            &worker_id,
+            None,
+            "1000",
+            "2025-01-10T10:00:00Z",
+            true,
+        )
+        .await;
+        let paid_only = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(paid_only["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(
+            paid_only["paidCustomerRevenueAfterDeductionsMilli"],
+            1_000_000
+        );
+
+        create_test_wash(
+            &app,
+            &token,
+            &worker_id,
+            Some(&showroom_id),
+            "500",
+            "2025-01-10T11:00:00Z",
+            false,
+        )
+        .await;
+        let with_showroom = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(with_showroom["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(
+            with_showroom["paidCustomerRevenueAfterDeductionsMilli"],
+            1_000_000
+        );
+
+        let (status, withdrawal) = request_json(
+            &app,
+            Method::POST,
+            "/api/payroll/withdrawals",
+            Some(&token),
+            Some(json!({"employeeId":employee_id,"amount":"200","withdrawnAt":"2025-01-10T12:00:00Z"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{withdrawal}");
+        let after_withdrawal = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(after_withdrawal["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(
+            after_withdrawal["paidCustomerRevenueAfterDeductionsMilli"],
+            800_000
+        );
+
+        let (status, expense) = request_json(
+            &app,
+            Method::POST,
+            "/api/expenses",
+            Some(&token),
+            Some(json!({"description":"مصروف الفترة","category":"أخرى","amount":"150","occurredAt":"2025-01-10T13:00:00Z","allocationType":"business"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{expense}");
+        let after_both = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(after_both["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(
+            after_both["paidCustomerRevenueAfterDeductionsMilli"],
+            650_000
+        );
+
+        create_test_wash(
+            &app,
+            &token,
+            &worker_id,
+            Some(&showroom_id),
+            "1000",
+            "2025-01-11T10:00:00Z",
+            false,
+        )
+        .await;
+        let showroom_only =
+            financial_summary_for_uri(&app, &token, "/api/reports/financial?date=2025-01-11").await;
+        assert_eq!(showroom_only["paidCustomerRevenueMilli"], 0);
+        assert_eq!(showroom_only["paidCustomerRevenueAfterDeductionsMilli"], 0);
+
+        let (status, _) = request_json(
+            &app,
+            Method::POST,
+            "/api/payroll/withdrawals",
+            Some(&token),
+            Some(json!({"employeeId":employee_id,"amount":"70","withdrawnAt":"2025-01-12T10:00:00Z"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = request_json(
+            &app,
+            Method::POST,
+            "/api/expenses",
+            Some(&token),
+            Some(json!({"description":"مصروف تاريخ آخر","category":"أخرى","amount":"30","occurredAt":"2025-01-12T11:00:00Z","allocationType":"business"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let day_ten_again = financial_summary_for_uri(&app, &token, day_ten).await;
+        assert_eq!(day_ten_again["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(
+            day_ten_again["paidCustomerRevenueAfterDeductionsMilli"],
+            650_000
+        );
+
+        let range = financial_summary_for_uri(
+            &app,
+            &token,
+            "/api/reports/financial?from=2025-01-10T00%3A00%3A00Z&to=2025-01-12T23%3A59%3A59Z",
+        )
+        .await;
+        assert_eq!(range["paidCustomerRevenueMilli"], 1_000_000);
+        assert_eq!(range["paidCustomerRevenueAfterDeductionsMilli"], 550_000);
+
+        let empty_day =
+            financial_summary_for_uri(&app, &token, "/api/reports/financial?date=2025-01-13").await;
+        assert_eq!(empty_day["paidCustomerRevenueMilli"], 0);
+        assert_eq!(empty_day["paidCustomerRevenueAfterDeductionsMilli"], 0);
+
+        drop(app);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

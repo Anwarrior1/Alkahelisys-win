@@ -155,6 +155,7 @@ export interface FinanceOverview {
   revenue?: Money;
   cash_revenue?: Money;
   paid_customer_revenue?: Money;
+  paid_customer_revenue_after_deductions?: Money;
   showroom_revenue?: Money;
   showroom_net_profit?: Money;
   worker_commissions?: Money;

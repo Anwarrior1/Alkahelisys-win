@@ -256,6 +256,7 @@ function mapFinance(raw: unknown): FinanceOverview {
     revenue: money(value.totalWashRevenueMilli),
     cash_revenue: money(value.cashRevenueMilli),
     paid_customer_revenue: money(value.paidCustomerRevenueMilli),
+    paid_customer_revenue_after_deductions: money(value.paidCustomerRevenueAfterDeductionsMilli),
     showroom_revenue: money(value.showroomRevenueMilli),
     showroom_net_profit: money(value.showroomNetProfitMilli),
     worker_commissions: money(value.workerCommissionsMilli),

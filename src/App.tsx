@@ -375,18 +375,18 @@ function EmptyState({ icon = <Sparkles size={28} />, title, description, action 
   );
 }
 
-type MetricCardProps = { label: string; value: ReactNode; note?: string; icon: ReactNode; tone?: 'blue' | 'teal' | 'violet' | 'amber'; reorder?: { active: boolean; onDragStart: (event: React.DragEvent<HTMLButtonElement>) => void; onDragEnd: () => void; onDragOver: (event: React.DragEvent<HTMLDivElement>) => void; onDrop: (event: React.DragEvent<HTMLDivElement>) => void; onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void } };
+type MetricCardProps = { label: string; value: ReactNode; note?: string; icon: ReactNode; tone?: 'blue' | 'teal' | 'violet' | 'amber'; reorder?: { cardId: string; active: boolean; onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void; onPointerMove: (event: React.PointerEvent<HTMLButtonElement>) => void; onPointerUp: (event: React.PointerEvent<HTMLButtonElement>) => void; onPointerCancel: (event: React.PointerEvent<HTMLButtonElement>) => void; onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void } };
 
 function MetricCard({ label, value, note, icon, tone = 'blue', reorder }: MetricCardProps) {
   return (
-    <div className={`metric-card metric-card--${tone}${reorder ? ' metric-card--reorderable' : ''}${reorder?.active ? ' metric-card--dragging' : ''}`} onDragOver={reorder?.onDragOver} onDrop={reorder?.onDrop}>
+    <div className={`metric-card metric-card--${tone}${reorder ? ' metric-card--reorderable' : ''}${reorder?.active ? ' metric-card--dragging' : ''}`} data-reorder-card-id={reorder?.cardId}>
       <div className="metric-card__icon">{icon}</div>
       <div className="metric-card__content">
         <span>{label}</span>
         <strong>{value}</strong>
         {note && <small>{note}</small>}
       </div>
-      {reorder && <button type="button" className="metric-card__drag-handle" draggable onDragStart={reorder.onDragStart} onDragEnd={reorder.onDragEnd} onKeyDown={reorder.onKeyDown} aria-label={`تغيير موضع بطاقة ${label}`} title="اسحب لتغيير ترتيب البطاقة، أو استخدم مفاتيح الأسهم"><GripVertical size={17} /></button>}
+      {reorder && <button type="button" className="metric-card__drag-handle" onPointerDown={reorder.onPointerDown} onPointerMove={reorder.onPointerMove} onPointerUp={reorder.onPointerUp} onPointerCancel={reorder.onPointerCancel} onKeyDown={reorder.onKeyDown} aria-grabbed={reorder.active} aria-label={`تغيير موضع بطاقة ${label}`} title="اسحب لتغيير ترتيب البطاقة، أو استخدم مفاتيح الأسهم"><GripVertical size={17} /></button>}
     </div>
   );
 }
@@ -876,6 +876,8 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
   const [cardOrderStatus, setCardOrderStatus] = useState('');
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const pointerDragOrder = useRef<DashboardCardId[] | null>(null);
+  const pointerDragStartOrder = useRef<DashboardCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadSequence = useRef(0);
@@ -921,6 +923,41 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
       .then(() => api.updateDashboardCardOrder(validOrder));
     void cardOrderSaveQueue.current.catch(() => setCardOrderStatus('تعذر حفظ ترتيب بطاقات لوحة المتابعة؛ يمكنك المحاولة مرة أخرى.'));
   };
+  const beginCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: DashboardCardId) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointerDragStartOrder.current = cardOrder;
+    pointerDragOrder.current = cardOrder;
+    setDraggedCardId(cardId);
+  };
+  const moveCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: DashboardCardId) => {
+    if (!pointerDragOrder.current) return;
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-reorder-card-id]');
+    const targetId = target?.dataset.reorderCardId as DashboardCardId | undefined;
+    const currentOrder = pointerDragOrder.current;
+    if (!targetId || targetId === cardId || !DASHBOARD_CARD_IDS.includes(targetId)) return;
+    const nextOrder = moveDashboardCard(currentOrder, cardId, currentOrder.indexOf(targetId));
+    pointerDragOrder.current = nextOrder;
+    cardOrderChanged.current = true;
+    setCardOrder(nextOrder);
+  };
+  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cancelled = false) => {
+    if (!pointerDragOrder.current) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    const nextOrder = pointerDragOrder.current;
+    const startOrder = pointerDragStartOrder.current;
+    pointerDragOrder.current = null;
+    pointerDragStartOrder.current = null;
+    setDraggedCardId(null);
+    if (cancelled) {
+      if (startOrder) setCardOrder(startOrder);
+      return;
+    }
+    if (startOrder && nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
+  };
   const dashboardCards: Record<DashboardCardId, Omit<MetricCardProps, 'reorder'> | null> = {
     carsToday: { label: 'السيارات اليوم', value: data.operational?.cars_today ?? 0, note: 'عملية مسجلة اليوم', icon: <Car size={21} /> },
     carsThisMonth: { label: 'السيارات هذا الشهر', value: data.operational?.cars_this_month ?? 0, note: 'إجمالي عمليات الشهر', icon: <CalendarDays size={21} />, tone: 'teal' },
@@ -941,11 +978,12 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
             const card = dashboardCards[cardId];
             if (!card) return null;
             return <MetricCard key={cardId} {...card} reorder={{
+              cardId,
               active: draggedCardId === cardId,
-              onDragStart: (event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', cardId); setDraggedCardId(cardId); },
-              onDragEnd: () => setDraggedCardId(null),
-              onDragOver: (event) => { if (draggedCardId && draggedCardId !== cardId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } },
-              onDrop: (event) => { event.preventDefault(); if (draggedCardId && draggedCardId !== cardId) applyCardOrder(moveDashboardCard(cardOrder, draggedCardId, cardOrder.indexOf(cardId))); setDraggedCardId(null); },
+              onPointerDown: (event) => beginCardPointerDrag(event, cardId),
+              onPointerMove: (event) => moveCardPointerDrag(event, cardId),
+              onPointerUp: (event) => finishCardPointerDrag(event),
+              onPointerCancel: (event) => finishCardPointerDrag(event, true),
               onKeyDown: (event) => {
                 let targetVisibleIndex: number | null = null;
                 if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetVisibleIndex = visibleIndex - 1;
@@ -1975,6 +2013,7 @@ const FINANCIAL_REPORT_CARD_IDS = [
   'paidCarsProfitAfterDeductions',
   'showroomDebts',
   'paidCustomerRevenue',
+  'paidCustomerRevenueAfterDeductions',
 ] as const;
 type FinancialReportCardId = typeof FINANCIAL_REPORT_CARD_IDS[number];
 
@@ -2005,6 +2044,8 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
   const [cardOrderStatus, setCardOrderStatus] = useState('');
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const pointerDragOrder = useRef<FinancialReportCardId[] | null>(null);
+  const pointerDragStartOrder = useRef<FinancialReportCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -2051,6 +2092,41 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     if (currentIndex === boundedIndex) return;
     applyCardOrder(moveFinancialReportCard(cardOrder, cardId, boundedIndex));
   };
+  const beginCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: FinancialReportCardId) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointerDragStartOrder.current = cardOrder;
+    pointerDragOrder.current = cardOrder;
+    setDraggedCardId(cardId);
+  };
+  const moveCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: FinancialReportCardId) => {
+    if (!pointerDragOrder.current) return;
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-reorder-card-id]');
+    const targetId = target?.dataset.reorderCardId as FinancialReportCardId | undefined;
+    const currentOrder = pointerDragOrder.current;
+    if (!targetId || targetId === cardId || !FINANCIAL_REPORT_CARD_IDS.includes(targetId)) return;
+    const nextOrder = moveFinancialReportCard(currentOrder, cardId, currentOrder.indexOf(targetId));
+    pointerDragOrder.current = nextOrder;
+    cardOrderChanged.current = true;
+    setCardOrder(nextOrder);
+  };
+  const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cancelled = false) => {
+    if (!pointerDragOrder.current) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    const nextOrder = pointerDragOrder.current;
+    const startOrder = pointerDragStartOrder.current;
+    pointerDragOrder.current = null;
+    pointerDragStartOrder.current = null;
+    setDraggedCardId(null);
+    if (cancelled) {
+      if (startOrder) setCardOrder(startOrder);
+      return;
+    }
+    if (startOrder && nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
+  };
   const financialCards: Record<FinancialReportCardId, Omit<MetricCardProps, 'reorder'>> | null = financial ? {
     totalRevenue: { label: 'إجمالي الإيراد', value: money(financial.revenue), icon: <ArrowUpLeft size={20} /> },
     showroomRevenue: { label: 'إيراد المعارض', value: money(financial.showroom_revenue), note: 'قيمة عمليات حساب المعرض ضمن الفترة', icon: <Building2 size={20} />, tone: 'teal' },
@@ -2061,6 +2137,7 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     paidCarsProfitAfterDeductions: { label: 'صافي الربح بعد المصروفات والمسحوبات', value: money(financial.net_profit_after_expenses), icon: <Banknote size={20} />, tone: 'blue' },
     showroomDebts: { label: 'ديون المعارض', value: money(financial.showroom_outstanding), note: 'صافي عمليات ودفعات المعارض ضمن الفترة', icon: <Building2 size={20} />, tone: 'amber' },
     paidCustomerRevenue: { label: 'الإيراد الإجمالي بدون المعارض', value: money(financial.paid_customer_revenue), note: 'إيراد السيارات الخالصة والعملاء العاديين فقط', icon: <CircleDollarSign size={20} />, tone: 'amber' },
+    paidCustomerRevenueAfterDeductions: { label: 'الإيراد الإجمالي بعد المصروفات والمسحوبات', value: money(financial.paid_customer_revenue_after_deductions), note: 'إيراد السيارات الخالصة ناقص مصروفات ومسحوبات الفترة', icon: <WalletCards size={20} />, tone: 'teal' },
   } : null;
 
   return (
@@ -2072,11 +2149,12 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
           <div className="report-headline glass-card"><div className="report-headline__icon"><FileText size={25} /></div><div><span>الفترة المعروضة</span><strong>{dateFormat(range.from)} — {dateFormat(range.to)}</strong></div><div><span>إجمالي السيارات المغسولة</span><strong>{operational?.cars_washed ?? operational?.washes?.length ?? 0} سيارة</strong></div>{isManager && <div><span>صافي ربح الأعمال</span><strong>{money(financial?.net_business_profit)}</strong></div>}</div>
           {isManager && financialCards && <div className="report-finance-grid">{cardOrder.map((cardId, index) => {
             return <MetricCard key={cardId} {...financialCards[cardId]} reorder={{
+              cardId,
               active: draggedCardId === cardId,
-              onDragStart: (event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', cardId); setDraggedCardId(cardId); },
-              onDragEnd: () => setDraggedCardId(null),
-              onDragOver: (event) => { if (draggedCardId && draggedCardId !== cardId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } },
-              onDrop: (event) => { event.preventDefault(); if (draggedCardId && draggedCardId !== cardId) applyCardOrder(moveFinancialReportCard(cardOrder, draggedCardId, index)); setDraggedCardId(null); },
+              onPointerDown: (event) => beginCardPointerDrag(event, cardId),
+              onPointerMove: (event) => moveCardPointerDrag(event, cardId),
+              onPointerUp: (event) => finishCardPointerDrag(event),
+              onPointerCancel: (event) => finishCardPointerDrag(event, true),
               onKeyDown: (event) => {
                 let targetIndex: number | null = null;
                 if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetIndex = index - 1;
