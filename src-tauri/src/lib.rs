@@ -95,6 +95,28 @@ pub fn run() {
                     return Err(error.into());
                 }
             }
+            #[cfg(target_os = "windows")]
+            if let Ok(port) = std::env::var("ALKAHILI_WEBVIEW_SMOKE_DEBUG_PORT") {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| "منفذ اختبار WebView غير صالح")?;
+                let browser_args = format!(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-address=127.0.0.1 --remote-debugging-port={port} --remote-allow-origins=*"
+                );
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    "windows-smoke",
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("Alkahelisys Windows WebView Smoke")
+                .inner_size(1440.0, 900.0)
+                .min_inner_size(1080.0, 720.0)
+                .resizable(true)
+                .data_directory(std::env::temp_dir().join("AlkahelisysWebViewSmoke"))
+                .additional_browser_args(&browser_args)
+                .build()
+                .map_err(|error| format!("تعذر تشغيل نافذة اختبار WebView: {error}"))?;
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

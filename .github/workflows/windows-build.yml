@@ -72,7 +72,7 @@ jobs:
 
           $stdoutPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stdout.log"
           $stderrPath = Join-Path $env:RUNNER_TEMP "alkahelisys-smoke.stderr.log"
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9222"
+          $env:ALKAHILI_WEBVIEW_SMOKE_DEBUG_PORT = "9222"
           $process = Start-Process -FilePath $application -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
           try {
             $healthy = $false
@@ -98,6 +98,9 @@ jobs:
 
             $reorderState = Join-Path $env:RUNNER_TEMP "alkahelisys-card-order-smoke.json"
             node scripts/verify-windows-card-reorder.mjs exercise $reorderState
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed WebView2 pointer reorder verification failed"
+            }
           } finally {
             if (-not $process.HasExited) {
               Stop-Process -Id $process.Id -Force
@@ -126,6 +129,9 @@ jobs:
               throw "Installed application did not become healthy after restart"
             }
             node scripts/verify-windows-card-reorder.mjs verify $reorderState
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed WebView2 restart persistence verification failed"
+            }
           } finally {
             if (-not $reopenedProcess.HasExited) {
               Stop-Process -Id $reopenedProcess.Id -Force
