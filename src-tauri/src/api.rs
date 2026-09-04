@@ -126,6 +126,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
         .route("/api/preferences/theme", put(update_theme))
+        .route(
+            "/api/preferences/financial-report-card-order",
+            get(financial_report_card_order).put(update_financial_report_card_order),
+        )
+        .route(
+            "/api/preferences/dashboard-card-order",
+            get(dashboard_card_order).put(update_dashboard_card_order),
+        )
         .route("/api/dashboard", get(dashboard))
         .route("/api/washes", get(list_washes).post(create_wash))
         .route("/api/washes/:id", patch(update_wash))
@@ -771,6 +779,137 @@ async fn update_theme(
     Ok(ok(json!({"theme": input.theme})))
 }
 
+async fn financial_report_card_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let principal = principal_from_headers(&state, &headers)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let raw = db
+        .conn
+        .query_row(
+            "SELECT financial_report_card_order_json FROM user_preferences WHERE user_id=?1",
+            [&principal.id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .flatten();
+    let card_order = raw
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or_default();
+    Ok(ok(json!({"cardOrder": card_order})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CardOrderInput {
+    card_order: Vec<String>,
+}
+
+async fn update_financial_report_card_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CardOrderInput>,
+) -> ApiResult {
+    let principal = principal_from_headers(&state, &headers)?;
+    if input.card_order.len() > 64
+        || input.card_order.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    {
+        return Err(ApiError::bad("ترتيب بطاقات التقرير غير صالح"));
+    }
+    let mut unique = std::collections::HashSet::new();
+    if input.card_order.iter().any(|id| !unique.insert(id)) {
+        return Err(ApiError::bad("ترتيب بطاقات التقرير يحتوي على تكرار"));
+    }
+    let serialized = serde_json::to_string(&input.card_order).map_err(ApiError::internal)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    db.conn
+        .execute(
+            "INSERT INTO user_preferences(user_id, theme, financial_report_card_order_json, updated_at)
+             VALUES(?1, 'light', ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET
+                financial_report_card_order_json=excluded.financial_report_card_order_json,
+                updated_at=excluded.updated_at",
+            params![principal.id, serialized, now()],
+        )
+        .map_err(ApiError::internal)?;
+    Ok(ok(json!({"cardOrder": input.card_order})))
+}
+
+async fn dashboard_card_order(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
+    let principal = principal_from_headers(&state, &headers)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let raw = db
+        .conn
+        .query_row(
+            "SELECT dashboard_card_order_json FROM user_preferences WHERE user_id=?1",
+            [&principal.id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .flatten();
+    let card_order = raw
+        .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or_default();
+    Ok(ok(json!({"cardOrder": card_order})))
+}
+
+async fn update_dashboard_card_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CardOrderInput>,
+) -> ApiResult {
+    let principal = principal_from_headers(&state, &headers)?;
+    if input.card_order.len() > 64
+        || input.card_order.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    {
+        return Err(ApiError::bad("ترتيب بطاقات لوحة المتابعة غير صالح"));
+    }
+    let mut unique = std::collections::HashSet::new();
+    if input.card_order.iter().any(|id| !unique.insert(id)) {
+        return Err(ApiError::bad("ترتيب بطاقات لوحة المتابعة يحتوي على تكرار"));
+    }
+    let serialized = serde_json::to_string(&input.card_order).map_err(ApiError::internal)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    db.conn
+        .execute(
+            "INSERT INTO user_preferences(user_id, theme, dashboard_card_order_json, updated_at)
+             VALUES(?1, 'light', ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET
+                dashboard_card_order_json=excluded.dashboard_card_order_json,
+                updated_at=excluded.updated_at",
+            params![principal.id, serialized, now()],
+        )
+        .map_err(ApiError::internal)?;
+    Ok(ok(json!({"cardOrder": input.card_order})))
+}
+
 fn parse_milli(value: &str) -> Result<i64, ApiError> {
     let normalized = value.trim().replace(',', ".");
     if normalized.is_empty() || normalized.starts_with('-') {
@@ -944,8 +1083,8 @@ async fn dashboard(
         "businessTimeZone": "Africa/Tripoli",
     });
     if principal.has_permission("dashboard.daily_revenue.read") {
-        let gross_today_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let today_revenue = gross_today_revenue - today_salary_withdrawals;
+        let revenue_before_withdrawals = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND ((payment_type='cash' AND is_paid=1) OR payment_type='showroom') AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
+        let today_revenue = revenue_before_withdrawals - today_salary_withdrawals;
         response["financial"] = json!({"todayRevenue": today_revenue});
     }
     if principal.has_permission("financial.manage") {
@@ -978,15 +1117,41 @@ async fn dashboard(
         response["financial"]["netProfit"] = json!(business_share - business_expenses);
     }
     if principal.is_manager() {
-        let today_customer_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
-        let paid_business_share = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
-        let today_net_profit = paid_business_share - today_salary_withdrawals;
-        let today_showroom_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
-        let today_showroom_net_profit = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND is_paid=1 AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start, selected_day_end])?;
+        let (
+            paid_customer_revenue,
+            paid_customer_profit,
+            today_showroom_revenue,
+            today_showroom_net_profit,
+        ) = db
+            .conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN payment_type='showroom' THEN price_milli ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN payment_type='showroom' THEN business_share_milli ELSE 0 END),0)
+                 FROM wash_operations
+                 WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2",
+                params![selected_day_start, selected_day_end],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(ApiError::internal)?;
+        let revenue_before_withdrawals = paid_customer_revenue + today_showroom_revenue;
+        let today_net_profit = paid_customer_profit - today_salary_withdrawals;
         if response.get("financial").is_none() {
             response["financial"] = json!({});
         }
-        response["financial"]["todayCustomerRevenue"] = json!(today_customer_revenue);
+        response["financial"]["todayRevenue"] =
+            json!(revenue_before_withdrawals - today_salary_withdrawals);
+        response["financial"]["todayRevenueBeforeWithdrawals"] = json!(revenue_before_withdrawals);
+        response["financial"]["todayCustomerRevenue"] = json!(paid_customer_revenue);
         response["financial"]["todayNetProfit"] = json!(today_net_profit);
         response["financial"]["todayShowroomRevenue"] = json!(today_showroom_revenue);
         response["financial"]["todayShowroomNetProfit"] = json!(today_showroom_net_profit);
@@ -4655,19 +4820,22 @@ fn financial_summary(
 ) -> Result<Value, ApiError> {
     let revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let cash=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
+    let paid_customer_revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let showroom_revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let showroom_commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let business_share=total_for(conn,"SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
+    let paid_cars_profit=total_for(conn,"SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let expenses = total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let business_expenses=total_for(conn,"SELECT COALESCE(SUM(business_amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
+    let worker_withdrawals=total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM salary_withdrawals WHERE withdrawn_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let workers_expenses=total_for(conn,"SELECT COALESCE(SUM(workers_amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let showroom_payments=total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
     let worker_deductions=total_for(conn,"SELECT COALESCE(SUM(ea.amount_milli),0) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)",params![from,to,owner_id])?;
     let outstanding_worker=total_for(conn,"SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)-COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)),0))",params![from,to,owner_id])?;
     let outstanding_showroom=total_for(conn,"SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3))-(SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)",params![from,to,owner_id])?;
     Ok(
-        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":business_share,"netProfitAfterExpensesMilli":business_share-business_expenses,"netBusinessProfitMilli":business_share-business_expenses}),
+        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"paidCustomerRevenueMilli":paid_customer_revenue,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"paidCarsProfitMilli":paid_cars_profit,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"workerWithdrawalsMilli":worker_withdrawals,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":paid_cars_profit,"netProfitAfterExpensesMilli":paid_cars_profit-business_expenses-worker_withdrawals,"netBusinessProfitMilli":business_share-business_expenses}),
     )
 }
 

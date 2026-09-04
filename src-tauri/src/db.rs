@@ -119,6 +119,8 @@ impl Database {
              CREATE TABLE IF NOT EXISTS user_preferences (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 theme TEXT NOT NULL DEFAULT 'light' CHECK(theme IN ('light','dark','system')),
+                financial_report_card_order_json TEXT,
+                dashboard_card_order_json TEXT,
                 updated_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS sessions (
@@ -942,6 +944,38 @@ impl Database {
             )?;
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(22, ?1)",
+                [now()],
+            )?;
+        }
+        let financial_report_card_order_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=23",
+            [],
+            |row| row.get(0),
+        )?;
+        if financial_report_card_order_added == 0 {
+            self.ensure_column(
+                "user_preferences",
+                "financial_report_card_order_json",
+                "financial_report_card_order_json TEXT",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(23, ?1)",
+                [now()],
+            )?;
+        }
+        let dashboard_card_order_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=24",
+            [],
+            |row| row.get(0),
+        )?;
+        if dashboard_card_order_added == 0 {
+            self.ensure_column(
+                "user_preferences",
+                "dashboard_card_order_json",
+                "dashboard_card_order_json TEXT",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(24, ?1)",
                 [now()],
             )?;
         }

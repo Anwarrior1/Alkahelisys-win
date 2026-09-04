@@ -137,6 +137,7 @@ export interface DashboardData {
   };
   financial?: {
     revenue_today?: Money;
+    revenue_before_withdrawals_today?: Money;
     customer_revenue_today?: Money;
     net_profit_today?: Money;
     showroom_revenue_today?: Money;
@@ -153,6 +154,7 @@ export interface DashboardData {
 export interface FinanceOverview {
   revenue?: Money;
   cash_revenue?: Money;
+  paid_customer_revenue?: Money;
   showroom_revenue?: Money;
   showroom_net_profit?: Money;
   worker_commissions?: Money;

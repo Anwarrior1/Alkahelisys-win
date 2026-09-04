@@ -20,6 +20,7 @@ import {
   Eye,
   EyeOff,
   FileText,
+  GripVertical,
   History,
   KeyRound,
   LayoutDashboard,
@@ -374,15 +375,18 @@ function EmptyState({ icon = <Sparkles size={28} />, title, description, action 
   );
 }
 
-function MetricCard({ label, value, note, icon, tone = 'blue' }: { label: string; value: ReactNode; note?: string; icon: ReactNode; tone?: 'blue' | 'teal' | 'violet' | 'amber' }) {
+type MetricCardProps = { label: string; value: ReactNode; note?: string; icon: ReactNode; tone?: 'blue' | 'teal' | 'violet' | 'amber'; reorder?: { active: boolean; onDragStart: (event: React.DragEvent<HTMLButtonElement>) => void; onDragEnd: () => void; onDragOver: (event: React.DragEvent<HTMLDivElement>) => void; onDrop: (event: React.DragEvent<HTMLDivElement>) => void; onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void } };
+
+function MetricCard({ label, value, note, icon, tone = 'blue', reorder }: MetricCardProps) {
   return (
-    <div className={`metric-card metric-card--${tone}`}>
+    <div className={`metric-card metric-card--${tone}${reorder ? ' metric-card--reorderable' : ''}${reorder?.active ? ' metric-card--dragging' : ''}`} onDragOver={reorder?.onDragOver} onDrop={reorder?.onDrop}>
       <div className="metric-card__icon">{icon}</div>
       <div className="metric-card__content">
         <span>{label}</span>
         <strong>{value}</strong>
         {note && <small>{note}</small>}
       </div>
+      {reorder && <button type="button" className="metric-card__drag-handle" draggable onDragStart={reorder.onDragStart} onDragEnd={reorder.onDragEnd} onKeyDown={reorder.onKeyDown} aria-label={`تغيير موضع بطاقة ${label}`} title="اسحب لتغيير ترتيب البطاقة، أو استخدم مفاتيح الأسهم"><GripVertical size={17} /></button>}
     </div>
   );
 }
@@ -808,20 +812,20 @@ function NavButton({ active, onClick, icon, children }: { active: boolean; onCli
 function ViewRouter({ view, user, selectedDate, canWrite, canFinancial, navigate, notify }: { view: View; user: AuthUser; selectedDate: string; canWrite: boolean; canFinancial: boolean; navigate: (view: View) => void; notify: (message: ToastMessage) => void }) {
   if (!canAccessView(user, view)) return <AccessDenied onBack={() => navigate(firstAccessibleView(user))} />;
   switch (view) {
-    case 'dashboard': return <DashboardView selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
+    case 'dashboard': return <DashboardView userId={user.id} selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
     case 'washes': return <WashesView selectedDate={selectedDate} isManager={managerOf(user)} canWrite={canWrite} onNotify={notify} />;
     case 'paidCars': return <PaidCarsView selectedDate={selectedDate} isManager={managerOf(user)} canWrite={canWrite} onNotify={notify} />;
     case 'overnight': return <OvernightCarsView selectedDate={selectedDate} canWrite={canWrite} onNotify={notify} />;
     case 'workers': return <WorkersView selectedDate={selectedDate} currentUserId={user.id} isManager={managerOf(user)} canWrite={canWrite} canFinancial={canFinancial} onNotify={notify} />;
     case 'showrooms': return <ShowroomsView selectedDate={selectedDate} canFinancial={canFinancial} canWrite={canWrite} onNotify={notify} />;
     case 'showroomDebts': return <ShowroomDebtsView selectedDate={selectedDate} reportIssuer={user.full_name || user.username} onNotify={notify} />;
-    case 'reports': return <ReportsView selectedDate={selectedDate} isManager={canFinancial} />;
+    case 'reports': return <ReportsView userId={user.id} selectedDate={selectedDate} isManager={canFinancial} />;
     case 'finance': return <FinanceView selectedDate={selectedDate} onNotify={notify} />;
     case 'salaries': return <SalariesView selectedDate={selectedDate} onNotify={notify} />;
     case 'settings': return <SettingsView user={user} canSettings={hasPermission(user, 'settings.manage')} canUsers={hasPermission(user, 'users.manage')} onNotify={notify} />;
     case 'audit': return <AuditView selectedDate={selectedDate} />;
     case 'backup': return <BackupView selectedDate={selectedDate} onNotify={notify} />;
-    default: return <DashboardView selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
+    default: return <DashboardView userId={user.id} selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
   }
 }
 
@@ -836,8 +840,42 @@ function AccessDenied({ onBack }: { onBack: () => void }) {
   );
 }
 
-function DashboardView({ selectedDate, isManager, canFinancial, canWrite, navigate }: { selectedDate: string; isManager: boolean; canFinancial: boolean; canWrite: boolean; navigate: (view: View) => void }) {
+const DASHBOARD_CARD_IDS = [
+  'carsToday',
+  'carsThisMonth',
+  'revenueBeforeWithdrawalsToday',
+  'revenueToday',
+  'showroomRevenueToday',
+  'netProfitToday',
+  'showroomNetProfitToday',
+] as const;
+type DashboardCardId = typeof DASHBOARD_CARD_IDS[number];
+
+function validDashboardCardOrder(savedOrder: readonly string[]): DashboardCardId[] {
+  const available = new Set<string>(DASHBOARD_CARD_IDS);
+  const seen = new Set<string>();
+  const valid: DashboardCardId[] = [];
+  savedOrder.forEach((id) => {
+    if (!available.has(id) || seen.has(id)) return;
+    seen.add(id);
+    valid.push(id as DashboardCardId);
+  });
+  return [...valid, ...DASHBOARD_CARD_IDS.filter((id) => !seen.has(id))];
+}
+
+function moveDashboardCard(order: readonly DashboardCardId[], cardId: DashboardCardId, targetIndex: number): DashboardCardId[] {
+  const withoutCard = order.filter((id) => id !== cardId);
+  withoutCard.splice(Math.max(0, Math.min(targetIndex, withoutCard.length)), 0, cardId);
+  return withoutCard;
+}
+
+function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite, navigate }: { userId: string; selectedDate: string; isManager: boolean; canFinancial: boolean; canWrite: boolean; navigate: (view: View) => void }) {
   const [data, setData] = useState<DashboardData>(dashboardFallback);
+  const [cardOrder, setCardOrder] = useState<DashboardCardId[]>(() => [...DASHBOARD_CARD_IDS]);
+  const [draggedCardId, setDraggedCardId] = useState<DashboardCardId | null>(null);
+  const [cardOrderStatus, setCardOrderStatus] = useState('');
+  const cardOrderChanged = useRef(false);
+  const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadSequence = useRef(0);
@@ -862,22 +900,67 @@ function DashboardView({ selectedDate, isManager, canFinancial, canWrite, naviga
     void load();
     return () => window.removeEventListener(DASHBOARD_REFRESH_EVENT, handleRefresh);
   }, [selectedDate]);
+  useEffect(() => {
+    let active = true;
+    cardOrderChanged.current = false;
+    setCardOrder([...DASHBOARD_CARD_IDS]);
+    void api.dashboardCardOrder()
+      .then((savedOrder) => { if (active && !cardOrderChanged.current) setCardOrder(validDashboardCardOrder(savedOrder)); })
+      .catch(() => { if (active && !cardOrderChanged.current) setCardOrder([...DASHBOARD_CARD_IDS]); });
+    return () => { active = false; };
+  }, [userId]);
   const recent = data.operational?.recent_washes ?? [];
   const finance = data.financial;
+  const applyCardOrder = (nextOrder: DashboardCardId[]) => {
+    const validOrder = validDashboardCardOrder(nextOrder);
+    cardOrderChanged.current = true;
+    setCardOrder(validOrder);
+    setCardOrderStatus('تم تغيير ترتيب بطاقات لوحة المتابعة.');
+    cardOrderSaveQueue.current = cardOrderSaveQueue.current
+      .catch(() => undefined)
+      .then(() => api.updateDashboardCardOrder(validOrder));
+    void cardOrderSaveQueue.current.catch(() => setCardOrderStatus('تعذر حفظ ترتيب بطاقات لوحة المتابعة؛ يمكنك المحاولة مرة أخرى.'));
+  };
+  const dashboardCards: Record<DashboardCardId, Omit<MetricCardProps, 'reorder'> | null> = {
+    carsToday: { label: 'السيارات اليوم', value: data.operational?.cars_today ?? 0, note: 'عملية مسجلة اليوم', icon: <Car size={21} /> },
+    carsThisMonth: { label: 'السيارات هذا الشهر', value: data.operational?.cars_this_month ?? 0, note: 'إجمالي عمليات الشهر', icon: <CalendarDays size={21} />, tone: 'teal' },
+    revenueBeforeWithdrawalsToday: isManager && finance?.revenue_before_withdrawals_today !== undefined ? { label: 'إيراد اليوم قبل المسحوبات', value: money(finance.revenue_before_withdrawals_today), note: 'السيارات الخالصة وإيراد المعارض', icon: <WalletCards size={21} />, tone: 'blue' } : null,
+    revenueToday: finance?.revenue_today !== undefined ? { label: 'إيراد اليوم', value: money(finance.revenue_today), note: isManager ? 'السيارات الخالصة والمعارض ناقص مسحوبات الموظفين' : 'إيراد عملياتك المحتسبة اليوم', icon: <CircleDollarSign size={21} />, tone: 'amber' } : null,
+    showroomRevenueToday: isManager && finance?.showroom_revenue_today !== undefined ? { label: 'إيراد المعارض اليوم', value: money(finance.showroom_revenue_today), note: 'عمليات المعارض فقط دون خصم المسحوبات', icon: <Building2 size={21} />, tone: 'blue' } : null,
+    netProfitToday: isManager && finance?.net_profit_today !== undefined ? { label: 'صافي ربح اليوم', value: money(finance.net_profit_today), note: 'ربح السيارات الخالصة فقط ناقص المسحوبات', icon: <Sparkles size={21} />, tone: 'teal' } : null,
+    showroomNetProfitToday: isManager && finance?.showroom_net_profit_today !== undefined ? { label: 'صافي ربح المعارض', value: money(finance.showroom_net_profit_today), note: 'إيراد المعارض ناقص عمولات عملياتها', icon: <ArrowUpLeft size={21} />, tone: 'violet' } : null,
+  };
+  const visibleCardIds = cardOrder.filter((cardId) => dashboardCards[cardId] !== null);
 
   return (
     <>
       <PageHeader eyebrow="لوحة المتابعة" title="عمليات اليوم" description={canFinancial ? `بيانات التشغيل والمالية ليوم ${workingDateFormat(selectedDate)}.` : `بيانات التشغيل ليوم ${workingDateFormat(selectedDate)}.`} actions={canWrite ? <Button variant="secondary" onClick={() => navigate('washes')} icon={<Plus size={18} />}>تسجيل غسيل جديد</Button> : undefined} />
       {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={load} /> : (
         <>
-          <div className="metric-grid">
-            <MetricCard label="السيارات اليوم" value={data.operational?.cars_today ?? 0} note="عملية مسجلة اليوم" icon={<Car size={21} />} />
-            <MetricCard label="السيارات هذا الشهر" value={data.operational?.cars_this_month ?? 0} note="إجمالي عمليات الشهر" icon={<CalendarDays size={21} />} tone="teal" />
-            {finance?.revenue_today !== undefined && <MetricCard label="إيراد اليوم" value={money(finance.revenue_today)} note={isManager ? 'إجمالي العمليات ناقص مسحوبات الموظفين' : 'إجمالي عملياتك المكتملة اليوم'} icon={<CircleDollarSign size={21} />} tone="amber" />}
-            {isManager && finance?.showroom_revenue_today !== undefined && <MetricCard label="إيراد المعارض اليوم" value={money(finance.showroom_revenue_today)} note="عمليات المعارض الآجلة فقط" icon={<Building2 size={21} />} tone="blue" />}
-            {isManager && finance?.net_profit_today !== undefined && <MetricCard label="صافي ربح اليوم" value={money(finance.net_profit_today)} note="ربح العمليات الخالصة ناقص مسحوبات الموظفين" icon={<Sparkles size={21} />} tone="teal" />}
-            {isManager && finance?.showroom_net_profit_today !== undefined && <MetricCard label="صافي ربح المعارض اليوم" value={money(finance.showroom_net_profit_today)} note="ربح عمليات المعارض بعد عمولة العامل" icon={<ArrowUpLeft size={21} />} tone="violet" />}
-          </div>
+          <div className="metric-grid">{visibleCardIds.map((cardId, visibleIndex) => {
+            const card = dashboardCards[cardId];
+            if (!card) return null;
+            return <MetricCard key={cardId} {...card} reorder={{
+              active: draggedCardId === cardId,
+              onDragStart: (event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', cardId); setDraggedCardId(cardId); },
+              onDragEnd: () => setDraggedCardId(null),
+              onDragOver: (event) => { if (draggedCardId && draggedCardId !== cardId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } },
+              onDrop: (event) => { event.preventDefault(); if (draggedCardId && draggedCardId !== cardId) applyCardOrder(moveDashboardCard(cardOrder, draggedCardId, cardOrder.indexOf(cardId))); setDraggedCardId(null); },
+              onKeyDown: (event) => {
+                let targetVisibleIndex: number | null = null;
+                if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetVisibleIndex = visibleIndex - 1;
+                else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') targetVisibleIndex = visibleIndex + 1;
+                else if (event.key === 'Home') targetVisibleIndex = 0;
+                else if (event.key === 'End') targetVisibleIndex = visibleCardIds.length - 1;
+                if (targetVisibleIndex !== null) {
+                  event.preventDefault();
+                  const targetId = visibleCardIds[Math.max(0, Math.min(targetVisibleIndex, visibleCardIds.length - 1))];
+                  if (targetId !== cardId) applyCardOrder(moveDashboardCard(cardOrder, cardId, cardOrder.indexOf(targetId)));
+                }
+              },
+            }} />;
+          })}</div>
+          <span className="visually-hidden" role="status" aria-live="polite">{cardOrderStatus}</span>
           <div className="dashboard-lower-grid">
             <SectionCard title="أحدث عمليات الغسيل" subtitle="آخر العمليات المسجلة في النظام" action={<button className="text-button" onClick={() => navigate('washes')}>عرض الكل <ChevronLeft size={15} /></button>}>
               {recent.length === 0 ? <EmptyState icon={<Car size={28} />} title="لا توجد عمليات بعد" description="ابدأ بإضافة أول عملية غسيل لهذا اليوم." action={<Button onClick={() => navigate('washes')} icon={<Plus size={17} />}>إضافة عملية</Button>} /> : <WashList washes={recent.slice(0, 5)} compact />}
@@ -1882,10 +1965,46 @@ function EditExpenseModal({expense,onClose,onSaved,onNotify}:{expense:ExpenseRec
 
 function ExpenseDetails({expense,onClose,onEdit,onDelete}:{expense:ExpenseRecord;onClose:()=>void;onEdit:()=>void;onDelete:()=>void}){return <SidePanel title="تفاصيل المصروف" onClose={onClose}><div className="profile-heading"><div className="profile-heading__avatar profile-heading__avatar--showroom"><ReceiptText size={25}/></div><div><h2>{expense.description}</h2><span>{expense.category||'أخرى'} · {expense.payment_method==='bank'?'مصرفي':'نقدي'} · {dateFormat(expense.spent_at,true)}</span></div></div><div className="mini-metric-grid"><MiniMetric label="إجمالي المصروف" value={expense.amount}/><MiniMetric label="حصة المركز" value={expense.business_amount} tone="warning"/><MiniMetric label="حصة العمال" value={expense.workers_amount} tone="danger"/></div><div className="profile-actions"><Button variant="secondary" onClick={onEdit} icon={<Pencil size={16}/>}>تعديل</Button><Button variant="danger" onClick={onDelete} icon={<Trash2 size={16}/>}>حذف</Button></div><SectionCard title="العمال المشاركون" subtitle={`${expense.allocations?.length??0} عامل في اللقطة التاريخية`}>{expense.allocations?.length?<div className="finance-overview-list">{expense.allocations.map(item=><div key={item.worker_id}><span><UsersRound size={16}/>{item.worker_name}</span><strong>{money(item.amount)}</strong></div>)}</div>:<EmptyState title="لا توجد استقطاعات عمال لهذا المصروف"/>}</SectionCard>{expense.notes&&<SectionCard title="ملاحظات"><p>{expense.notes}</p></SectionCard>}</SidePanel>}
 
-function ReportsView({ selectedDate, isManager }: { selectedDate: string; isManager: boolean }) {
+const FINANCIAL_REPORT_CARD_IDS = [
+  'totalRevenue',
+  'showroomRevenue',
+  'workerCommissions',
+  'paidCarsProfitBeforeDeductions',
+  'showroomProfit',
+  'businessExpenses',
+  'paidCarsProfitAfterDeductions',
+  'showroomDebts',
+  'paidCustomerRevenue',
+] as const;
+type FinancialReportCardId = typeof FINANCIAL_REPORT_CARD_IDS[number];
+
+function validFinancialReportCardOrder(savedOrder: readonly string[]): FinancialReportCardId[] {
+  const available = new Set<string>(FINANCIAL_REPORT_CARD_IDS);
+  const seen = new Set<string>();
+  const valid: FinancialReportCardId[] = [];
+  savedOrder.forEach((id) => {
+    if (!available.has(id) || seen.has(id)) return;
+    seen.add(id);
+    valid.push(id as FinancialReportCardId);
+  });
+  return [...valid, ...FINANCIAL_REPORT_CARD_IDS.filter((id) => !seen.has(id))];
+}
+
+function moveFinancialReportCard(order: readonly FinancialReportCardId[], cardId: FinancialReportCardId, targetIndex: number): FinancialReportCardId[] {
+  const withoutCard = order.filter((id) => id !== cardId);
+  withoutCard.splice(Math.max(0, Math.min(targetIndex, withoutCard.length)), 0, cardId);
+  return withoutCard;
+}
+
+function ReportsView({ userId, selectedDate, isManager }: { userId: string; selectedDate: string; isManager: boolean }) {
   const [range, setRange] = useState<DateRange>(() => selectedDateRange(selectedDate));
   const [operational, setOperational] = useState<OperationalReport | null>(null);
   const [financial, setFinancial] = useState<FinancialReport | null>(null);
+  const [cardOrder, setCardOrder] = useState<FinancialReportCardId[]>(() => [...FINANCIAL_REPORT_CARD_IDS]);
+  const [draggedCardId, setDraggedCardId] = useState<FinancialReportCardId | null>(null);
+  const [cardOrderStatus, setCardOrderStatus] = useState('');
+  const cardOrderChanged = useRef(false);
+  const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -1904,7 +2023,45 @@ function ReportsView({ selectedDate, isManager }: { selectedDate: string; isMana
     setRange(nextRange);
     void load(nextRange);
   }, [isManager, selectedDate]);
+  useEffect(() => {
+    if (!isManager) return;
+    let active = true;
+    cardOrderChanged.current = false;
+    setCardOrder([...FINANCIAL_REPORT_CARD_IDS]);
+    void api.financialReportCardOrder()
+      .then((savedOrder) => { if (active && !cardOrderChanged.current) setCardOrder(validFinancialReportCardOrder(savedOrder)); })
+      .catch(() => { if (active && !cardOrderChanged.current) setCardOrder([...FINANCIAL_REPORT_CARD_IDS]); });
+    return () => { active = false; };
+  }, [isManager, userId]);
   const workerRows = isManager ? financial?.worker_performance : operational?.workers;
+
+  const applyCardOrder = (nextOrder: FinancialReportCardId[]) => {
+    const validOrder = validFinancialReportCardOrder(nextOrder);
+    cardOrderChanged.current = true;
+    setCardOrder(validOrder);
+    setCardOrderStatus('تم تغيير ترتيب البطاقات.');
+    cardOrderSaveQueue.current = cardOrderSaveQueue.current
+      .catch(() => undefined)
+      .then(() => api.updateFinancialReportCardOrder(validOrder));
+    void cardOrderSaveQueue.current.catch(() => setCardOrderStatus('تعذر حفظ ترتيب البطاقات؛ يمكنك المحاولة مرة أخرى.'));
+  };
+  const moveCardToIndex = (cardId: FinancialReportCardId, targetIndex: number) => {
+    const currentIndex = cardOrder.indexOf(cardId);
+    const boundedIndex = Math.max(0, Math.min(targetIndex, cardOrder.length - 1));
+    if (currentIndex === boundedIndex) return;
+    applyCardOrder(moveFinancialReportCard(cardOrder, cardId, boundedIndex));
+  };
+  const financialCards: Record<FinancialReportCardId, Omit<MetricCardProps, 'reorder'>> | null = financial ? {
+    totalRevenue: { label: 'إجمالي الإيراد', value: money(financial.revenue), icon: <ArrowUpLeft size={20} /> },
+    showroomRevenue: { label: 'إيراد المعارض', value: money(financial.showroom_revenue), note: 'قيمة عمليات حساب المعرض ضمن الفترة', icon: <Building2 size={20} />, tone: 'teal' },
+    workerCommissions: { label: 'عمولات العمال', value: money(financial.worker_commissions), icon: <UsersRound size={20} />, tone: 'violet' },
+    paidCarsProfitBeforeDeductions: { label: 'صافي الربح قبل المصروفات والمسحوبات', value: money(financial.net_profit_before_expenses), icon: <Sparkles size={20} />, tone: 'teal' },
+    showroomProfit: { label: 'صافي ربح المعارض', value: money(financial.showroom_net_profit), note: 'إيراد المعارض ناقص عمولات عملياتها', icon: <Sparkles size={20} />, tone: 'blue' },
+    businessExpenses: { label: 'مصروفات الأعمال', value: money(financial.business_expenses), icon: <ReceiptText size={20} />, tone: 'amber' },
+    paidCarsProfitAfterDeductions: { label: 'صافي الربح بعد المصروفات والمسحوبات', value: money(financial.net_profit_after_expenses), icon: <Banknote size={20} />, tone: 'blue' },
+    showroomDebts: { label: 'ديون المعارض', value: money(financial.showroom_outstanding), note: 'صافي عمليات ودفعات المعارض ضمن الفترة', icon: <Building2 size={20} />, tone: 'amber' },
+    paidCustomerRevenue: { label: 'الإيراد الإجمالي بدون المعارض', value: money(financial.paid_customer_revenue), note: 'إيراد السيارات الخالصة والعملاء العاديين فقط', icon: <CircleDollarSign size={20} />, tone: 'amber' },
+  } : null;
 
   return (
     <>
@@ -1913,7 +2070,24 @@ function ReportsView({ selectedDate, isManager }: { selectedDate: string; isMana
       {loading ? <LoadingBlock label="جارٍ إعداد التقرير..." /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : (
         <>
           <div className="report-headline glass-card"><div className="report-headline__icon"><FileText size={25} /></div><div><span>الفترة المعروضة</span><strong>{dateFormat(range.from)} — {dateFormat(range.to)}</strong></div><div><span>إجمالي السيارات المغسولة</span><strong>{operational?.cars_washed ?? operational?.washes?.length ?? 0} سيارة</strong></div>{isManager && <div><span>صافي ربح الأعمال</span><strong>{money(financial?.net_business_profit)}</strong></div>}</div>
-          {isManager && financial && <div className="report-finance-grid"><MetricCard label="إجمالي الإيراد" value={money(financial.revenue)} icon={<ArrowUpLeft size={20} />} /><MetricCard label="إيراد المعارض" value={money(financial.showroom_revenue)} note="قيمة عمليات حساب المعرض ضمن الفترة" icon={<Building2 size={20} />} tone="teal" /><MetricCard label="عمولات العمال" value={money(financial.worker_commissions)} icon={<UsersRound size={20} />} tone="violet" /><MetricCard label="صافي الربح قبل المصروفات" value={money(financial.net_profit_before_expenses)} icon={<Sparkles size={20} />} tone="teal" /><MetricCard label="صافي ربح المعارض" value={money(financial.showroom_net_profit)} note="إيراد المعارض ناقص عمولات عملياتها" icon={<Sparkles size={20} />} tone="blue" /><MetricCard label="مصروفات الأعمال" value={money(financial.business_expenses)} icon={<ReceiptText size={20} />} tone="amber" /><MetricCard label="صافي الربح بعد المصروفات" value={money(financial.net_profit_after_expenses)} icon={<Banknote size={20} />} tone="blue" /><MetricCard label="ديون المعارض" value={money(financial.showroom_outstanding)} note="صافي عمليات ودفعات المعارض ضمن الفترة" icon={<Building2 size={20} />} tone="amber" /></div>}
+          {isManager && financialCards && <div className="report-finance-grid">{cardOrder.map((cardId, index) => {
+            return <MetricCard key={cardId} {...financialCards[cardId]} reorder={{
+              active: draggedCardId === cardId,
+              onDragStart: (event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', cardId); setDraggedCardId(cardId); },
+              onDragEnd: () => setDraggedCardId(null),
+              onDragOver: (event) => { if (draggedCardId && draggedCardId !== cardId) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } },
+              onDrop: (event) => { event.preventDefault(); if (draggedCardId && draggedCardId !== cardId) applyCardOrder(moveFinancialReportCard(cardOrder, draggedCardId, index)); setDraggedCardId(null); },
+              onKeyDown: (event) => {
+                let targetIndex: number | null = null;
+                if (event.key === 'ArrowRight' || event.key === 'ArrowUp') targetIndex = index - 1;
+                else if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') targetIndex = index + 1;
+                else if (event.key === 'Home') targetIndex = 0;
+                else if (event.key === 'End') targetIndex = cardOrder.length - 1;
+                if (targetIndex !== null) { event.preventDefault(); moveCardToIndex(cardId, targetIndex); }
+              },
+            }} />;
+          })}</div>}
+          <span className="visually-hidden" role="status" aria-live="polite">{cardOrderStatus}</span>
           <div className="report-grid">
             <SectionCard title="أداء العمال" subtitle={isManager ? 'عدد السيارات والمؤشرات المالية لكل عامل.' : 'عدد السيارات المغسولة لكل عامل ضمن الفترة.'}>
               {!workerRows?.length ? <EmptyState icon={<UsersRound size={27} />} title="لا توجد بيانات أداء ضمن هذه الفترة" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>العامل</th><th>السيارات المغسولة</th>{isManager && <><th>العمولات</th><th>الاستقطاعات</th><th>المستحق</th></>}</tr></thead><tbody>{workerRows.map((row) => {

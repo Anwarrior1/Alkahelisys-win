@@ -255,6 +255,7 @@ function mapFinance(raw: unknown): FinanceOverview {
   return {
     revenue: money(value.totalWashRevenueMilli),
     cash_revenue: money(value.cashRevenueMilli),
+    paid_customer_revenue: money(value.paidCustomerRevenueMilli),
     showroom_revenue: money(value.showroomRevenueMilli),
     showroom_net_profit: money(value.showroomNetProfitMilli),
     worker_commissions: money(value.workerCommissionsMilli),
@@ -324,6 +325,20 @@ class ApiClient {
   async me(): Promise<AuthUser> { return mapUser(await this.get('/auth/me')); }
   async logout() { await this.post('/auth/logout'); }
   async updateTheme(theme: 'light' | 'dark') { await this.put('/preferences/theme', { theme }); }
+  async financialReportCardOrder(): Promise<string[]> {
+    const value = record(await this.get('/preferences/financial-report-card-order'));
+    return Array.isArray(value.cardOrder) ? value.cardOrder.map((id) => text(id)).filter(Boolean) : [];
+  }
+  async updateFinancialReportCardOrder(cardOrder: string[]): Promise<void> {
+    await this.put('/preferences/financial-report-card-order', { cardOrder });
+  }
+  async dashboardCardOrder(): Promise<string[]> {
+    const value = record(await this.get('/preferences/dashboard-card-order'));
+    return Array.isArray(value.cardOrder) ? value.cardOrder.map((id) => text(id)).filter(Boolean) : [];
+  }
+  async updateDashboardCardOrder(cardOrder: string[]): Promise<void> {
+    await this.put('/preferences/dashboard-card-order', { cardOrder });
+  }
 
   async dashboard(selectedDate?: string): Promise<DashboardData> {
     const value = record(await this.get(`/dashboard${query({ date: selectedDate })}`));
@@ -332,6 +347,7 @@ class ApiClient {
       operational: { cars_today: number(value.todayWashes), cars_this_month: number(value.monthWashes), recent_washes: records(value.recentWashes).map(mapWash) },
       financial: Object.keys(finance).length ? {
         ...(Object.prototype.hasOwnProperty.call(finance, 'todayRevenue') ? { revenue_today: money(finance.todayRevenue) } : {}),
+        ...(Object.prototype.hasOwnProperty.call(finance, 'todayRevenueBeforeWithdrawals') ? { revenue_before_withdrawals_today: money(finance.todayRevenueBeforeWithdrawals) } : {}),
         ...(Object.prototype.hasOwnProperty.call(finance, 'todayCustomerRevenue') ? { customer_revenue_today: money(finance.todayCustomerRevenue) } : {}),
         ...(Object.prototype.hasOwnProperty.call(finance, 'todayNetProfit') ? { net_profit_today: money(finance.todayNetProfit) } : {}),
         ...(Object.prototype.hasOwnProperty.call(finance, 'todayShowroomRevenue') ? { showroom_revenue_today: money(finance.todayShowroomRevenue) } : {}),
