@@ -873,9 +873,9 @@ function DashboardView({ selectedDate, isManager, canFinancial, canWrite, naviga
           <div className="metric-grid">
             <MetricCard label="السيارات اليوم" value={data.operational?.cars_today ?? 0} note="عملية مسجلة اليوم" icon={<Car size={21} />} />
             <MetricCard label="السيارات هذا الشهر" value={data.operational?.cars_this_month ?? 0} note="إجمالي عمليات الشهر" icon={<CalendarDays size={21} />} tone="teal" />
-            {finance?.revenue_today !== undefined && <MetricCard label="إيراد اليوم" value={money(finance.revenue_today)} note={isManager ? 'إجمالي عمليات الزبائن والمعارض' : 'إجمالي عملياتك المكتملة اليوم'} icon={<CircleDollarSign size={21} />} tone="amber" />}
+            {finance?.revenue_today !== undefined && <MetricCard label="إيراد اليوم" value={money(finance.revenue_today)} note={isManager ? 'إجمالي العمليات ناقص مسحوبات الموظفين' : 'إجمالي عملياتك المكتملة اليوم'} icon={<CircleDollarSign size={21} />} tone="amber" />}
             {isManager && finance?.showroom_revenue_today !== undefined && <MetricCard label="إيراد المعارض اليوم" value={money(finance.showroom_revenue_today)} note="عمليات المعارض الآجلة فقط" icon={<Building2 size={21} />} tone="blue" />}
-            {isManager && finance?.net_profit_today !== undefined && <MetricCard label="صافي ربح اليوم" value={money(finance.net_profit_today)} note="ربح عمليات الزبائن بعد عمولة العامل" icon={<Sparkles size={21} />} tone="teal" />}
+            {isManager && finance?.net_profit_today !== undefined && <MetricCard label="صافي ربح اليوم" value={money(finance.net_profit_today)} note="ربح العمليات الخالصة ناقص مسحوبات الموظفين" icon={<Sparkles size={21} />} tone="teal" />}
             {isManager && finance?.showroom_net_profit_today !== undefined && <MetricCard label="صافي ربح المعارض اليوم" value={money(finance.showroom_net_profit_today)} note="ربح عمليات المعارض بعد عمولة العامل" icon={<ArrowUpLeft size={21} />} tone="violet" />}
           </div>
           <div className="dashboard-lower-grid">
@@ -1619,8 +1619,10 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
   const [deductionEmployee, setDeductionEmployee] = useState<PayrollEmployee | null>(null);
   const [editingWithdrawal, setEditingWithdrawal] = useState<SalaryWithdrawal | null>(null);
   const [editingDeduction, setEditingDeduction] = useState<SalaryDeduction | null>(null);
+  const loadSequence = useRef(0);
 
   const load = async () => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     setError(null);
     try {
@@ -1629,13 +1631,15 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
         api.salaryWithdrawals(month, selectedDate),
         api.salaryDeductions(month, selectedDate),
       ]);
-      setSummary(nextSummary);
-      setWithdrawals(nextWithdrawals);
-      setDeductions(nextDeductions);
+      if (sequence === loadSequence.current) {
+        setSummary(nextSummary);
+        setWithdrawals(nextWithdrawals);
+        setDeductions(nextDeductions);
+      }
     } catch (requestError) {
-      setError(friendlyError(requestError));
+      if (sequence === loadSequence.current) setError(friendlyError(requestError));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   };
 

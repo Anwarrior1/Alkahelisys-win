@@ -1104,6 +1104,316 @@ async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_his
 }
 
 #[tokio::test]
+async fn persisted_withdrawals_and_paid_washes_drive_selected_day_dashboard_totals() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل اختبار صافي اليوم").await;
+    let (status, employee) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/employees",
+        Some(&manager_token),
+        Some(json!({"fullName":"موظف اختبار المسحوبات","month":"2026-09","salary":"1000"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let employee_id = employee["data"]["employee"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut withdrawal_ids = Vec::new();
+    for sequence in 1..=3 {
+        let (status, withdrawal) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/payroll/withdrawals",
+            Some(&manager_token),
+            Some(json!({
+                "employeeId": employee_id,
+                "amount": "15",
+                "withdrawnAt": format!("2026-09-03T{sequence:02}:00:00Z"),
+                "notes": format!("مسحوب {sequence}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        withdrawal_ids.push(withdrawal["data"]["id"].as_str().unwrap().to_owned());
+    }
+    withdrawal_ids.sort();
+    withdrawal_ids.dedup();
+    assert_eq!(
+        withdrawal_ids.len(),
+        3,
+        "each withdrawal must have a unique ID"
+    );
+
+    let (_, payroll) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll?month=2026-09",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(payroll["data"]["totalWithdrawalsMilli"], 45_000);
+    assert_eq!(payroll["data"]["totalDeductionsMilli"], 0);
+    assert_eq!(payroll["data"]["totalRemainingMilli"], 955_000);
+
+    let (_, september_third) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll/withdrawals?month=2026-09&date=2026-09-03",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        september_third["data"]["items"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        september_third["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["amountMilli"].as_i64().unwrap())
+            .sum::<i64>(),
+        45_000
+    );
+
+    let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    let persisted: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(amount_milli),0)
+             FROM salary_withdrawals
+             WHERE employee_id=?1 AND withdrawn_at BETWEEN ?2 AND ?3",
+            params![
+                &employee_id,
+                "2026-09-02T22:00:00.000Z",
+                "2026-09-03T21:59:59.999Z"
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted, (3, 45_000));
+    drop(connection);
+
+    let (_, following_day_before_wash) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-04",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        following_day_before_wash["data"]["financial"]["todayRevenue"],
+        0
+    );
+    assert_eq!(
+        following_day_before_wash["data"]["financial"]["todayNetProfit"],
+        0
+    );
+
+    let deleted_id = withdrawal_ids.pop().unwrap();
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::DELETE,
+        &format!("/api/payroll/withdrawals/{deleted_id}"),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, payroll_after_delete) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll?month=2026-09",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        payroll_after_delete["data"]["totalWithdrawalsMilli"],
+        30_000
+    );
+
+    let wash_id = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_id,
+        "100",
+        "2026-09-04T10:00:00Z",
+    )
+    .await;
+    let (_, unpaid_dashboard) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-04",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        unpaid_dashboard["data"]["financial"]["todayRevenue"],
+        100_000
+    );
+    assert_eq!(unpaid_dashboard["data"]["financial"]["todayNetProfit"], 0);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{wash_id}/paid?date=2026-09-04"),
+        Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, paid_dashboard) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-04",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(paid_dashboard["data"]["financial"]["todayRevenue"], 100_000);
+    assert_eq!(
+        paid_dashboard["data"]["financial"]["todayNetProfit"],
+        50_000
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/withdrawals",
+        Some(&manager_token),
+        Some(json!({
+            "employeeId": employee_id,
+            "amount": "15",
+            "withdrawnAt": "2026-09-04T12:00:00Z",
+            "notes": "مسحوب يوم السيارة الخالصة"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_withdrawal) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-04",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after_withdrawal["data"]["financial"]["todayRevenue"],
+        85_000
+    );
+    assert_eq!(
+        after_withdrawal["data"]["financial"]["todayNetProfit"],
+        35_000
+    );
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn payroll_movements_use_tripoli_business_month_at_utc_boundary() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let (_, employee) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/employees",
+        Some(&manager_token),
+        Some(json!({"fullName":"موظف حد الشهر","month":"2026-09","salary":"100"})),
+    )
+    .await;
+    let employee_id = employee["data"]["employee"]["id"].as_str().unwrap();
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/withdrawals",
+        Some(&manager_token),
+        Some(json!({
+            "employeeId": employee_id,
+            "amount": "15",
+            "withdrawnAt": "2026-08-31T22:30:00Z",
+            "notes": "00:30 بتوقيت طرابلس"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, deduction) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/deductions",
+        Some(&manager_token),
+        Some(json!({
+            "employeeId": employee_id,
+            "amount": "5",
+            "deductedAt": "2026-08-31T22:45:00Z",
+            "notes": "00:45 بتوقيت طرابلس"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deduction["data"]["month"], "2026-09");
+
+    let (_, august) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll?month=2026-08",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let (_, september) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll?month=2026-09",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(august["data"]["totalWithdrawalsMilli"], 0);
+    assert_eq!(august["data"]["totalDeductionsMilli"], 0);
+    assert_eq!(september["data"]["totalWithdrawalsMilli"], 15_000);
+    assert_eq!(september["data"]["totalDeductionsMilli"], 5_000);
+    assert_eq!(september["data"]["totalRemainingMilli"], 80_000);
+
+    let (_, september_history) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll/withdrawals?month=2026-09",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        september_history["data"]["items"].as_array().unwrap().len(),
+        1
+    );
+    let (_, september_deductions) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/payroll/deductions?month=2026-09",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        september_deductions["data"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn obsolete_worker_payments_are_migrated_out_and_never_reduce_worker_balances() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
@@ -2765,17 +3075,14 @@ async fn daily_revenue_permission_controls_dashboard_card_data_per_employee() {
         manager_dashboard["data"]["financial"]["todayCustomerRevenue"],
         80_000
     );
-    assert_eq!(
-        manager_dashboard["data"]["financial"]["todayNetProfit"],
-        40_000
-    );
+    assert_eq!(manager_dashboard["data"]["financial"]["todayNetProfit"], 0);
     assert_eq!(
         manager_dashboard["data"]["financial"]["todayShowroomRevenue"],
         100_000
     );
     assert_eq!(
         manager_dashboard["data"]["financial"]["todayShowroomNetProfit"],
-        50_000
+        0
     );
     test_app.cleanup();
 }
@@ -2940,11 +3247,8 @@ async fn dashboard_revenue_uses_local_today_and_recalculates_after_wash_mutation
     assert_eq!(initial["data"]["financial"]["todayRevenue"], 100_000);
     assert_eq!(initial["data"]["financial"]["todayCustomerRevenue"], 50_000);
     assert_eq!(initial["data"]["financial"]["todayShowroomRevenue"], 50_000);
-    assert_eq!(initial["data"]["financial"]["todayNetProfit"], 25_000);
-    assert_eq!(
-        initial["data"]["financial"]["todayShowroomNetProfit"],
-        25_000
-    );
+    assert_eq!(initial["data"]["financial"]["todayNetProfit"], 0);
+    assert_eq!(initial["data"]["financial"]["todayShowroomNetProfit"], 0);
 
     let (status, _) = request_json(
         &test_app.router, Method::PATCH, &format!("/api/washes/{cash_id}"), Some(&manager_token),
@@ -3485,7 +3789,8 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     )
     .await;
     assert_eq!(dashboard["data"]["todayWashes"], 3);
-    assert_eq!(dashboard["data"]["financial"]["todayRevenue"], 125_000);
+    assert_eq!(dashboard["data"]["financial"]["todayRevenue"], 100_000);
+    assert_eq!(dashboard["data"]["financial"]["todayNetProfit"], -5_000);
     let (_, washes) = request_json(
         &test_app.router,
         Method::GET,
@@ -3790,7 +4095,11 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     assert_eq!(following_dashboard["data"]["todayWashes"], 2);
     assert_eq!(
         following_dashboard["data"]["financial"]["todayRevenue"],
-        155_000
+        120_000
+    );
+    assert_eq!(
+        following_dashboard["data"]["financial"]["todayNetProfit"],
+        -35_000
     );
     let (_, selected_again) = request_json(
         &test_app.router,

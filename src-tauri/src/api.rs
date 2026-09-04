@@ -900,6 +900,17 @@ async fn dashboard(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let today_salary_withdrawals = if can_view_all {
+        total_for(
+            &db.conn,
+            "SELECT COALESCE(SUM(amount_milli),0)
+             FROM salary_withdrawals
+             WHERE withdrawn_at BETWEEN ?1 AND ?2",
+            params![selected_day_start.clone(), selected_day_end.clone()],
+        )?
+    } else {
+        0
+    };
     let today_washes = total_for(&db.conn, "SELECT COUNT(*) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
     let month_washes = total_for(&db.conn, "SELECT COUNT(*) FROM wash_operations WHERE status='posted' AND strftime('%Y-%m', occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
     let mut recent = Vec::new();
@@ -933,7 +944,8 @@ async fn dashboard(
         "businessTimeZone": "Africa/Tripoli",
     });
     if principal.has_permission("dashboard.daily_revenue.read") {
-        let today_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
+        let gross_today_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
+        let today_revenue = gross_today_revenue - today_salary_withdrawals;
         response["financial"] = json!({"todayRevenue": today_revenue});
     }
     if principal.has_permission("financial.manage") {
@@ -967,9 +979,10 @@ async fn dashboard(
     }
     if principal.is_manager() {
         let today_customer_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
-        let today_net_profit = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
+        let paid_business_share = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
+        let today_net_profit = paid_business_share - today_salary_withdrawals;
         let today_showroom_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start.clone(), selected_day_end.clone()])?;
-        let today_showroom_net_profit = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start, selected_day_end])?;
+        let today_showroom_net_profit = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND is_paid=1 AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2", params![selected_day_start, selected_day_end])?;
         if response.get("financial").is_none() {
             response["financial"] = json!({});
         }
@@ -3460,7 +3473,7 @@ fn parse_payroll_month(value: Option<&String>) -> Result<String, ApiError> {
     let month = value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| Utc::now().format("%Y-%m").to_string());
+        .unwrap_or_else(|| business_today().format("%Y-%m").to_string());
     NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
         .map_err(|_| ApiError::bad("الشهر المحدد غير صالح"))?;
     Ok(month)
@@ -3513,9 +3526,11 @@ async fn payroll_summary(
                           WHERE rate.employee_id=employee.id AND rate.effective_month<=?1
                           ORDER BY rate.effective_month DESC LIMIT 1),0),
                 COALESCE((SELECT SUM(sw.amount_milli) FROM salary_withdrawals sw
-                          WHERE sw.employee_id=employee.id AND substr(sw.withdrawn_at,1,7)=?1),0)
+                          WHERE sw.employee_id=employee.id
+                            AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?1),0)
                 ,COALESCE((SELECT SUM(sd.amount_milli) FROM salary_deductions sd
-                          WHERE sd.employee_id=employee.id AND sd.deduction_month=?1),0)
+                          WHERE sd.employee_id=employee.id
+                            AND strftime('%Y-%m',sd.deducted_at,'+2 hours')=?1),0)
          FROM payroll_employees employee
          WHERE employee.is_active=1
          ORDER BY employee.full_name,employee.id",
@@ -3727,8 +3742,14 @@ struct SalaryDeductionInput {
 
 fn deduction_time(input: &SalaryDeductionInput) -> Result<(String, String), ApiError> {
     if let Some(value) = input.deducted_at.as_deref() {
-        let deducted_at = canonical_timestamp(value, "تاريخ الخصم غير صالح")?;
-        return Ok((deducted_at[..7].to_owned(), deducted_at));
+        let parsed = DateTime::parse_from_rfc3339(value.trim())
+            .map_err(|_| ApiError::bad("تاريخ الخصم غير صالح"))?;
+        let utc = parsed.with_timezone(&Utc);
+        let month = (utc + Duration::hours(BUSINESS_UTC_OFFSET_HOURS))
+            .format("%Y-%m")
+            .to_string();
+        let deducted_at = utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+        return Ok((month, deducted_at));
     }
     let month = parse_payroll_month(input.month.as_ref())?;
     let deducted_at =
@@ -3763,7 +3784,7 @@ async fn list_salary_deductions(
          FROM salary_deductions sd
          JOIN payroll_employees employee ON employee.id=sd.employee_id
          JOIN users creator ON creator.id=sd.created_by
-         WHERE (?1=0 AND sd.deduction_month=?2)
+         WHERE (?1=0 AND strftime('%Y-%m',sd.deducted_at,'+2 hours')=?2)
             OR (?1=1 AND sd.deducted_at BETWEEN ?3 AND ?4)
          ORDER BY sd.deducted_at DESC,sd.created_at DESC"
     ).map_err(ApiError::internal)?;
@@ -3975,7 +3996,7 @@ async fn list_salary_withdrawals(
              FROM salary_withdrawals sw
              JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
-             WHERE ((?1=0 AND substr(sw.withdrawn_at,1,7)=?2)
+             WHERE ((?1=0 AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?2)
                     OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4))
                AND sw.employee_id=?5
              ORDER BY sw.withdrawn_at DESC,sw.created_at DESC",
@@ -3994,7 +4015,7 @@ async fn list_salary_withdrawals(
              FROM salary_withdrawals sw
              JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
-             WHERE (?1=0 AND substr(sw.withdrawn_at,1,7)=?2)
+             WHERE (?1=0 AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?2)
                 OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4)
              ORDER BY sw.withdrawn_at DESC,sw.created_at DESC",
         ).map_err(ApiError::internal)?;
