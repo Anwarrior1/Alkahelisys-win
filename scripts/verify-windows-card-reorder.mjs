@@ -94,7 +94,9 @@ class CdpClient {
 
   async evaluate(expression) {
     const result = await this.command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? 'WebView evaluation failed');
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? 'WebView evaluation failed');
+    }
     return result.result?.value;
   }
 
@@ -108,7 +110,7 @@ async function connectToWebView() {
     const response = await fetch(`${debuggerRoot}/json/list`);
     if (!response.ok) return undefined;
     const targets = await response.json();
-    return targets.find((item) => item.type === 'page' && item.webSocketDebuggerUrl);
+    return targets.find((item) => item.type === 'page' && item.webSocketDebuggerUrl && item.url && item.url !== 'about:blank');
   });
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
@@ -122,6 +124,13 @@ async function connectToWebView() {
 }
 
 async function openReports(client, token) {
+  await retry('loaded WebView document', async () => {
+    try {
+      return await client.evaluate(`location.protocol !== 'about:' && document.readyState !== 'loading'`);
+    } catch {
+      return undefined;
+    }
+  });
   await client.evaluate(`sessionStorage.setItem('alkaheli.session-token', ${JSON.stringify(token)}); location.hash = '#/reports'; true`);
   await client.command('Page.reload', { ignoreCache: true });
   await retry('financial report cards', async () => {
