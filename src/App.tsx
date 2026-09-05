@@ -1370,16 +1370,17 @@ function WorkerWithdrawalsReturnsView({ workerId, workerName, selectedDate, onCl
   const [entryType, setEntryType] = useState<'withdrawal' | 'return' | 'deduction_payment' | null>(null);
   const [editingPayment, setEditingPayment] = useState<WorkerWithdrawalReturnLedger['transactions'][number] | null>(null);
   const [settling, setSettling] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [deletingMovementId, setDeletingMovementId] = useState<string | null>(null);
   const load = async () => { setLoading(true); setError(null); try { setLedger(await api.workerWithdrawalReturns(workerId, { from: '0000-01-01T00:00:00Z', to: '9999-12-31T23:59:59Z' })); } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); } };
   useEffect(() => { void load(); }, [workerId, selectedDate]);
   const settle = async () => {
-    if (!ledger || Number(ledger.outstanding_balance) <= 0 || !window.confirm(`هل تريد تصفية كامل الرصيد القائم للعامل ${workerName}؟ ستُحفظ التصفية كحركة مستقلة ولن تُحذف الحركات السابقة.`)) return;
+    if (!ledger || Number(ledger.remaining_withdrawal_debt) <= 0 || !window.confirm(`هل تريد تسوية كامل دين المسحوبات للعامل ${workerName}؟ ستُحفظ التسوية كحركة مستقلة ولن تُحذف الحركات السابقة.`)) return;
     setSettling(true);
     try {
       await api.settleWorkerWithdrawalReturns(workerId, new Date(`${selectedDate}T12:00:00`).toISOString());
       await load();
-      onNotify({ tone: 'success', text: 'تمت تصفية المستقطعات وحفظ حركة التصفية في السجل.' });
+      onNotify({ tone: 'success', text: 'تمت تسوية دين المسحوبات وحفظ حركة التسوية في السجل.' });
     } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); }
     finally { setSettling(false); }
   };
@@ -1393,13 +1394,23 @@ function WorkerWithdrawalsReturnsView({ workerId, workerName, selectedDate, onCl
     } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); }
     finally { setDeletingMovementId(null); }
   };
+  const resetAll = async () => {
+    if (resetting || !window.confirm(`هل تريد تصفير جميع سجلات المسحوبات والمرتجعات والاستقطاعات للعامل ${workerName}؟ لا يمكن التراجع عن هذا الإجراء من الواجهة.`)) return;
+    setResetting(true);
+    try {
+      await api.resetWorkerFinancialRecords(workerId);
+      await load();
+      onNotify({ tone: 'success', text: 'تم تصفير جميع السجلات المالية المعروضة للعامل المحدد.' });
+    } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); }
+    finally { setResetting(false); }
+  };
   return <Modal title={`المسحوبات والمرتجعات — ${workerName}`} subtitle="السجل الكامل للعامل؛ الحركات مستقلة ولا تؤثر على عمولات عمليات الغسيل." onClose={onClose} wide>
     {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : ledger && <>
-      <div className="mini-metric-grid worker-ledger-summary"><MiniMetric label="إجمالي المسحوبات" value={ledger.total_withdrawals} tone="danger" /><MiniMetric label="إجمالي الاستقطاعات" value={ledger.total_deductions} tone="danger" /><MiniMetric label="إجمالي المرتجعات" value={ledger.total_returns} tone="success" /><MiniMetric label="تسديدات الاستقطاع" value={ledger.total_deduction_payments} tone="success" /><MiniMetric label="إجمالي التسويات" value={ledger.total_settlements} /><MiniMetric label="الرصيد القائم" value={ledger.outstanding_balance} tone="warning" /></div>
-      <div className="profile-actions"><Button onClick={() => setEntryType('withdrawal')} icon={<ArrowDownLeft size={17} />}>إضافة مسحوب</Button><Button variant="secondary" onClick={() => setEntryType('return')} icon={<ArrowUpLeft size={17} />}>إضافة مرتجع</Button><Button variant="secondary" onClick={() => setEntryType('deduction_payment')} disabled={Number(ledger.outstanding_balance) <= 0} icon={<Banknote size={17} />}>تسديد استقطاع</Button><Button variant="secondary" onClick={() => void settle()} disabled={settling || Number(ledger.outstanding_balance) <= 0} icon={settling ? <LoaderCircle size={17} className="spin" /> : <CheckCircle2 size={17} />}>{settling ? 'جارٍ التصفية...' : 'تصفية المستقطعات'}</Button></div>
+      <div className="mini-metric-grid worker-ledger-summary"><MiniMetric label="إجمالي المسحوبات" value={ledger.total_withdrawals} tone="danger" /><MiniMetric label="باقي دين المسحوبات" value={ledger.remaining_withdrawal_debt} tone="warning" /><MiniMetric label="إجمالي الاستقطاعات" value={ledger.total_deductions} tone="danger" /><MiniMetric label="تسديد الاستقطاع" value={ledger.total_deduction_payments} tone="success" /><MiniMetric label="الرصيد القائم" value={ledger.outstanding_deduction_balance} tone="warning" /></div>
+      <div className="profile-actions"><Button onClick={() => setEntryType('withdrawal')} icon={<ArrowDownLeft size={17} />}>إضافة مسحوب</Button><Button variant="secondary" onClick={() => setEntryType('return')} disabled={Number(ledger.remaining_withdrawal_debt) <= 0} icon={<ArrowUpLeft size={17} />}>إضافة مرتجع</Button><Button variant="secondary" onClick={() => setEntryType('deduction_payment')} disabled={Number(ledger.outstanding_deduction_balance) <= 0} icon={<Banknote size={17} />}>تسديد استقطاع</Button><Button variant="secondary" onClick={() => void settle()} disabled={settling || Number(ledger.remaining_withdrawal_debt) <= 0} icon={settling ? <LoaderCircle size={17} className="spin" /> : <CheckCircle2 size={17} />}>{settling ? 'جارٍ التسوية...' : 'تسوية دين المسحوبات'}</Button><Button variant="danger" onClick={() => void resetAll()} disabled={resetting} icon={resetting ? <LoaderCircle size={17} className="spin" /> : <Trash2 size={17} />}>{resetting ? 'جارٍ التصفير...' : 'تصفير جميع السجلات'}</Button></div>
       <SectionCard title="سجل الحركات" subtitle={`${ledger.transactions.length} حركة مسجلة للعامل المحدد فقط.`}>
         {ledger.transactions.length === 0 ? <EmptyState icon={<WalletCards size={27} />} title="لا توجد حركات مالية" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>النوع</th><th>المبلغ</th><th>التاريخ</th><th>الملاحظة</th><th>سجله</th><th>إجراء</th></tr></thead><tbody>{ledger.transactions.map((transaction) => {
-          const label = transaction.type === 'withdrawal' ? 'مسحوب' : transaction.type === 'deduction' ? 'استقطاع' : transaction.type === 'return' ? 'مرتجع' : transaction.type === 'deduction_payment' ? 'تسديد استقطاع' : 'تصفية';
+          const label = transaction.type === 'withdrawal' ? 'مسحوب' : transaction.type === 'deduction' ? 'استقطاع' : transaction.type === 'return' ? 'مرتجع' : transaction.type === 'deduction_payment' ? 'تسديد استقطاع' : 'تسوية دين المسحوبات';
           const tone = transaction.type === 'withdrawal' || transaction.type === 'deduction' ? 'danger' : transaction.type === 'return' || transaction.type === 'deduction_payment' ? 'success' : 'info';
           return <tr key={transaction.id}><td><StatusBadge tone={tone}>{label}</StatusBadge></td><td className="money-cell">{money(transaction.amount)}</td><td>{dateFormat(transaction.occurred_at)}</td><td>{transaction.notes || '—'}</td><td>{transaction.created_by_name || '—'}</td><td><div className="worker-ledger-row-actions">{transaction.editable && <button type="button" className="table-action worker-ledger-edit" onClick={() => setEditingPayment(transaction)} title="تعديل تسديد الاستقطاع" aria-label="تعديل تسديد الاستقطاع"><Pencil size={15} /></button>}{transaction.deletable ? <button type="button" className="table-action danger-action worker-ledger-delete" onClick={() => void removeMovement(transaction.id, label)} disabled={deletingMovementId === transaction.id} title={`حذف حركة ${label}`} aria-label={`حذف حركة ${label}`}>{deletingMovementId === transaction.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button> : <span className="table-muted" title="يُدار الاستقطاع من المصروف المرتبط">—</span>}</div></td></tr>;
         })}</tbody></table></div>}

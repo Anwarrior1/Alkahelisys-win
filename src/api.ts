@@ -517,7 +517,9 @@ class ApiClient {
       total_returns: money(value.totalReturnsMilli),
       total_deduction_payments: money(value.totalDeductionPaymentsMilli),
       total_settlements: money(value.totalSettlementsMilli),
-      outstanding_balance: money(value.outstandingBalanceMilli),
+      remaining_returns: money(value.remainingReturnsMilli),
+      remaining_withdrawal_debt: money(value.remainingWithdrawalDebtMilli),
+      outstanding_deduction_balance: money(value.outstandingDeductionBalanceMilli),
       transactions: records(value.transactions).map((transaction) => ({
         id: text(transaction.id),
         type: transaction.type === 'deduction' ? 'deduction' : transaction.type === 'deduction_payment' ? 'deduction_payment' : transaction.type === 'settlement' ? 'settlement' : transaction.type === 'return' ? 'return' : 'withdrawal',
@@ -551,6 +553,9 @@ class ApiClient {
   }
   async deleteWorkerWithdrawalReturn(workerId: string, movementId: string): Promise<void> {
     await this.delete(`/workers/${encodeURIComponent(workerId)}/withdrawals-returns/${encodeURIComponent(movementId)}`);
+  }
+  async resetWorkerFinancialRecords(workerId: string): Promise<void> {
+    await this.post(`/workers/${encodeURIComponent(workerId)}/withdrawals-returns/reset`, {});
   }
 
   async showrooms(params?: Record<string, string | number | boolean | undefined | null>): Promise<Showroom[]> { return records(await this.get(`/showrooms${query(params)}`)).map(mapShowroom); }

@@ -164,6 +164,10 @@ pub fn build_router(state: AppState) -> Router {
             post(settle_worker_withdrawal_returns),
         )
         .route(
+            "/api/workers/:id/withdrawals-returns/reset",
+            post(reset_worker_financial_records),
+        )
+        .route(
             "/api/workers/:worker_id/withdrawals-returns/:movement_id",
             patch(update_worker_deduction_payment).delete(delete_worker_withdrawal_return),
         )
@@ -2597,7 +2601,18 @@ struct WorkerMovementTotals {
     returns: i64,
     deduction_payments: i64,
     settlements: i64,
-    outstanding: i64,
+    remaining_returns: i64,
+    withdrawal_debt: i64,
+    deduction_outstanding: i64,
+}
+
+fn worker_financial_reset_at(conn: &Connection, worker_id: &str) -> Result<String, ApiError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(reset_at),'') FROM worker_financial_resets WHERE worker_id=?1",
+        [worker_id],
+        |row| row.get(0),
+    )
+    .map_err(ApiError::internal)
 }
 
 fn worker_movement_totals_excluding(
@@ -2607,6 +2622,7 @@ fn worker_movement_totals_excluding(
     to: &str,
     excluded_movement_id: Option<&str>,
 ) -> Result<WorkerMovementTotals, ApiError> {
+    let reset_at = worker_financial_reset_at(conn, worker_id)?;
     let (withdrawals, returns, deduction_payments, settlements): (i64, i64, i64, i64) = conn
         .query_row(
             "SELECT
@@ -2616,8 +2632,8 @@ fn worker_movement_totals_excluding(
                 COALESCE(SUM(CASE WHEN transaction_type='settlement' THEN amount_milli ELSE 0 END),0)
              FROM worker_withdrawal_returns
              WHERE worker_id=?1 AND deleted_at IS NULL AND occurred_at BETWEEN ?2 AND ?3
-                   AND (?4 IS NULL OR id<>?4)",
-            params![worker_id, from, to, excluded_movement_id],
+                   AND created_at>?4 AND (?5 IS NULL OR id<>?5)",
+            params![worker_id, from, to, reset_at, excluded_movement_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(ApiError::internal)?;
@@ -2625,22 +2641,21 @@ fn worker_movement_totals_excluding(
         conn,
         "SELECT COALESCE(SUM(ea.amount_milli),0)
          FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id
-         WHERE ea.worker_id=?1 AND e.occurred_at BETWEEN ?2 AND ?3",
-        params![worker_id, from, to],
+         WHERE ea.worker_id=?1 AND e.occurred_at BETWEEN ?2 AND ?3 AND ea.created_at>?4",
+        params![worker_id, from, to, reset_at],
     )?;
-    let outstanding = withdrawals
-        .saturating_add(deductions)
-        .saturating_sub(returns)
-        .saturating_sub(deduction_payments)
-        .saturating_sub(settlements)
-        .max(0);
+    let remaining_returns = withdrawals.saturating_sub(returns).max(0);
+    let withdrawal_debt = remaining_returns.saturating_sub(settlements).max(0);
+    let deduction_outstanding = deductions.saturating_sub(deduction_payments).max(0);
     Ok(WorkerMovementTotals {
         withdrawals,
         deductions,
         returns,
         deduction_payments,
         settlements,
-        outstanding,
+        remaining_returns,
+        withdrawal_debt,
+        deduction_outstanding,
     })
 }
 
@@ -2676,14 +2691,16 @@ async fn worker_withdrawal_returns(
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
     let totals = worker_movement_totals(&db.conn, &id, &from, &to)?;
+    let reset_at = worker_financial_reset_at(&db.conn, &id)?;
     let mut transactions = Vec::new();
     let mut statement = db.conn.prepare(
         "SELECT movement.id,movement.transaction_type,movement.amount_milli,movement.occurred_at,movement.notes,user.full_name
          FROM worker_withdrawal_returns movement JOIN users user ON user.id=movement.created_by
          WHERE movement.worker_id=?1 AND movement.deleted_at IS NULL AND movement.occurred_at BETWEEN ?2 AND ?3
+               AND movement.created_at>?4
          ORDER BY movement.occurred_at DESC,movement.created_at DESC"
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![id.clone(),from.clone(),to.clone()], |row| Ok(json!({
+    let rows = statement.query_map(params![id.clone(),from.clone(),to.clone(),reset_at.clone()], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"type":row.get::<_,String>(1)?,"amountMilli":row.get::<_,i64>(2)?,
         "occurredAt":row.get::<_,String>(3)?,"notes":row.get::<_,Option<String>>(4)?,"createdByName":row.get::<_,String>(5)?,
         "editable":row.get::<_,String>(1)? == "deduction_payment","deletable":true
@@ -2696,9 +2713,10 @@ async fn worker_withdrawal_returns(
          FROM expense_allocations allocation
          JOIN expenses expense ON expense.id=allocation.expense_id
          JOIN users user ON user.id=expense.created_by
-         WHERE allocation.worker_id=?1 AND allocation.amount_milli>0 AND expense.occurred_at BETWEEN ?2 AND ?3"
+         WHERE allocation.worker_id=?1 AND allocation.amount_milli>0 AND expense.occurred_at BETWEEN ?2 AND ?3
+               AND allocation.created_at>?4"
     ).map_err(ApiError::internal)?;
-    let deduction_rows = deduction_statement.query_map(params![id.clone(),from,to], |row| Ok(json!({
+    let deduction_rows = deduction_statement.query_map(params![id.clone(),from,to,reset_at], |row| Ok(json!({
         "id":format!("deduction:{}",row.get::<_,String>(0)?),"type":"deduction","amountMilli":row.get::<_,i64>(1)?,
         "occurredAt":row.get::<_,String>(2)?,"notes":row.get::<_,String>(3)?,"createdByName":row.get::<_,String>(4)?,
         "editable":false,"deletable":false
@@ -2715,7 +2733,10 @@ async fn worker_withdrawal_returns(
         "worker":{"id":id,"fullName":worker_name},"totalWithdrawalsMilli":totals.withdrawals,
         "totalDeductionsMilli":totals.deductions,"totalReturnsMilli":totals.returns,
         "totalDeductionPaymentsMilli":totals.deduction_payments,"totalSettlementsMilli":totals.settlements,
-        "outstandingBalanceMilli":totals.outstanding,"transactions":transactions
+        "remainingReturnsMilli":totals.remaining_returns,
+        "remainingWithdrawalDebtMilli":totals.withdrawal_debt,
+        "outstandingDeductionBalanceMilli":totals.deduction_outstanding,
+        "transactions":transactions
     })))
 }
 
@@ -2768,7 +2789,12 @@ async fn create_worker_withdrawal_return(
             "0000-01-01T00:00:00Z",
             "9999-12-31T23:59:59Z",
         )?;
-        if amount > totals.outstanding {
+        let available = if input.transaction_type == "return" {
+            totals.withdrawal_debt
+        } else {
+            totals.deduction_outstanding
+        };
+        if amount > available {
             return Err(ApiError::bad(if input.transaction_type == "return" {
                 "لا يمكن أن يتجاوز المرتجع الرصيد القائم للعامل"
             } else {
@@ -2842,7 +2868,7 @@ async fn update_worker_deduction_payment(
         "9999-12-31T23:59:59Z",
         Some(&movement_id),
     )?
-    .outstanding;
+    .deduction_outstanding;
     if amount > available {
         return Err(ApiError::bad(
             "لا يمكن أن يتجاوز تسديد الاستقطاع الرصيد القائم بعد إعادة الاحتساب",
@@ -2898,9 +2924,9 @@ async fn settle_worker_withdrawal_returns(
         "0000-01-01T00:00:00Z",
         "9999-12-31T23:59:59Z",
     )?
-    .outstanding;
+    .withdrawal_debt;
     if outstanding == 0 {
-        return Err(ApiError::bad("لا يوجد رصيد قائم يحتاج إلى تصفية"));
+        return Err(ApiError::bad("لا يوجد دين مسحوبات قائم يحتاج إلى تسوية"));
     }
     let id = new_id();
     let created_at = now();
@@ -2908,21 +2934,62 @@ async fn settle_worker_withdrawal_returns(
     tx.execute(
         "INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at)
          VALUES(?1,?2,'settlement',?3,?4,?5,?6,?7)",
-        params![id,worker_id,outstanding,occurred_at,"تصفية المستقطعات",principal.id,created_at],
+        params![id,worker_id,outstanding,occurred_at,"تسوية دين المسحوبات",principal.id,created_at],
     ).map_err(ApiError::internal)?;
     insert_audit_tx(
         &tx,
         Some(&principal.id),
-        "WORKER_DEDUCTIONS_SETTLED",
+        "WORKER_WITHDRAWAL_DEBT_SETTLED",
         "worker_withdrawal_return",
         Some(&id),
-        "تمت تصفية الرصيد القائم لمسحوبات العامل مع الاحتفاظ بالسجل السابق",
+        "تمت تسوية دين مسحوبات العامل مع الاحتفاظ بالسجل السابق",
         Some(&json!({"workerId":worker_id,"workerName":worker_name,"amountMilli":outstanding})),
     )?;
     tx.commit().map_err(ApiError::internal)?;
     Ok(ok(
-        json!({"id":id,"created":true,"amountMilli":outstanding,"outstandingBalanceMilli":0}),
+        json!({"id":id,"created":true,"amountMilli":outstanding,"remainingWithdrawalDebtMilli":0}),
     ))
+}
+
+async fn reset_worker_financial_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(worker_id): Path<String>,
+) -> ApiResult {
+    let principal = manager(&state, &headers)?;
+    let mut db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let worker_name: String = db
+        .conn
+        .query_row(
+            "SELECT full_name FROM workers WHERE id=?1",
+            [worker_id.clone()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let reset_id = new_id();
+    let reset_at = now();
+    let tx = db.conn.transaction().map_err(ApiError::internal)?;
+    tx.execute(
+        "INSERT INTO worker_financial_resets(id,worker_id,reset_at,reset_by) VALUES(?1,?2,?3,?4)",
+        params![reset_id, worker_id, reset_at, principal.id],
+    )
+    .map_err(ApiError::internal)?;
+    insert_audit_tx(
+        &tx,
+        Some(&principal.id),
+        "WORKER_FINANCIAL_RECORDS_RESET",
+        "worker_financial_reset",
+        Some(&reset_id),
+        "تم تصفير سجل المسحوبات والمرتجعات والاستقطاعات للعامل المحدد",
+        Some(&json!({"workerId":worker_id,"workerName":worker_name})),
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(ok(json!({"id":reset_id,"reset":true})))
 }
 
 async fn delete_worker_withdrawal_return(
@@ -5811,35 +5878,100 @@ async fn restore_backup_upload(
 
 fn apply_restore(
     state: &AppState,
-    _principal: &Principal,
+    principal: &Principal,
     source: &FsPath,
 ) -> Result<Value, ApiError> {
+    apply_restore_with_post_replace(state, principal, source, || Ok(()))
+}
+
+fn apply_restore_with_post_replace<F>(
+    state: &AppState,
+    _principal: &Principal,
+    source: &FsPath,
+    post_replace: F,
+) -> Result<Value, ApiError>
+where
+    F: FnOnce() -> Result<(), ApiError>,
+{
     if !source.is_file() {
         return Err(ApiError::bad("ملف النسخة الاحتياطية غير موجود"));
     }
-    Database::verify_backup(source).map_err(|_| ApiError::bad("ملف النسخة غير صالح أو تالف"))?;
+    let current_path = state.data_dir.join("carwash.db");
+    if source.canonicalize().ok() == current_path.canonicalize().ok() {
+        return Err(ApiError::bad("لا يمكن استعادة قاعدة البيانات نفسها"));
+    }
+    let staged = state
+        .data_dir
+        .join(format!("restore-staged-{}.db", new_id()));
+    fs::copy(source, &staged).map_err(|_| ApiError::bad("تعذر قراءة ملف النسخة الاحتياطية"))?;
+    if Database::verify_backup_for_restore(&staged, &state.data_dir).is_err() {
+        let _ = fs::remove_file(&staged);
+        return Err(ApiError::bad(
+            "ملف النسخة الاحتياطية غير مكتمل أو غير متوافق مع هذا الإصدار",
+        ));
+    }
+
+    let result = apply_verified_restore(
+        state,
+        &staged,
+        source.to_string_lossy().as_ref(),
+        post_replace,
+    );
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+fn remove_database_sidecars(path: &FsPath) {
+    let _ = fs::remove_file(path.with_extension("db-wal"));
+    let _ = fs::remove_file(path.with_extension("db-shm"));
+}
+
+fn reopen_from_snapshot(
+    data_dir: &FsPath,
+    current_path: &FsPath,
+    snapshot: &FsPath,
+) -> Result<Database, String> {
+    remove_database_sidecars(current_path);
+    fs::copy(snapshot, current_path)
+        .map_err(|error| format!("failed to restore emergency database: {error}"))?;
+    let database = Database::open(data_dir)
+        .map_err(|error| format!("failed to reopen emergency database: {error}"))?;
+    database
+        .verify_runtime_database()
+        .map_err(|error| format!("emergency database verification failed: {error}"))?;
+    Ok(database)
+}
+
+fn apply_verified_restore<F>(
+    state: &AppState,
+    staged: &FsPath,
+    source_description: &str,
+    post_replace: F,
+) -> Result<Value, ApiError>
+where
+    F: FnOnce() -> Result<(), ApiError>,
+{
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     let current_path = db.path.clone();
-    if source.canonicalize().ok() == current_path.canonicalize().ok() {
-        return Err(ApiError::bad("لا يمكن استعادة قاعدة البيانات نفسها"));
-    }
     let emergency = state.data_dir.join("backups").join(format!(
-        "pre-restore-{}.db",
-        Utc::now().format("%Y%m%d-%H%M%S")
+        "pre-restore-{}-{}.db",
+        Utc::now().format("%Y%m%d-%H%M%S"),
+        new_id()
     ));
-    fs::create_dir_all(emergency.parent().unwrap()).map_err(ApiError::internal)?;
+    let emergency_parent = emergency
+        .parent()
+        .ok_or_else(|| ApiError::internal("مسار نسخة الطوارئ غير صالح"))?;
+    fs::create_dir_all(emergency_parent).map_err(ApiError::internal)?;
     vacuum_into(&db.conn, &emergency)?;
-    let staged = state
-        .data_dir
-        .join(format!("restore-staged-{}.db", new_id()));
-    fs::copy(source, &staged).map_err(ApiError::internal)?;
-    if Database::verify_backup(&staged).is_err() {
-        let _ = fs::remove_file(&staged);
-        return Err(ApiError::bad("تعذر التحقق من النسخة قبل الاستعادة"));
+    if Database::verify_backup_for_restore(&emergency, &state.data_dir).is_err() {
+        return Err(ApiError::internal(
+            "تعذر التحقق من نسخة الطوارئ قبل الاستعادة",
+        ));
     }
+
     let mut preserved_backups = Vec::new();
     {
         let mut statement = db.conn.prepare(
@@ -5866,42 +5998,112 @@ fn apply_restore(
             }
         }
     }
-    // Replace only after a verified staging copy and a fresh emergency backup exist.
+
+    // Close the live connection only after both the restore candidate and emergency
+    // snapshot have passed a full isolated open/migration/schema validation.
     let old_conn = std::mem::replace(
         &mut db.conn,
         Connection::open_in_memory().map_err(ApiError::internal)?,
     );
     drop(old_conn);
-    let _ = fs::remove_file(current_path.with_extension("db-wal"));
-    let _ = fs::remove_file(current_path.with_extension("db-shm"));
-    fs::copy(&staged, &current_path).map_err(ApiError::internal)?;
-    let _ = fs::remove_file(&staged);
-    let reopened = Database::open(&state.data_dir).map_err(ApiError::internal)?;
-    *db = reopened;
-    for (id, path, created_at, notes) in preserved_backups {
-        db.conn.execute(
-            "INSERT OR IGNORE INTO backup_history(id,backup_path,created_by,created_at,status,notes) VALUES(?1,?2,NULL,?3,'completed',?4)",
-            params![id,path,created_at,notes],
-        ).map_err(ApiError::internal)?;
-    }
-    db.conn
-        .execute("DELETE FROM sessions", [])
+    remove_database_sidecars(&current_path);
+    let displaced = state
+        .data_dir
+        .join(format!("pre-restore-live-{}.db", new_id()));
+
+    let restore_attempt: Result<Database, ApiError> = (|| {
+        fs::rename(&current_path, &displaced).map_err(ApiError::internal)?;
+        fs::copy(staged, &current_path).map_err(ApiError::internal)?;
+        post_replace()?;
+        let mut reopened = Database::open(&state.data_dir).map_err(ApiError::internal)?;
+        reopened
+            .verify_runtime_database()
+            .map_err(ApiError::internal)?;
+
+        let tx = reopened.conn.transaction().map_err(ApiError::internal)?;
+        for (id, path, created_at, notes) in preserved_backups {
+            tx.execute(
+                "INSERT OR IGNORE INTO backup_history(id,backup_path,created_by,created_at,status,notes) VALUES(?1,?2,NULL,?3,'completed',?4)",
+                params![id,path,created_at,notes],
+            )
+            .map_err(ApiError::internal)?;
+        }
+        tx.execute("DELETE FROM sessions", [])
+            .map_err(ApiError::internal)?;
+        tx.execute(
+            "INSERT INTO audit_logs(id,user_id,action,entity_type,entity_id,description,metadata_json,created_at)
+             VALUES(?1,NULL,'BACKUP_RESTORED','backup',?2,?3,?4,?5)",
+            params![
+                new_id(),
+                new_id(),
+                "تمت استعادة نسخة احتياطية وإبطال كل الجلسات",
+                source_description,
+                now()
+            ],
+        )
         .map_err(ApiError::internal)?;
-    let source_text = source.to_string_lossy().to_string();
-    let history_id = new_id();
-    insert_audit(
-        &db.conn,
-        None,
-        "BACKUP_RESTORED",
-        "backup",
-        Some(&history_id),
-        "تمت استعادة نسخة احتياطية وإبطال كل الجلسات",
-        Some(&source_text),
-    )
-    .map_err(ApiError::internal)?;
-    Ok(
-        json!({"restored":true,"emergencyBackupPath":emergency.to_string_lossy(),"reauthenticationRequired":true}),
-    )
+        tx.commit().map_err(ApiError::internal)?;
+        reopened
+            .verify_runtime_database()
+            .map_err(ApiError::internal)?;
+        Ok(reopened)
+    })();
+
+    match restore_attempt {
+        Ok(reopened) => {
+            *db = reopened;
+            let _ = fs::remove_file(&displaced);
+            Ok(
+                json!({"restored":true,"emergencyBackupPath":emergency.to_string_lossy(),"reauthenticationRequired":true}),
+            )
+        }
+        Err(_restore_error) => {
+            eprintln!(
+                "Restore failed after live replacement; rolling back from {}",
+                emergency.display()
+            );
+            match reopen_from_snapshot(&state.data_dir, &current_path, &emergency) {
+                Ok(original) => {
+                    *db = original;
+                    let _ = fs::remove_file(&displaced);
+                    Err(ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "فشلت الاستعادة وتمت إعادة قاعدة البيانات الأصلية بأمان",
+                    ))
+                }
+                Err(rollback_error) => {
+                    eprintln!("Emergency snapshot rollback failed: {rollback_error}");
+                    remove_database_sidecars(&current_path);
+                    let _ = fs::remove_file(&current_path);
+                    let displaced_rollback = fs::rename(&displaced, &current_path)
+                        .map_err(ApiError::internal)
+                        .and_then(|_| {
+                            let original =
+                                Database::open(&state.data_dir).map_err(ApiError::internal)?;
+                            original
+                                .verify_runtime_database()
+                                .map_err(ApiError::internal)?;
+                            Ok(original)
+                        });
+                    match displaced_rollback {
+                        Ok(original) => {
+                            *db = original;
+                            Err(ApiError::new(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "فشلت الاستعادة وتمت إعادة قاعدة البيانات الأصلية بأمان",
+                            ))
+                        }
+                        Err(displaced_error) => {
+                            eprintln!(
+                                "Critical restore rollback failure after both recovery attempts"
+                            );
+                            Err(displaced_error)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5944,6 +6146,92 @@ mod paid_cars_tests {
 
     fn response_data(payload: &Value) -> &Value {
         payload.get("data").expect("response data")
+    }
+
+    #[test]
+    fn restore_failure_after_replacement_rolls_back_and_reconnects_original_database() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-restore-rollback-tests")
+            .join(new_id());
+        let source_dir = std::env::temp_dir()
+            .join("alkaheli-restore-rollback-source-tests")
+            .join(new_id());
+        let live_database = Database::open(&data_dir).expect("live test database");
+        live_database
+            .conn
+            .execute(
+                "INSERT INTO settings(key,value_json,updated_by,updated_at) VALUES('restore-marker','\"original\"',NULL,?1)",
+                [now()],
+            )
+            .expect("original marker");
+        let state = AppState {
+            db: Arc::new(Mutex::new(live_database)),
+            data_dir: data_dir.clone(),
+        };
+
+        let source_database = Database::open(&source_dir).expect("source test database");
+        source_database
+            .conn
+            .execute(
+                "INSERT INTO settings(key,value_json,updated_by,updated_at) VALUES('restore-marker','\"replacement\"',NULL,?1)",
+                [now()],
+            )
+            .expect("replacement marker");
+        let source = source_dir.join("complete-backup.db");
+        vacuum_into(&source_database.conn, &source).expect("complete source backup");
+        drop(source_database);
+
+        let principal = Principal {
+            id: "restore-test-manager".to_owned(),
+            full_name: "Restore Test Manager".to_owned(),
+            username: "restore.test".to_owned(),
+            role_code: "manager".to_owned(),
+            role_name: "Manager".to_owned(),
+            theme: "light".to_owned(),
+            permissions: Vec::new(),
+        };
+        let result = apply_restore_with_post_replace(&state, &principal, &source, || {
+            Err(ApiError::internal("forced post-replacement failure"))
+        });
+        assert!(
+            result.is_err(),
+            "the injected restore failure must be returned"
+        );
+
+        {
+            let database = state.db.lock().expect("restored database lock");
+            assert_eq!(database.path, data_dir.join("carwash.db"));
+            database
+                .verify_runtime_database()
+                .expect("rolled-back live connection must be valid");
+            let marker: String = database
+                .conn
+                .query_row(
+                    "SELECT value_json FROM settings WHERE key='restore-marker'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("original marker after rollback");
+            assert_eq!(marker, "\"original\"");
+        }
+
+        drop(state);
+        let reopened = Database::open(&data_dir).expect("rolled-back database must reopen");
+        reopened
+            .verify_runtime_database()
+            .expect("reopened rolled-back database must be valid");
+        let marker: String = reopened
+            .conn
+            .query_row(
+                "SELECT value_json FROM settings WHERE key='restore-marker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("persisted original marker");
+        assert_eq!(marker, "\"original\"");
+        drop(reopened);
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(source_dir);
     }
 
     async fn financial_summary_for_uri(app: &Router, token: &str, uri: &str) -> Value {

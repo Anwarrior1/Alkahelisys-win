@@ -2443,6 +2443,87 @@ async fn corrupt_backup_is_rejected_without_changing_the_live_database() {
 }
 
 #[tokio::test]
+async fn incomplete_sqlite_backup_is_rejected_before_live_database_replacement() {
+    let test_app = TestApp::new();
+    let data_dir = test_app.data_dir.clone();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(
+        &test_app.router,
+        &manager_token,
+        "عامل قبل النسخة غير المكتملة",
+    )
+    .await;
+    let incomplete_path = data_dir.join("incomplete-but-valid-backup.db");
+    let incomplete = Connection::open(&incomplete_path).unwrap();
+    incomplete
+        .execute_batch("CREATE TABLE users(id TEXT PRIMARY KEY);")
+        .unwrap();
+    let integrity: String = incomplete
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    drop(incomplete);
+
+    let (status, rejected) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/backups/restore",
+        Some(&manager_token),
+        Some(json!({"path": incomplete_path, "confirmation": "RESTORE"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+
+    let (status, workers) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/workers",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(workers["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|worker| worker["id"] == worker_id));
+
+    drop(test_app);
+    let reopened = build_router(create_state(data_dir.clone()).expect("original database reopens"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (status, workers) = request_json(
+        &reopened,
+        Method::GET,
+        "/api/workers",
+        Some(&reopened_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(workers["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|worker| worker["id"] == worker_id));
+    drop(reopened);
+
+    let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let foreign_key_violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(foreign_key_violations, 0);
+    drop(connection);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
 async fn sqlite_records_and_theme_preference_persist_after_reopen() {
     let test_app = TestApp::new();
     let data_dir = test_app.data_dir.clone();
@@ -5026,7 +5107,9 @@ async fn worker_withdrawal_returns_are_isolated_and_wash_deletion_recalculates_p
     .await;
     assert_eq!(ledger_a["data"]["totalWithdrawalsMilli"], 500_000);
     assert_eq!(ledger_a["data"]["totalReturnsMilli"], 100_000);
-    assert_eq!(ledger_a["data"]["outstandingBalanceMilli"], 400_000);
+    assert_eq!(ledger_a["data"]["remainingReturnsMilli"], 400_000);
+    assert_eq!(ledger_a["data"]["remainingWithdrawalDebtMilli"], 400_000);
+    assert_eq!(ledger_a["data"]["outstandingDeductionBalanceMilli"], 0);
     assert_eq!(
         ledger_a["data"]["transactions"].as_array().unwrap().len(),
         2
@@ -5039,7 +5122,7 @@ async fn worker_withdrawal_returns_are_isolated_and_wash_deletion_recalculates_p
         None,
     )
     .await;
-    assert_eq!(ledger_b["data"]["outstandingBalanceMilli"], 50_000);
+    assert_eq!(ledger_b["data"]["remainingWithdrawalDebtMilli"], 50_000);
     assert_eq!(
         ledger_b["data"]["transactions"].as_array().unwrap().len(),
         1
@@ -5337,7 +5420,12 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
     assert_eq!(after_settlement["data"]["totalWithdrawalsMilli"], 500_000);
     assert_eq!(after_settlement["data"]["totalReturnsMilli"], 200_000);
     assert_eq!(after_settlement["data"]["totalSettlementsMilli"], 300_000);
-    assert_eq!(after_settlement["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(after_settlement["data"]["remainingReturnsMilli"], 300_000);
+    assert_eq!(after_settlement["data"]["remainingWithdrawalDebtMilli"], 0);
+    assert_eq!(
+        after_settlement["data"]["outstandingDeductionBalanceMilli"],
+        0
+    );
     assert_eq!(
         after_settlement["data"]["transactions"]
             .as_array()
@@ -5373,7 +5461,7 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
         None,
     )
     .await;
-    assert_eq!(persisted["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(persisted["data"]["remainingWithdrawalDebtMilli"], 0);
     assert_eq!(
         persisted["data"]["transactions"].as_array().unwrap().len(),
         3
@@ -5398,7 +5486,7 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
     .await;
     assert_eq!(without_settlement["data"]["totalSettlementsMilli"], 0);
     assert_eq!(
-        without_settlement["data"]["outstandingBalanceMilli"],
+        without_settlement["data"]["remainingWithdrawalDebtMilli"],
         300_000
     );
 
@@ -5420,7 +5508,10 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
     )
     .await;
     assert_eq!(without_return["data"]["totalReturnsMilli"], 0);
-    assert_eq!(without_return["data"]["outstandingBalanceMilli"], 500_000);
+    assert_eq!(
+        without_return["data"]["remainingWithdrawalDebtMilli"],
+        500_000
+    );
 
     let (status, _) = request_json(
         &reopened,
@@ -5440,7 +5531,7 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
     )
     .await;
     assert_eq!(empty["data"]["totalWithdrawalsMilli"], 0);
-    assert_eq!(empty["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(empty["data"]["remainingWithdrawalDebtMilli"], 0);
     assert!(empty["data"]["transactions"].as_array().unwrap().is_empty());
     drop(reopened);
 
@@ -5459,7 +5550,7 @@ async fn worker_movements_settle_persist_delete_and_recalculate_without_negative
 }
 
 #[tokio::test]
-async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding_balance() {
+async fn worker_deductions_and_withdrawals_keep_independent_persistent_balances() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
     let worker_id = create_worker(&test_app.router, &manager_token, "عامل تسديد الاستقطاع").await;
@@ -5486,7 +5577,11 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
     )
     .await;
     assert_eq!(deduction_only["data"]["totalDeductionsMilli"], 300_000);
-    assert_eq!(deduction_only["data"]["outstandingBalanceMilli"], 300_000);
+    assert_eq!(
+        deduction_only["data"]["outstandingDeductionBalanceMilli"],
+        300_000
+    );
+    assert_eq!(deduction_only["data"]["remainingWithdrawalDebtMilli"], 0);
     assert!(deduction_only["data"]["transactions"]
         .as_array()
         .unwrap()
@@ -5512,7 +5607,7 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         100_000
     );
     assert_eq!(
-        after_first_payment["data"]["outstandingBalanceMilli"],
+        after_first_payment["data"]["outstandingDeductionBalanceMilli"],
         200_000
     );
 
@@ -5535,7 +5630,7 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         150_000
     );
     assert_eq!(
-        after_second_payment["data"]["outstandingBalanceMilli"],
+        after_second_payment["data"]["outstandingDeductionBalanceMilli"],
         150_000
     );
 
@@ -5553,7 +5648,10 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
     )
     .await;
     assert_eq!(after_edit["data"]["totalDeductionPaymentsMilli"], 170_000);
-    assert_eq!(after_edit["data"]["outstandingBalanceMilli"], 130_000);
+    assert_eq!(
+        after_edit["data"]["outstandingDeductionBalanceMilli"],
+        130_000
+    );
     let edited = after_edit["data"]["transactions"]
         .as_array()
         .unwrap()
@@ -5585,7 +5683,7 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         120_000
     );
     assert_eq!(
-        after_payment_delete["data"]["outstandingBalanceMilli"],
+        after_payment_delete["data"]["outstandingDeductionBalanceMilli"],
         180_000
     );
 
@@ -5602,7 +5700,11 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         None,
     )
     .await;
-    assert_eq!(combined["data"]["outstandingBalanceMilli"], 380_000);
+    assert_eq!(
+        combined["data"]["outstandingDeductionBalanceMilli"],
+        180_000
+    );
+    assert_eq!(combined["data"]["remainingWithdrawalDebtMilli"], 200_000);
 
     let (status, _) = request_json(
         &test_app.router, Method::POST, &format!("/api/workers/{worker_id}/withdrawals-returns"), Some(&manager_token),
@@ -5617,7 +5719,14 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         None,
     )
     .await;
-    assert_eq!(after_return["data"]["outstandingBalanceMilli"], 300_000);
+    assert_eq!(
+        after_return["data"]["outstandingDeductionBalanceMilli"],
+        180_000
+    );
+    assert_eq!(
+        after_return["data"]["remainingWithdrawalDebtMilli"],
+        120_000
+    );
 
     let (status, settled) = request_json(
         &test_app.router,
@@ -5628,7 +5737,7 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(settled["data"]["amountMilli"], 300_000);
+    assert_eq!(settled["data"]["amountMilli"], 120_000);
     let (_, after_settlement) = request_json(
         &test_app.router,
         Method::GET,
@@ -5637,7 +5746,11 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
         None,
     )
     .await;
-    assert_eq!(after_settlement["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(after_settlement["data"]["remainingWithdrawalDebtMilli"], 0);
+    assert_eq!(
+        after_settlement["data"]["outstandingDeductionBalanceMilli"],
+        180_000
+    );
     for movement_type in [
         "deduction",
         "deduction_payment",
@@ -5679,12 +5792,189 @@ async fn worker_deductions_and_partial_payments_share_one_persistent_outstanding
     .await;
     assert_eq!(persisted["data"]["totalDeductionsMilli"], 300_000);
     assert_eq!(persisted["data"]["totalDeductionPaymentsMilli"], 120_000);
-    assert_eq!(persisted["data"]["totalSettlementsMilli"], 300_000);
-    assert_eq!(persisted["data"]["outstandingBalanceMilli"], 0);
+    assert_eq!(persisted["data"]["totalSettlementsMilli"], 120_000);
+    assert_eq!(persisted["data"]["remainingWithdrawalDebtMilli"], 0);
+    assert_eq!(
+        persisted["data"]["outstandingDeductionBalanceMilli"],
+        180_000
+    );
     assert_eq!(
         persisted["data"]["transactions"].as_array().unwrap().len(),
         5
     );
+    drop(reopened);
+    let _ = fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn worker_financial_reset_clears_only_the_selected_section_and_persists() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل اختبار التصفير").await;
+    let wash_id = create_cash_wash(&test_app.router, &manager_token, &worker_id, "100").await;
+    let ledger_url = all_time_endpoint(&format!("/api/workers/{worker_id}/withdrawals-returns"));
+
+    for (movement_type, amount, date) in [
+        ("withdrawal", "600", "2026-09-01T12:00:00Z"),
+        ("return", "200", "2026-09-02T12:00:00Z"),
+    ] {
+        let (status, _) = request_json(
+            &test_app.router,
+            Method::POST,
+            &format!("/api/workers/{worker_id}/withdrawals-returns"),
+            Some(&manager_token),
+            Some(json!({"transactionType":movement_type,"amount":amount,"occurredAt":date})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, withdrawal_side) = request_json(
+        &test_app.router,
+        Method::GET,
+        &ledger_url,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(withdrawal_side["data"]["totalWithdrawalsMilli"], 600_000);
+    assert_eq!(withdrawal_side["data"]["remainingReturnsMilli"], 400_000);
+    assert_eq!(
+        withdrawal_side["data"]["remainingWithdrawalDebtMilli"],
+        400_000
+    );
+    assert_eq!(withdrawal_side["data"]["totalDeductionsMilli"], 0);
+    assert_eq!(
+        withdrawal_side["data"]["outstandingDeductionBalanceMilli"],
+        0
+    );
+
+    let (status, expense) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/expenses",
+        Some(&manager_token),
+        Some(json!({
+            "description":"استقطاع اختبار العزل","category":"أخرى","amount":"500",
+            "occurredAt":"2026-09-03T12:00:00Z","allocationType":"workers"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let expense_id = expense["data"]["id"].as_str().unwrap().to_owned();
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/workers/{worker_id}/withdrawals-returns"),
+        Some(&manager_token),
+        Some(json!({
+            "transactionType":"deduction_payment","amount":"360",
+            "occurredAt":"2026-09-04T12:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, isolated) = request_json(
+        &test_app.router,
+        Method::GET,
+        &ledger_url,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(isolated["data"]["totalDeductionsMilli"], 500_000);
+    assert_eq!(isolated["data"]["totalDeductionPaymentsMilli"], 360_000);
+    assert_eq!(
+        isolated["data"]["outstandingDeductionBalanceMilli"],
+        140_000
+    );
+    assert_eq!(isolated["data"]["remainingWithdrawalDebtMilli"], 400_000);
+
+    let (_, financial_before_reset) = request_json(
+        &test_app.router,
+        Method::GET,
+        &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/workers/{worker_id}/withdrawals-returns/reset"),
+        Some(&manager_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, reset) = request_json(
+        &test_app.router,
+        Method::GET,
+        &ledger_url,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    for field in [
+        "totalWithdrawalsMilli",
+        "remainingReturnsMilli",
+        "remainingWithdrawalDebtMilli",
+        "totalDeductionsMilli",
+        "totalDeductionPaymentsMilli",
+        "outstandingDeductionBalanceMilli",
+    ] {
+        assert_eq!(reset["data"][field], 0, "{field} must be reset");
+    }
+    assert!(reset["data"]["transactions"].as_array().unwrap().is_empty());
+
+    let TestApp { router, data_dir } = test_app;
+    drop(router);
+    let reopened =
+        build_router(create_state(data_dir.clone()).expect("reset database should reopen"));
+    let reopened_token = login(&reopened, "manager.test", MANAGER_PASSWORD).await;
+    let (_, persisted) = request_json(
+        &reopened,
+        Method::GET,
+        &ledger_url,
+        Some(&reopened_token),
+        None,
+    )
+    .await;
+    assert_eq!(persisted["data"]["totalWithdrawalsMilli"], 0);
+    assert_eq!(persisted["data"]["totalDeductionsMilli"], 0);
+    assert!(persisted["data"]["transactions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let (_, financial_after_reset) = request_json(
+        &reopened,
+        Method::GET,
+        &all_time_endpoint(&format!("/api/workers/{worker_id}/financial")),
+        Some(&reopened_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        financial_after_reset["data"],
+        financial_before_reset["data"]
+    );
+    let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+    let wash_status: String = connection
+        .query_row(
+            "SELECT status FROM wash_operations WHERE id=?1",
+            [wash_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expense_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM expenses WHERE id=?1",
+            [expense_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wash_status, "posted");
+    assert_eq!(expense_count, 1);
+    drop(connection);
     drop(reopened);
     let _ = fs::remove_dir_all(data_dir);
 }

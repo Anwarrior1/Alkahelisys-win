@@ -6,6 +6,115 @@ use uuid::Uuid;
 
 pub const MONEY_SCALE: i64 = 1000;
 pub const DEFAULT_COMMISSION_BPS: i64 = 5000;
+const CURRENT_SCHEMA_VERSION: i64 = 25;
+
+const REQUIRED_APPLICATION_TABLES: &[&str] = &[
+    "schema_migrations",
+    "roles",
+    "permissions",
+    "role_permissions",
+    "users",
+    "user_roles",
+    "workers",
+    "showrooms",
+    "wash_operations",
+    "worker_payments",
+    "salary_withdrawals",
+    "showroom_payments",
+    "expenses",
+    "expense_allocations",
+    "financial_transactions",
+    "ledger_entries",
+    "audit_logs",
+    "backup_history",
+];
+
+const REQUIRED_CURRENT_TABLES: &[&str] = &[
+    "user_permission_profiles",
+    "user_permissions",
+    "user_profile_pictures",
+    "user_preferences",
+    "sessions",
+    "settings",
+    "salary_deductions",
+    "overnight_cars",
+    "worker_withdrawal_returns",
+    "worker_daily_values",
+    "payroll_employees",
+    "payroll_salary_rates",
+    "worker_financial_resets",
+];
+
+const REQUIRED_CURRENT_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "users",
+        &[
+            "id",
+            "full_name",
+            "username_norm",
+            "password_hash",
+            "is_active",
+            "deleted_at",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "wash_operations",
+        &[
+            "id",
+            "price_milli",
+            "worker_id",
+            "payment_type",
+            "showroom_id",
+            "occurred_at",
+            "commission_milli",
+            "business_share_milli",
+            "client_request_id",
+            "status",
+            "is_paid",
+            "revision",
+        ],
+    ),
+    (
+        "financial_transactions",
+        &["id", "source_type", "source_id", "occurred_at"],
+    ),
+    (
+        "ledger_entries",
+        &[
+            "id",
+            "transaction_id",
+            "account_code",
+            "entry_side",
+            "amount_milli",
+        ],
+    ),
+    (
+        "user_preferences",
+        &[
+            "user_id",
+            "theme",
+            "financial_report_card_order_json",
+            "dashboard_card_order_json",
+        ],
+    ),
+    (
+        "worker_withdrawal_returns",
+        &[
+            "id",
+            "worker_id",
+            "transaction_type",
+            "amount_milli",
+            "occurred_at",
+            "deleted_at",
+        ],
+    ),
+    (
+        "worker_financial_resets",
+        &["id", "worker_id", "reset_at", "reset_by"],
+    ),
+];
 
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -48,17 +157,95 @@ impl Database {
 
     pub fn verify_backup(path: &Path) -> Result<()> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
+        Self::verify_connection_integrity(&conn)?;
+        Self::verify_application_identity(&conn)
+    }
+
+    pub fn verify_backup_for_restore(path: &Path, validation_root: &Path) -> Result<()> {
+        Self::verify_backup(path)?;
+
+        let validation_dir = validation_root.join(format!("restore-validation-{}", new_id()));
+        fs::create_dir_all(&validation_dir)
+            .map_err(|_| rusqlite::Error::InvalidPath(validation_dir.clone()))?;
+        let validation_path = validation_dir.join("carwash.db");
+        let result = (|| {
+            fs::copy(path, &validation_path)
+                .map_err(|_| rusqlite::Error::InvalidPath(validation_path.clone()))?;
+            let database = Self::open(&validation_dir)?;
+            database.verify_runtime_database()
+        })();
+        let _ = fs::remove_dir_all(&validation_dir);
+        result
+    }
+
+    pub fn verify_runtime_database(&self) -> Result<()> {
+        Self::verify_connection_integrity(&self.conn)?;
+        Self::verify_application_identity(&self.conn)?;
+        Self::require_tables(&self.conn, REQUIRED_CURRENT_TABLES)?;
+        for version in 2..=CURRENT_SCHEMA_VERSION {
+            let present: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?1)",
+                [version],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        for (table, required_columns) in REQUIRED_CURRENT_COLUMNS {
+            let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>>>()?;
+            if required_columns
+                .iter()
+                .any(|required| !columns.iter().any(|column| column == required))
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_connection_integrity(conn: &Connection) -> Result<()> {
+        for pragma in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+            let mut statement = conn.prepare(pragma)?;
+            let results = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>>>()?;
+            if results.as_slice() != ["ok"] {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
+        let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+        if statement.query([])?.next()?.is_some() {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let has_users: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_users != 1 {
+        Ok(())
+    }
+
+    fn verify_application_identity(conn: &Connection) -> Result<()> {
+        Self::require_tables(conn, REQUIRED_APPLICATION_TABLES)?;
+        let newest_version: Option<i64> =
+            conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })?;
+        if newest_version.is_none_or(|version| !(2..=CURRENT_SCHEMA_VERSION).contains(&version)) {
             return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok(())
+    }
+
+    fn require_tables(conn: &Connection, required_tables: &[&str]) -> Result<()> {
+        for table in required_tables {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
         }
         Ok(())
     }
@@ -976,6 +1163,27 @@ impl Database {
             )?;
             self.conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(24, ?1)",
+                [now()],
+            )?;
+        }
+        let worker_financial_resets_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=25",
+            [],
+            |row| row.get(0),
+        )?;
+        if worker_financial_resets_added == 0 {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS worker_financial_resets (
+                    id TEXT PRIMARY KEY,
+                    worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE RESTRICT,
+                    reset_at TEXT NOT NULL,
+                    reset_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_worker_financial_resets_worker
+                 ON worker_financial_resets(worker_id, reset_at DESC);",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(25, ?1)",
                 [now()],
             )?;
         }

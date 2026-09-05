@@ -204,7 +204,9 @@ export interface WorkerWithdrawalReturnLedger {
   total_returns: Money;
   total_deduction_payments: Money;
   total_settlements: Money;
-  outstanding_balance: Money;
+  remaining_returns: Money;
+  remaining_withdrawal_debt: Money;
+  outstanding_deduction_balance: Money;
   transactions: WorkerWithdrawalReturnTransaction[];
 }
 
