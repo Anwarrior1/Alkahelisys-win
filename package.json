@@ -12,14 +12,18 @@
     "build": "tauri build --bundles nsis,msi",
     "dist:win": "tauri build --ci --bundles nsis --target x86_64-pc-windows-msvc && node scripts/stage-windows-installer.mjs",
     "test:api": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:frontend": "node --test scripts/frontend-performance.test.mjs",
+    "benchmark:frontend": "node scripts/frontend-performance-benchmark.mjs optimized",
+    "benchmark:performance": "node scripts/performance-benchmark.mjs src-tauri/target/release/carwash-api",
     "verify:fonts": "node scripts/verify-arabic-font-assets.mjs",
-    "test": "npm run test:api && npm run build:web",
+    "test": "npm run test:frontend && npm run test:api && npm run build:web",
     "lint": "tsc -b --noEmit"
   },
   "engines": {
     "node": ">=20 <25"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.10",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "lucide-react": "^0.468.0",

@@ -3,7 +3,7 @@ pub mod db;
 
 use api::{build_router, AppState};
 use db::{now, Database};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -30,9 +30,12 @@ fn log_app_event(data_dir: &Path, level: &str, message: &str) {
 pub fn create_state(data_dir: PathBuf) -> Result<AppState, String> {
     let database =
         Database::open(&data_dir).map_err(|error| format!("تعذر فتح قاعدة البيانات: {error}"))?;
+    let db_path = database.path.clone();
     Ok(AppState {
         db: Arc::new(Mutex::new(database)),
         data_dir,
+        db_path,
+        read_gate: Arc::new(RwLock::new(())),
     })
 }
 

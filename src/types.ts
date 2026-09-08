@@ -83,7 +83,11 @@ export interface ShowroomDebtProfile {
   total_payments: Money;
   total_outstanding: Money;
   operations: Wash[];
+  operations_has_more: boolean;
+  operations_next_cursor: string | null;
   payments: PaymentRecord[];
+  payments_has_more: boolean;
+  payments_next_cursor: string | null;
 }
 
 export type Money = number | string;
@@ -118,7 +122,10 @@ export interface Wash {
 
 export interface PaidCarsData {
   items: Wash[];
+  total_count?: number;
   settlement: Money;
+  has_more?: boolean;
+  next_cursor?: string | null;
 }
 
 export interface OvernightCar {
@@ -208,6 +215,8 @@ export interface WorkerWithdrawalReturnLedger {
   remaining_withdrawal_debt: Money;
   outstanding_deduction_balance: Money;
   transactions: WorkerWithdrawalReturnTransaction[];
+  has_more: boolean;
+  next_cursor: string | null;
 }
 
 export interface PayrollEmployee {
@@ -278,6 +287,8 @@ export interface ExpenseRecord {
 export interface OperationalReport {
   cars_washed?: number;
   washes?: Wash[];
+  washes_has_more?: boolean;
+  washes_next_cursor?: string | null;
   workers?: Array<{
     worker_id: string;
     worker_name: string;

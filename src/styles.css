@@ -763,6 +763,19 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
 .backup-row__actions { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
 .backup-row__actions .danger-action { color: var(--danger); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+.section-load-more { display: flex; justify-content: center; padding-top: 1rem; }
+.virtualized-list { max-height: min(68vh, 720px); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.virtualized-list:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.virtualized-list__canvas { position: relative; width: 100%; }
+.virtualized-list__item { position: absolute; top: 0; right: 0; width: 100%; }
+.virtualized-list__item > .wash-row,
+.virtualized-list__item > .audit-row,
+.virtualized-list__item > .backup-row { width: 100%; }
+.windowed-table-nav td { padding: 12px 8px !important; background: var(--surface-soft); }
+.windowed-table-nav__content { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted-strong); font-size: 12px; }
+.windowed-table-nav__content > div { display: flex; align-items: center; gap: 7px; }
+.windowed-table-nav button { padding: 6px 12px; color: var(--blue); border: 1px solid var(--border); border-radius: 9px; background: var(--surface); font: inherit; font-weight: 800; cursor: pointer; }
+.windowed-table-nav button:disabled { cursor: not-allowed; opacity: .45; }
 
 .access-denied { display: grid; justify-items: center; max-width: 540px; margin: 8vh auto; padding: 43px 28px; text-align: center; }
 .access-denied > div { display: grid; place-items: center; width: 66px; height: 66px; color: var(--blue); border-radius: 20px; background: var(--blue-soft); }

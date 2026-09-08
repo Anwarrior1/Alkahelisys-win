@@ -4,13 +4,14 @@ use argon2::{
     Argon2,
 };
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -19,15 +20,51 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
+    io::{BufReader, BufWriter, Read, Write},
+    ops::Deref,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub data_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub read_gate: Arc<RwLock<()>>,
+}
+
+struct ReadDatabase<'a> {
+    database: Database,
+    _restore_guard: RwLockReadGuard<'a, ()>,
+}
+
+impl Deref for ReadDatabase<'_> {
+    type Target = Database;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
+    }
+}
+
+impl AppState {
+    fn read_db(&self) -> Result<ReadDatabase<'_>, ApiError> {
+        let restore_guard = self
+            .read_gate
+            .read()
+            .map_err(|_| ApiError::internal("قفل قراءة قاعدة البيانات"))?;
+        let database = Database::open_read_only(&self.db_path).map_err(ApiError::internal)?;
+        Ok(ReadDatabase {
+            database,
+            _restore_guard: restore_guard,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,9 +142,88 @@ fn ok(data: Value) -> Json<Value> {
     Json(json!({ "data": data }))
 }
 
+fn operation_request_id(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let normalized = value.trim();
+    if normalized.is_empty()
+        || normalized.chars().count() > 100
+        || normalized.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad("معرف الطلب غير صالح"));
+    }
+    Ok(Some(normalized.to_owned()))
+}
+
+fn replay_operation(
+    conn: &Connection,
+    actor_id: &str,
+    operation_type: &str,
+    request_id: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    let Some(request_id) = request_id else {
+        return Ok(None);
+    };
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT response_json FROM operation_requests
+             WHERE actor_id=?1 AND operation_type=?2 AND request_id=?3",
+            params![actor_id, operation_type, request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    stored
+        .map(|value| serde_json::from_str(&value).map_err(ApiError::internal))
+        .transpose()
+}
+
+fn record_operation(
+    tx: &Transaction<'_>,
+    actor_id: &str,
+    operation_type: &str,
+    request_id: Option<&str>,
+    response: &Value,
+) -> Result<(), ApiError> {
+    let Some(request_id) = request_id else {
+        return Ok(());
+    };
+    let response_json = serde_json::to_string(response).map_err(ApiError::internal)?;
+    tx.execute(
+        "INSERT INTO operation_requests(actor_id,operation_type,request_id,response_json,created_at)
+         VALUES(?1,?2,?3,?4,?5)",
+        params![actor_id, operation_type, request_id, response_json, now()],
+    )
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+/// Runs blocking filesystem or backup-file work on Tokio's blocking pool so it neither occupies an
+/// async worker thread nor forces the caller to hold the live database mutex while it executes.
+///
+/// The global `Arc<Mutex<Database>>` guard is deliberately not `Send`, so any handler that awaits
+/// this helper is required by the compiler to have released the lock first. That property is what
+/// keeps long filesystem operations out of the database critical section.
+async fn blocking<F, T>(task: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(ApiError::internal)?
+}
+
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
+        .allow_origin(AllowOrigin::list([
+            HeaderValue::from_static("http://tauri.localhost"),
+            HeaderValue::from_static("https://tauri.localhost"),
+            HeaderValue::from_static("tauri://localhost"),
+            HeaderValue::from_static("http://localhost:1420"),
+            HeaderValue::from_static("http://127.0.0.1:1420"),
+        ]))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -244,7 +360,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/backups/:id/download", get(download_backup))
         .route("/api/backups/:id/export", put(export_backup))
         .route("/api/backups/restore", post(restore_backup))
-        .route("/api/backups/restore-upload", post(restore_backup_upload))
+        .route(
+            "/api/backups/restore-upload",
+            post(restore_backup_upload).layer(DefaultBodyLimit::disable()),
+        )
         .layer(cors)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -279,8 +398,9 @@ fn normalized_username(value: &str) -> Result<String, ApiError> {
 }
 
 fn valid_password(value: &str) -> Result<(), ApiError> {
-    if value.chars().count() < 10 {
-        return Err(ApiError::bad("يجب ألا تقل كلمة المرور عن 10 أحرف"));
+    let length = value.chars().count();
+    if !(10..=128).contains(&length) {
+        return Err(ApiError::bad("يجب أن تتكون كلمة المرور من 10 إلى 128 حرفًا"));
     }
     Ok(())
 }
@@ -293,6 +413,23 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
         .map_err(ApiError::internal)
 }
 
+async fn hash_password_blocking(password: String) -> Result<String, ApiError> {
+    blocking(move || hash_password(&password)).await
+}
+
+async fn verify_password_blocking(
+    password: String,
+    encoded_hash: String,
+) -> Result<bool, ApiError> {
+    blocking(move || {
+        let parsed_hash = PasswordHash::new(&encoded_hash).map_err(ApiError::internal)?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok())
+    })
+    .await
+}
+
 fn principal_from_headers(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
     let raw = headers
         .get(header::AUTHORIZATION)
@@ -300,10 +437,7 @@ fn principal_from_headers(state: &AppState, headers: &HeaderMap) -> Result<Princ
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;
     let hash = token_hash(raw);
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let row = db.conn.query_row(
         "SELECT u.id, u.full_name, u.username_norm, r.code, r.name_ar, COALESCE(p.theme, 'light'), s.expires_at
          FROM sessions s
@@ -425,10 +559,7 @@ struct InitialManagerInput {
 }
 
 async fn setup_status(State(state): State<AppState>) -> ApiResult {
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let count: i64 = db
         .conn
         .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
@@ -446,7 +577,7 @@ async fn initial_manager(
     }
     let username = normalized_username(&input.username)?;
     valid_password(&input.password)?;
-    let hash = hash_password(&input.password)?;
+    let hash = hash_password_blocking(input.password.clone()).await?;
     let mut db = state
         .db
         .lock()
@@ -500,13 +631,12 @@ struct LoginInput {
 
 async fn login(State(state): State<AppState>, Json(input): Json<LoginInput>) -> ApiResult {
     let username = normalized_username(&input.username)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let user = db
-        .conn
-        .query_row(
+    if input.password.chars().count() > 128 {
+        return Err(ApiError::unauthorized());
+    }
+    let user = {
+        let db = state.read_db()?;
+        db.conn.query_row(
             "SELECT id, full_name, password_hash, is_active FROM users WHERE username_norm=?1 AND deleted_at IS NULL",
             [username.clone()],
             |row| {
@@ -517,18 +647,32 @@ async fn login(State(state): State<AppState>, Json(input): Json<LoginInput>) -> 
                     row.get::<_, i64>(3)?,
                 ))
             },
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
+        ).optional().map_err(ApiError::internal)?
+    };
     let (user_id, _full_name, password_hash, active) = user.ok_or_else(ApiError::unauthorized)?;
     if active != 1 {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "هذا الحساب معطّل"));
     }
-    let parsed_hash = PasswordHash::new(&password_hash).map_err(ApiError::internal)?;
-    if Argon2::default()
-        .verify_password(input.password.as_bytes(), &parsed_hash)
-        .is_err()
-    {
+    if !verify_password_blocking(input.password, password_hash.clone()).await? {
+        return Err(ApiError::unauthorized());
+    }
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    // Password verification is deliberately outside the writer lock. Rechecking the credential
+    // state before creating the session preserves the behavior if an administrator changed or
+    // disabled the account while Argon2 was running.
+    let current: Option<(String, i64)> = db
+        .conn
+        .query_row(
+            "SELECT password_hash,is_active FROM users WHERE id=?1 AND deleted_at IS NULL",
+            [&user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    if current.as_ref() != Some(&(password_hash, 1)) {
         return Err(ApiError::unauthorized());
     }
     let token = create_session(&db.conn, &user_id)?;
@@ -601,24 +745,22 @@ async fn get_profile_picture(
     Path(user_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let _principal = can_manage_profile_picture(&state, &headers, &user_id)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let content_type: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT content_type FROM user_profile_pictures WHERE user_id=?1",
-            [user_id.clone()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
+    let content_type: Option<String> = {
+        let db = state.read_db()?;
+        db.conn
+            .query_row(
+                "SELECT content_type FROM user_profile_pictures WHERE user_id=?1",
+                [user_id.clone()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?
+    };
     let Some(content_type) = content_type else {
         return Err(ApiError::not_found());
     };
     let path = profile_picture_path(&state.data_dir, &user_id);
-    let bytes = fs::read(path).map_err(|_| ApiError::not_found())?;
+    let bytes = blocking(move || fs::read(path).map_err(|_| ApiError::not_found())).await?;
     Ok((
         [
             (header::CONTENT_TYPE, content_type),
@@ -660,14 +802,19 @@ async fn upload_profile_picture(
         return Err(ApiError::bad("نوع الصورة غير مدعوم أو الملف غير صالح"));
     }
     let picture_dir = state.data_dir.join("profile-pictures");
-    fs::create_dir_all(&picture_dir).map_err(ApiError::internal)?;
     let path = profile_picture_path(&state.data_dir, &user_id);
     let temp_path = picture_dir.join(format!(".{user_id}.upload"));
-    fs::write(&temp_path, &bytes).map_err(ApiError::internal)?;
-    if let Err(error) = fs::rename(&temp_path, &path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(ApiError::internal(error));
-    }
+    let write_path = path.clone();
+    blocking(move || {
+        fs::create_dir_all(&picture_dir).map_err(ApiError::internal)?;
+        fs::write(&temp_path, &bytes).map_err(ApiError::internal)?;
+        if let Err(error) = fs::rename(&temp_path, &write_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ApiError::internal(error));
+        }
+        Ok(())
+    })
+    .await?;
     let timestamp = now();
     let db = state
         .db
@@ -699,9 +846,13 @@ async fn delete_profile_picture(
 ) -> ApiResult {
     let principal = can_manage_profile_picture(&state, &headers, &user_id)?;
     let path = profile_picture_path(&state.data_dir, &user_id);
-    if path.is_file() {
-        fs::remove_file(&path).map_err(ApiError::internal)?;
-    }
+    blocking(move || {
+        if path.is_file() {
+            fs::remove_file(&path).map_err(ApiError::internal)?;
+        }
+        Ok(())
+    })
+    .await?;
     let db = state
         .db
         .lock()
@@ -788,10 +939,7 @@ async fn financial_report_card_order(
     headers: HeaderMap,
 ) -> ApiResult {
     let principal = principal_from_headers(&state, &headers)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let raw = db
         .conn
         .query_row(
@@ -855,10 +1003,7 @@ async fn update_financial_report_card_order(
 
 async fn dashboard_card_order(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let principal = principal_from_headers(&state, &headers)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let raw = db
         .conn
         .query_row(
@@ -993,6 +1138,36 @@ fn business_day_range(selected: NaiveDate) -> Result<(String, String), ApiError>
     ))
 }
 
+fn business_month_range(selected: NaiveDate) -> Result<(String, String), ApiError> {
+    let start_date = NaiveDate::from_ymd_opt(selected.year(), selected.month(), 1)
+        .ok_or_else(|| ApiError::bad("الشهر المحدد غير صالح"))?;
+    let next_month = if selected.month() == 12 {
+        NaiveDate::from_ymd_opt(selected.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(selected.year(), selected.month() + 1, 1)
+    }
+    .ok_or_else(|| ApiError::bad("الشهر المحدد غير صالح"))?;
+    let start = start_date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| ApiError::bad("الشهر المحدد غير صالح"))?
+        - Duration::hours(BUSINESS_UTC_OFFSET_HOURS);
+    let end = next_month
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| ApiError::bad("الشهر المحدد غير صالح"))?
+        - Duration::hours(BUSINESS_UTC_OFFSET_HOURS)
+        - Duration::milliseconds(1);
+    Ok((
+        format!("{}Z", start.format("%Y-%m-%dT%H:%M:%S%.3f")),
+        format!("{}Z", end.format("%Y-%m-%dT%H:%M:%S%.3f")),
+    ))
+}
+
+fn business_month_range_from_key(month: &str) -> Result<(String, String), ApiError> {
+    let selected = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")
+        .map_err(|_| ApiError::bad("الشهر المحدد غير صالح"))?;
+    business_month_range(selected)
+}
+
 fn date_range(query: &HashMap<String, String>) -> Result<(String, String), ApiError> {
     if let Some(selected) = selected_business_date(query)? {
         return business_day_range(selected);
@@ -1008,11 +1183,125 @@ fn date_range(query: &HashMap<String, String>) -> Result<(String, String), ApiEr
         Some(value) => canonical_timestamp(value, "نهاية الفترة غير صالحة")?,
         None => "9999-12-31T23:59:59Z".into(),
     };
+    if from > to {
+        return Err(ApiError::bad("تاريخ البداية يجب أن يسبق تاريخ النهاية"));
+    }
     Ok((from, to))
 }
 
+const HISTORY_PAGE_SIZE: i64 = 100;
+const HISTORY_MAX_PAGE_SIZE: i64 = 300;
+
+fn history_limit(query: &HashMap<String, String>) -> i64 {
+    history_limit_named(query, "limit")
+}
+
+fn history_limit_named(query: &HashMap<String, String>, limit_key: &str) -> i64 {
+    query
+        .get(limit_key)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(HISTORY_PAGE_SIZE)
+        .clamp(1, HISTORY_MAX_PAGE_SIZE)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageCursor {
+    timestamp: String,
+    id: String,
+    scope: String,
+}
+
+fn cursor_scope(parts: &[&str]) -> String {
+    parts.join("\u{1f}")
+}
+
+fn history_cursor(
+    query: &HashMap<String, String>,
+    key: &str,
+    scope: &str,
+) -> Result<Option<PageCursor>, ApiError> {
+    let Some(encoded) = query.get(key).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let cursor: PageCursor =
+        serde_json::from_str(encoded).map_err(|_| ApiError::bad("مؤشر الصفحة غير صالح"))?;
+    if cursor.scope != scope
+        || cursor.id.is_empty()
+        || cursor.id.chars().count() > 120
+        || cursor.id.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad("مؤشر الصفحة لا يطابق نطاق البحث الحالي"));
+    }
+    let canonical = canonical_timestamp(&cursor.timestamp, "مؤشر الصفحة غير صالح")?;
+    if canonical != cursor.timestamp {
+        return Err(ApiError::bad("مؤشر الصفحة غير صالح"));
+    }
+    Ok(Some(cursor))
+}
+
+fn cursor_boundary(cursor: Option<&PageCursor>) -> (String, String) {
+    cursor
+        .map(|value| (value.timestamp.clone(), value.id.clone()))
+        .unwrap_or_else(|| ("~".to_owned(), "~".to_owned()))
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))?
+        .as_str()
+}
+
+fn encode_page_cursor(timestamp: &str, id: &str, scope: &str) -> Result<String, ApiError> {
+    serde_json::to_string(&PageCursor {
+        timestamp: timestamp.to_owned(),
+        id: id.to_owned(),
+        scope: scope.to_owned(),
+    })
+    .map_err(ApiError::internal)
+}
+
+fn finish_cursor_page(
+    items: &mut Vec<Value>,
+    limit: i64,
+    scope: &str,
+    timestamp_path: &[&str],
+) -> Result<(bool, Option<String>), ApiError> {
+    finish_cursor_page_with_id(items, limit, scope, timestamp_path, &["id"])
+}
+
+fn finish_cursor_page_with_id(
+    items: &mut Vec<Value>,
+    limit: i64,
+    scope: &str,
+    timestamp_path: &[&str],
+    id_path: &[&str],
+) -> Result<(bool, Option<String>), ApiError> {
+    let has_more = items.len() > limit as usize;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        let last = items
+            .last()
+            .ok_or_else(|| ApiError::internal("تعذر إنشاء مؤشر الصفحة"))?;
+        let timestamp = value_at_path(last, timestamp_path)
+            .ok_or_else(|| ApiError::internal("تعذر قراءة تاريخ مؤشر الصفحة"))?;
+        let id = value_at_path(last, id_path)
+            .ok_or_else(|| ApiError::internal("تعذر قراءة سجل مؤشر الصفحة"))?;
+        Some(encode_page_cursor(timestamp, id, scope)?)
+    } else {
+        None
+    };
+    Ok((has_more, next_cursor))
+}
+
 fn round_percentage(amount: i64, bps: i64) -> i64 {
-    (amount.saturating_mul(bps).saturating_add(5000)) / 10000
+    // Both inputs are validated as non-negative and bps is capped at 10,000. The mathematical
+    // result therefore always fits in i64 when the amount does, but the intermediate product may
+    // not. Use i128 so accepted large integer-money values are rounded exactly instead of being
+    // silently undercounted by saturating multiplication.
+    (((amount as i128) * (bps as i128) + 5000) / 10000) as i64
 }
 
 fn total_for(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<i64, ApiError> {
@@ -1035,27 +1324,74 @@ async fn dashboard(
     let owner_id = principal.id.clone();
     let selected_date = selected_business_date(&query)?.unwrap_or_else(business_today);
     let selected_date_key = selected_date.format("%Y-%m-%d").to_string();
-    let selected_month_key = selected_date.format("%Y-%m").to_string();
     let mut selected_day_query = query.clone();
     selected_day_query.insert("date".to_owned(), selected_date_key.clone());
     let (selected_day_start, selected_day_end) = date_range(&selected_day_query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let today_salary_withdrawals = if can_view_all {
-        total_for(
-            &db.conn,
-            "SELECT COALESCE(SUM(amount_milli),0)
-             FROM salary_withdrawals
-             WHERE withdrawn_at BETWEEN ?1 AND ?2",
-            params![selected_day_start.clone(), selected_day_end.clone()],
-        )?
-    } else {
-        0
-    };
-    let today_washes = total_for(&db.conn, "SELECT COUNT(*) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-    let month_washes = total_for(&db.conn, "SELECT COUNT(*) FROM wash_operations WHERE status='posted' AND strftime('%Y-%m', occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
+    let (selected_month_start, selected_month_end) = business_month_range(selected_date)?;
+    let response = blocking(move || {
+    let db = state.read_db()?;
+    struct DashboardMetrics {
+        today_salary_withdrawals: i64,
+        today_washes: i64,
+        month_washes: i64,
+        today_revenue_before_withdrawals: i64,
+        month_revenue: i64,
+        month_commissions: i64,
+        month_expenses: i64,
+        month_worker_deductions: i64,
+        month_showroom_revenue: i64,
+        month_showroom_payments: i64,
+        month_business_share: i64,
+        month_business_expenses: i64,
+        today_paid_customer_revenue: i64,
+        today_paid_customer_profit: i64,
+        today_showroom_revenue: i64,
+        today_showroom_profit: i64,
+    }
+    let metrics = db.conn.query_row(
+        "WITH wash AS (
+             SELECT
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 THEN 1 ELSE 0 END),0),
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND ((payment_type='cash' AND is_paid=1) OR payment_type='showroom') THEN price_milli ELSE 0 END),0),
+                COALESCE(SUM(price_milli),0),
+                COALESCE(SUM(commission_milli),0),
+                COALESCE(SUM(CASE WHEN payment_type='showroom' THEN price_milli ELSE 0 END),0),
+                COALESCE(SUM(business_share_milli),0),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='showroom' THEN price_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='showroom' THEN business_share_milli ELSE 0 END),0)
+             FROM wash_operations
+             WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2
+               AND (?5=1 OR created_by=?6)
+         ), expense AS (
+             SELECT COALESCE(SUM(amount_milli),0),COALESCE(SUM(business_amount_milli),0)
+             FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?5=1 OR created_by=?6)
+         ), deduction AS (
+             SELECT COALESCE(SUM(ea.amount_milli),0)
+             FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id
+             WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?5=1 OR e.created_by=?6)
+         ), payment AS (
+             SELECT COALESCE(SUM(amount_milli),0)
+             FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?5=1 OR created_by=?6)
+         ), withdrawal AS (
+             SELECT CASE WHEN ?5=1 THEN COALESCE(SUM(amount_milli),0) ELSE 0 END
+             FROM salary_withdrawals WHERE withdrawn_at BETWEEN ?3 AND ?4
+         )
+         SELECT withdrawal.*,wash.*,expense.*,deduction.*,payment.*
+         FROM withdrawal,wash,expense,deduction,payment",
+        params![selected_month_start, selected_month_end, selected_day_start, selected_day_end, if can_view_all { 1 } else { 0 }, owner_id],
+        |row| Ok(DashboardMetrics {
+            today_salary_withdrawals: row.get(0)?, today_washes: row.get(1)?, month_washes: row.get(2)?,
+            today_revenue_before_withdrawals: row.get(3)?, month_revenue: row.get(4)?, month_commissions: row.get(5)?,
+            month_showroom_revenue: row.get(6)?, month_business_share: row.get(7)?,
+            today_paid_customer_revenue: row.get(8)?, today_paid_customer_profit: row.get(9)?,
+            today_showroom_revenue: row.get(10)?, today_showroom_profit: row.get(11)?,
+            month_expenses: row.get(12)?, month_business_expenses: row.get(13)?,
+            month_worker_deductions: row.get(14)?, month_showroom_payments: row.get(15)?,
+        }),
+    ).map_err(ApiError::internal)?;
     let mut recent = Vec::new();
     let mut statement = db.conn.prepare(
         "SELECT w.id, w.vehicle_make, w.vehicle_model, w.license_plate, w.price_milli, w.occurred_at, w.payment_type, w.status, worker.full_name, w.commission_milli
@@ -1080,86 +1416,49 @@ async fn dashboard(
     }
     let mut response = json!({
         "role": principal.role_code,
-        "todayWashes": today_washes,
-        "monthWashes": month_washes,
+        "todayWashes": metrics.today_washes,
+        "monthWashes": metrics.month_washes,
         "recentWashes": recent,
         "selectedDate": selected_date_key,
         "businessTimeZone": "Africa/Tripoli",
     });
     if principal.has_permission("dashboard.daily_revenue.read") {
-        let revenue_before_withdrawals = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND ((payment_type='cash' AND is_paid=1) OR payment_type='showroom') AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)", params![selected_day_start.clone(), selected_day_end.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let today_revenue = revenue_before_withdrawals - today_salary_withdrawals;
+        let today_revenue =
+            metrics.today_revenue_before_withdrawals - metrics.today_salary_withdrawals;
         response["financial"] = json!({"todayRevenue": today_revenue});
     }
     if principal.has_permission("financial.manage") {
-        let month_revenue = total_for(&db.conn, "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND strftime('%Y-%m', occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let worker_payable = total_for(&db.conn,
-            "SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND strftime('%Y-%m',occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)),0) -
-                     COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE strftime('%Y-%m',e.occurred_at,'+2 hours')=?1 AND (?2=1 OR e.created_by=?3)),0))", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let expenses = total_for(
-            &db.conn,
-            "SELECT COALESCE(SUM(amount_milli),0) FROM expenses WHERE strftime('%Y-%m', occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)",
-            params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()],
-        )?;
-        let showroom_outstanding = total_for(&db.conn,
-            "SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND strftime('%Y-%m',occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)) -
-                     (SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE strftime('%Y-%m',paid_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)),0)", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let business_share = total_for(&db.conn, "SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND strftime('%Y-%m',occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)", params![selected_month_key.clone(), if can_view_all { 1 } else { 0 }, owner_id.clone()])?;
-        let business_expenses = total_for(
-            &db.conn,
-            "SELECT COALESCE(SUM(business_amount_milli),0) FROM expenses WHERE strftime('%Y-%m',occurred_at,'+2 hours')=?1 AND (?2=1 OR created_by=?3)",
-            params![selected_month_key, if can_view_all { 1 } else { 0 }, owner_id.clone()],
-        )?;
         if response.get("financial").is_none() {
             response["financial"] = json!({});
         }
-        response["financial"]["monthRevenue"] = json!(month_revenue);
-        response["financial"]["workerPayable"] = json!(worker_payable);
-        response["financial"]["expenses"] = json!(expenses);
-        response["financial"]["showroomOutstanding"] = json!(showroom_outstanding);
-        response["financial"]["businessShare"] = json!(business_share);
-        response["financial"]["netProfit"] = json!(business_share - business_expenses);
+        response["financial"]["monthRevenue"] = json!(metrics.month_revenue);
+        response["financial"]["workerPayable"] =
+            json!((metrics.month_commissions - metrics.month_worker_deductions).max(0));
+        response["financial"]["expenses"] = json!(metrics.month_expenses);
+        response["financial"]["showroomOutstanding"] =
+            json!(metrics.month_showroom_revenue - metrics.month_showroom_payments);
+        response["financial"]["businessShare"] = json!(metrics.month_business_share);
+        response["financial"]["netProfit"] =
+            json!(metrics.month_business_share - metrics.month_business_expenses);
     }
     if principal.is_manager() {
-        let (
-            paid_customer_revenue,
-            paid_customer_profit,
-            today_showroom_revenue,
-            today_showroom_net_profit,
-        ) = db
-            .conn
-            .query_row(
-                "SELECT
-                    COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN payment_type='showroom' THEN price_milli ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN payment_type='showroom' THEN business_share_milli ELSE 0 END),0)
-                 FROM wash_operations
-                 WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2",
-                params![selected_day_start, selected_day_end],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .map_err(ApiError::internal)?;
-        let revenue_before_withdrawals = paid_customer_revenue + today_showroom_revenue;
-        let today_net_profit = paid_customer_profit - today_salary_withdrawals;
+        let revenue_before_withdrawals =
+            metrics.today_paid_customer_revenue + metrics.today_showroom_revenue;
+        let today_net_profit =
+            metrics.today_paid_customer_profit - metrics.today_salary_withdrawals;
         if response.get("financial").is_none() {
             response["financial"] = json!({});
         }
         response["financial"]["todayRevenue"] =
-            json!(revenue_before_withdrawals - today_salary_withdrawals);
+            json!(revenue_before_withdrawals - metrics.today_salary_withdrawals);
         response["financial"]["todayRevenueBeforeWithdrawals"] = json!(revenue_before_withdrawals);
-        response["financial"]["todayCustomerRevenue"] = json!(paid_customer_revenue);
+        response["financial"]["todayCustomerRevenue"] = json!(metrics.today_paid_customer_revenue);
         response["financial"]["todayNetProfit"] = json!(today_net_profit);
-        response["financial"]["todayShowroomRevenue"] = json!(today_showroom_revenue);
-        response["financial"]["todayShowroomNetProfit"] = json!(today_showroom_net_profit);
+        response["financial"]["todayShowroomRevenue"] = json!(metrics.today_showroom_revenue);
+        response["financial"]["todayShowroomNetProfit"] = json!(metrics.today_showroom_profit);
     }
+    Ok(response)
+    }).await?;
     Ok(ok(response))
 }
 
@@ -1190,6 +1489,23 @@ fn trim_required(value: &str, label: &str) -> Result<String, ApiError> {
     Ok(normalized.to_owned())
 }
 
+fn trim_optional(
+    value: Option<String>,
+    max_chars: usize,
+    error_message: &str,
+) -> Result<Option<String>, ApiError> {
+    let normalized = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if normalized
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > max_chars)
+    {
+        return Err(ApiError::bad(error_message));
+    }
+    Ok(normalized)
+}
+
 async fn list_washes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1202,15 +1518,31 @@ async fn list_washes(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(150)
+        .clamp(1, 300);
+    let can_view_all = principal.is_manager();
+    let owner_id = principal.id.clone();
+    let scope = cursor_scope(&[
+        "washes",
+        &from,
+        &to,
+        if can_view_all { "all" } else { "owner" },
+        &owner_id,
+        if principal.has_permission("financial.manage") {
+            "financial"
+        } else {
+            "operational"
+        },
+    ]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut washes = Vec::new();
     if principal.has_permission("financial.manage") {
         let can_manage_overnight = principal.is_manager();
-        let can_view_all = principal.is_manager();
-        let owner_id = principal.id.clone();
         let mut statement = db.conn.prepare(
             "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,w.occurred_at,w.payment_type,w.status,
                     worker.id,worker.full_name,showroom.id,showroom.name,w.commission_bps,w.commission_milli,w.business_share_milli,w.showroom_payment_method,
@@ -1218,9 +1550,11 @@ async fn list_washes(
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
              WHERE w.status='posted' AND w.is_paid=0
                    AND NOT EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id)
-                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
+                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4)
+                   AND (w.occurred_at<?5 OR (w.occurred_at=?5 AND w.id<?6))
+             ORDER BY w.occurred_at DESC,w.id DESC LIMIT ?7",
         ).map_err(ApiError::internal)?;
-        let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], move |row| {
+        let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id.clone(), cursor_timestamp, cursor_id, limit+1], move |row| {
             let mut item = json!({
                 "id": row.get::<_, String>(0)?, "vehicleMake": row.get::<_, String>(1)?, "vehicleModel": row.get::<_, String>(2)?,
                 "manufactureYear": row.get::<_, Option<i32>>(3)?, "licensePlate": row.get::<_, Option<String>>(4)?, "carColor": row.get::<_, Option<String>>(5)?, "priceMilli": row.get::<_, i64>(6)?,
@@ -1242,17 +1576,17 @@ async fn list_washes(
             washes.push(row.map_err(ApiError::internal)?);
         }
     } else {
-        let can_view_all = principal.is_manager();
-        let owner_id = principal.id.clone();
         let mut statement = db.conn.prepare(
             "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,w.occurred_at,w.payment_type,w.status,
                     worker.id,worker.full_name,showroom.id,showroom.name,w.showroom_payment_method,w.is_paid,w.paid_at,w.wash_type
              FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id
              WHERE w.status='posted' AND w.is_paid=0
                    AND NOT EXISTS(SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=w.id)
-                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300",
+                   AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4)
+                   AND (w.occurred_at<?5 OR (w.occurred_at=?5 AND w.id<?6))
+             ORDER BY w.occurred_at DESC,w.id DESC LIMIT ?7",
         ).map_err(ApiError::internal)?;
-        let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], |row| Ok(json!({
+        let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id, cursor_timestamp, cursor_id, limit+1], |row| Ok(json!({
             "id": row.get::<_, String>(0)?, "vehicleMake": row.get::<_, String>(1)?, "vehicleModel": row.get::<_, String>(2)?,
             "manufactureYear": row.get::<_, Option<i32>>(3)?, "licensePlate": row.get::<_, Option<String>>(4)?, "carColor": row.get::<_, Option<String>>(5)?, "priceMilli": row.get::<_, i64>(6)?,
             "occurredAt": row.get::<_, String>(7)?, "paymentType": row.get::<_, String>(8)?, "status": row.get::<_, String>(9)?,
@@ -1267,7 +1601,10 @@ async fn list_washes(
             washes.push(row.map_err(ApiError::internal)?);
         }
     }
-    Ok(ok(json!({"items": washes})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut washes, limit, &scope, &["occurredAt"])?;
+    Ok(ok(
+        json!({"items": washes,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn list_paid_cars(
@@ -1285,10 +1622,26 @@ async fn list_paid_cars(
     let can_view_all = principal.is_manager();
     let include_financials = principal.has_permission("financial.manage");
     let owner_id = principal.id.clone();
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(150)
+        .clamp(1, 300);
+    let scope = cursor_scope(&[
+        "paid-cars",
+        &from,
+        &to,
+        if can_view_all { "all" } else { "owner" },
+        &owner_id,
+        if include_financials {
+            "financial"
+        } else {
+            "operational"
+        },
+    ]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut statement = db.conn.prepare(
         "SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.car_color,w.price_milli,
                 w.occurred_at,w.payment_type,w.status,worker.id,worker.full_name,showroom.id,showroom.name,
@@ -1300,11 +1653,12 @@ async fn list_paid_cars(
          JOIN users creator ON creator.id=w.created_by
          WHERE w.status='posted' AND w.is_paid=1 AND w.occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR w.created_by=?4)
-         ORDER BY w.occurred_at DESC
-         LIMIT 500",
+               AND (w.occurred_at<?5 OR (w.occurred_at=?5 AND w.id<?6))
+         ORDER BY w.occurred_at DESC,w.id DESC
+         LIMIT ?7",
     ).map_err(ApiError::internal)?;
     let rows = statement.query_map(
-        params![&from, &to, if can_view_all { 1 } else { 0 }, owner_id.clone()],
+        params![&from, &to, if can_view_all { 1 } else { 0 }, owner_id.clone(), cursor_timestamp, cursor_id, limit+1],
         move |row| {
             let mut item = json!({
                 "id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,
@@ -1328,15 +1682,21 @@ async fn list_paid_cars(
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    let settlement = total_for(
-        &db.conn,
-        "SELECT COALESCE(SUM(price_milli),0)
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["occurredAt"])?;
+    let (total_count, settlement) = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(price_milli),0)
          FROM wash_operations
          WHERE status='posted' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR created_by=?4)",
-        params![&from, &to, if can_view_all { 1 } else { 0 }, owner_id],
-    )?;
-    Ok(ok(json!({"items":items,"settlementMilli":settlement})))
+            params![&from, &to, if can_view_all { 1 } else { 0 }, owner_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(ApiError::internal)?;
+    Ok(ok(
+        json!({"items":items,"totalCount":total_count,"settlementMilli":settlement,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1624,6 +1984,7 @@ async fn create_wash(
     {
         return Err(ApiError::bad("نوع الغسيل طويل جدًا"));
     }
+    let license_plate = trim_optional(input.license_plate, 60, "رقم لوحة السيارة طويل جدًا")?;
     let price = parse_milli(&input.price)?;
     if let Some(year) = input.manufacture_year {
         if !(1900..=2100).contains(&year) {
@@ -1669,10 +2030,7 @@ async fn create_wash(
         .map(str::to_owned)
         .unwrap_or_else(now);
     let occurred_at = canonical_timestamp(&raw_occurred_at, "وقت الغسلة غير صالح")?;
-    let request_id = input.client_request_id.unwrap_or_else(new_id);
-    if request_id.len() > 100 {
-        return Err(ApiError::bad("معرف الطلب غير صالح"));
-    }
+    let request_id = operation_request_id(input.client_request_id)?.unwrap_or_else(new_id);
     let mut db = state
         .db
         .lock()
@@ -1726,7 +2084,7 @@ async fn create_wash(
     tx.execute(
         "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,manufacture_year,license_plate,car_color,wash_type,price_milli,worker_id,payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,created_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-        params![wash_id, vehicle_make, vehicle_model, input.manufacture_year, input.license_plate.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()), car_color, wash_type, price, input.worker_id, input.payment_type, showroom_id, showroom_payment_method, occurred_at, commission_bps, commission, business_share, principal.id, request_id, now()],
+        params![wash_id, vehicle_make, vehicle_model, input.manufacture_year, license_plate, car_color, wash_type, price, input.worker_id, input.payment_type, showroom_id, showroom_payment_method, occurred_at, commission_bps, commission, business_share, principal.id, request_id, now()],
     ).map_err(ApiError::internal)?;
     let debit_account = if input.payment_type == "cash" {
         "CASH"
@@ -1820,6 +2178,7 @@ async fn update_wash(
     {
         return Err(ApiError::bad("نوع الغسيل طويل جدًا"));
     }
+    let license_plate = trim_optional(input.license_plate, 60, "رقم لوحة السيارة طويل جدًا")?;
     if input
         .manufacture_year
         .is_some_and(|year| !(1900..=2100).contains(&year))
@@ -1983,7 +2342,7 @@ async fn update_wash(
         ],
     )?;
     tx.execute("UPDATE wash_operations SET vehicle_make=?1,vehicle_model=?2,manufacture_year=?3,license_plate=?4,car_color=?5,wash_type=?6,price_milli=?7,worker_id=?8,payment_type=?9,showroom_id=?10,showroom_payment_method=?11,occurred_at=?12,commission_bps=?13,commission_milli=?14,business_share_milli=?15,revision=revision+1,updated_at=?16,updated_by=?17 WHERE id=?18",
-        params![vehicle_make,vehicle_model,input.manufacture_year,input.license_plate.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),car_color,wash_type,price,input.worker_id,input.payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission,business_share,now(),principal.id,id]).map_err(ApiError::internal)?;
+        params![vehicle_make,vehicle_model,input.manufacture_year,license_plate,car_color,wash_type,price,input.worker_id,input.payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission,business_share,now(),principal.id,id]).map_err(ApiError::internal)?;
     if let Some(mark_as_overnight) = input.mark_as_overnight {
         if mark_as_overnight {
             let inserted = tx.execute(
@@ -2044,12 +2403,24 @@ async fn list_overnight_cars(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
+    let limit = history_limit(&query);
     let can_view_all = principal.is_manager();
     let owner_id = principal.id.clone();
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let scope = cursor_scope(&[
+        "overnight-cars",
+        &from,
+        &to,
+        if can_view_all { "all" } else { "owner" },
+        &owner_id,
+        if principal.has_permission("financial.manage") {
+            "financial"
+        } else {
+            "operational"
+        },
+    ]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut statement = db.conn.prepare(
         "SELECT overnight.id,overnight.marked_at,marker.full_name,
                 wash.id,wash.vehicle_make,wash.vehicle_model,wash.manufacture_year,wash.license_plate,wash.car_color,wash.price_milli,
@@ -2062,9 +2433,11 @@ async fn list_overnight_cars(
          JOIN users marker ON marker.id=overnight.marked_by
          WHERE wash.status='posted' AND wash.is_paid=0 AND wash.occurred_at BETWEEN ?1 AND ?2
                AND (?3=1 OR wash.created_by=?4)
-         ORDER BY wash.occurred_at DESC"
+               AND (wash.occurred_at<?5 OR (wash.occurred_at=?5 AND wash.id<?6))
+         ORDER BY wash.occurred_at DESC,wash.id DESC
+         LIMIT ?7"
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id], move |row| {
+    let rows = statement.query_map(params![from, to, if can_view_all { 1 } else { 0 }, owner_id, cursor_timestamp, cursor_id, limit+1], move |row| {
         let mut wash = json!({
             "id": row.get::<_,String>(3)?, "vehicleMake": row.get::<_,String>(4)?, "vehicleModel": row.get::<_,String>(5)?,
             "manufactureYear": row.get::<_,Option<i32>>(6)?, "licensePlate": row.get::<_,Option<String>>(7)?, "carColor": row.get::<_,Option<String>>(8)?, "priceMilli": row.get::<_,i64>(9)?,
@@ -2084,7 +2457,16 @@ async fn list_overnight_cars(
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page_with_id(
+        &mut items,
+        limit,
+        &scope,
+        &["wash", "occurredAt"],
+        &["wash", "id"],
+    )?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn delete_overnight_car(
@@ -2239,18 +2621,16 @@ async fn list_workers(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let result = blocking(move || {
+    let db = state.read_db()?;
     let mut items = Vec::new();
     let can_view_financial = principal.has_permission("financial.manage");
     let mut statement = db.conn.prepare(
         "SELECT w.id,w.full_name,w.phone,w.notes,w.is_active,w.commission_bps_override,
-                COUNT(CASE WHEN wash.status='posted' AND wash.occurred_at BETWEEN ?1 AND ?2 THEN 1 END),
-                COALESCE(SUM(CASE WHEN wash.status='posted' AND wash.occurred_at BETWEEN ?1 AND ?2 THEN wash.commission_milli ELSE 0 END),0),
+                COUNT(wash.worker_id),COALESCE(SUM(wash.commission_milli),0),
                 COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE ea.worker_id=w.id AND e.occurred_at BETWEEN ?1 AND ?2),0)
          FROM workers w LEFT JOIN wash_operations wash ON wash.worker_id=w.id
+              AND wash.status='posted' AND wash.occurred_at BETWEEN ?1 AND ?2
          WHERE w.is_active=1
          GROUP BY w.id ORDER BY w.full_name",
     ).map_err(ApiError::internal)?;
@@ -2273,7 +2653,9 @@ async fn list_workers(
     if query.get("status").is_some_and(|value| value == "active") {
         items.retain(|item| item["isActive"] == true);
     }
-    Ok(ok(json!({"items":items})))
+    Ok(json!({"items":items}))
+    }).await?;
+    Ok(ok(result))
 }
 
 async fn create_worker(
@@ -2296,6 +2678,8 @@ async fn create_worker(
             return Err(ApiError::bad("نسبة العمولة الخاصة غير صالحة"));
         }
     }
+    let phone = trim_optional(input.phone, 60, "رقم الهاتف طويل جدًا")?;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let id = new_id();
     let db = state
         .db
@@ -2303,7 +2687,7 @@ async fn create_worker(
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
     db.conn.execute(
         "INSERT INTO workers(id,full_name,phone,notes,is_active,commission_bps_override,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-        params![id, full_name, input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), if input.is_active.unwrap_or(true){1}else{0}, input.commission_bps_override, now()],
+        params![id, full_name, phone, notes, if input.is_active.unwrap_or(true){1}else{0}, input.commission_bps_override, now()],
     ).map_err(ApiError::internal)?;
     insert_audit(
         &db.conn,
@@ -2339,6 +2723,8 @@ async fn update_worker(
             return Err(ApiError::bad("نسبة العمولة الخاصة غير صالحة"));
         }
     }
+    let phone = trim_optional(input.phone, 60, "رقم الهاتف طويل جدًا")?;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let db = state
         .db
         .lock()
@@ -2361,7 +2747,7 @@ async fn update_worker(
     };
     let affected = db.conn.execute(
         "UPDATE workers SET full_name=?1,phone=?2,notes=?3,is_active=?4,commission_bps_override=?5,updated_at=?6,deactivated_at=CASE WHEN ?4=0 THEN COALESCE(deactivated_at,?6) ELSE NULL END,deactivated_by=CASE WHEN ?4=0 THEN ?8 ELSE NULL END WHERE id=?7",
-        params![full_name, input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()), if next_active{1}else{0}, next_commission_bps_override, now(), id, principal.id],
+        params![full_name, phone, notes, if next_active{1}else{0}, next_commission_bps_override, now(), id, principal.id],
     ).map_err(ApiError::internal)?;
     if affected == 0 {
         return Err(ApiError::not_found());
@@ -2443,10 +2829,11 @@ async fn worker_detail(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["worker-history", &id, &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let worker: Option<Value> = db.conn.query_row("SELECT id,full_name,phone,notes,is_active FROM workers WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,"isActive":row.get::<_,i64>(4)?==1}))).optional().map_err(ApiError::internal)?;
     let mut worker = worker.ok_or_else(ApiError::not_found)?;
     let (wash_count, total_wash_value): (i64, i64) = db
@@ -2477,9 +2864,11 @@ async fn worker_detail(
          JOIN workers worker ON worker.id=wash.worker_id
          JOIN users creator ON creator.id=wash.created_by
          WHERE wash.worker_id=?1 AND wash.status='posted' AND wash.occurred_at BETWEEN ?2 AND ?3
-         ORDER BY wash.occurred_at DESC",
+               AND (wash.occurred_at<?4 OR (wash.occurred_at=?4 AND wash.id<?5))
+         ORDER BY wash.occurred_at DESC,wash.id DESC
+         LIMIT ?6",
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![id,from,to], |row| {
+    let rows = statement.query_map(params![id,from,to,cursor_timestamp,cursor_id,limit+1], |row| {
         let mut value = json!({"id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,"manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,"occurredAt":row.get::<_,String>(6)?,"paymentType":row.get::<_,String>(7)?,"status":row.get::<_,String>(8)?,"worker":{"id":row.get::<_,String>(9)?,"fullName":row.get::<_,String>(10)?},"createdBy":{"id":row.get::<_,String>(11)?,"fullName":row.get::<_,String>(12)?}});
         value["priceMilli"] = json!(row.get::<_,i64>(5)?);
         Ok(value)
@@ -2487,7 +2876,9 @@ async fn worker_detail(
     for row in rows {
         history.push(row.map_err(ApiError::internal)?);
     }
-    let mut response = json!({"worker":worker,"history":history});
+    let (history_has_more, history_next_cursor) =
+        finish_cursor_page(&mut history, limit, &scope, &["occurredAt"])?;
+    let mut response = json!({"worker":worker,"history":history,"historyHasMore":history_has_more,"historyNextCursor":history_next_cursor});
     response["dailyValue"] = daily_value.map_or_else(
         || json!({"date": value_date, "amountMilli": null}),
         |(date, amount)| json!({"date": date, "amountMilli": amount}),
@@ -2559,10 +2950,7 @@ async fn worker_financial(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let commission_bps_override: Option<i64> = db
         .conn
         .query_row(
@@ -2587,6 +2975,7 @@ struct WorkerWithdrawalReturnInput {
     amount: String,
     occurred_at: String,
     notes: Option<String>,
+    client_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2676,10 +3065,11 @@ async fn worker_withdrawal_returns(
 ) -> ApiResult {
     manager(&state, &headers)?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["worker-movements", &id, &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let worker_name: String = db
         .conn
         .query_row(
@@ -2694,41 +3084,37 @@ async fn worker_withdrawal_returns(
     let reset_at = worker_financial_reset_at(&db.conn, &id)?;
     let mut transactions = Vec::new();
     let mut statement = db.conn.prepare(
-        "SELECT movement.id,movement.transaction_type,movement.amount_milli,movement.occurred_at,movement.notes,user.full_name
-         FROM worker_withdrawal_returns movement JOIN users user ON user.id=movement.created_by
-         WHERE movement.worker_id=?1 AND movement.deleted_at IS NULL AND movement.occurred_at BETWEEN ?2 AND ?3
-               AND movement.created_at>?4
-         ORDER BY movement.occurred_at DESC,movement.created_at DESC"
+        "SELECT id,transaction_type,amount_milli,occurred_at,notes,created_by_name,editable,deletable
+         FROM (
+             SELECT movement.id id,movement.transaction_type transaction_type,movement.amount_milli amount_milli,
+                    movement.occurred_at occurred_at,movement.notes notes,user.full_name created_by_name,
+                    movement.transaction_type='deduction_payment' editable,1 deletable,movement.created_at sort_created_at
+             FROM worker_withdrawal_returns movement JOIN users user ON user.id=movement.created_by
+             WHERE movement.worker_id=?1 AND movement.deleted_at IS NULL AND movement.occurred_at BETWEEN ?2 AND ?3
+                   AND movement.created_at>?4
+             UNION ALL
+             SELECT 'deduction:'||allocation.id,'deduction',allocation.amount_milli,expense.occurred_at,
+                    expense.description,user.full_name,0,0,allocation.created_at
+             FROM expense_allocations allocation
+             JOIN expenses expense ON expense.id=allocation.expense_id
+             JOIN users user ON user.id=expense.created_by
+             WHERE allocation.worker_id=?1 AND allocation.amount_milli>0 AND expense.occurred_at BETWEEN ?2 AND ?3
+                   AND allocation.created_at>?4
+         )
+         WHERE occurred_at<?5 OR (occurred_at=?5 AND id<?6)
+         ORDER BY occurred_at DESC,id DESC
+         LIMIT ?7"
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![id.clone(),from.clone(),to.clone(),reset_at.clone()], |row| Ok(json!({
+    let rows = statement.query_map(params![id.clone(),from,to,reset_at,cursor_timestamp,cursor_id,limit+1], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"type":row.get::<_,String>(1)?,"amountMilli":row.get::<_,i64>(2)?,
         "occurredAt":row.get::<_,String>(3)?,"notes":row.get::<_,Option<String>>(4)?,"createdByName":row.get::<_,String>(5)?,
-        "editable":row.get::<_,String>(1)? == "deduction_payment","deletable":true
+        "editable":row.get::<_,i64>(6)? == 1,"deletable":row.get::<_,i64>(7)? == 1
     }))).map_err(ApiError::internal)?;
     for row in rows {
         transactions.push(row.map_err(ApiError::internal)?);
     }
-    let mut deduction_statement = db.conn.prepare(
-        "SELECT allocation.id,allocation.amount_milli,expense.occurred_at,expense.description,user.full_name
-         FROM expense_allocations allocation
-         JOIN expenses expense ON expense.id=allocation.expense_id
-         JOIN users user ON user.id=expense.created_by
-         WHERE allocation.worker_id=?1 AND allocation.amount_milli>0 AND expense.occurred_at BETWEEN ?2 AND ?3
-               AND allocation.created_at>?4"
-    ).map_err(ApiError::internal)?;
-    let deduction_rows = deduction_statement.query_map(params![id.clone(),from,to,reset_at], |row| Ok(json!({
-        "id":format!("deduction:{}",row.get::<_,String>(0)?),"type":"deduction","amountMilli":row.get::<_,i64>(1)?,
-        "occurredAt":row.get::<_,String>(2)?,"notes":row.get::<_,String>(3)?,"createdByName":row.get::<_,String>(4)?,
-        "editable":false,"deletable":false
-    }))).map_err(ApiError::internal)?;
-    for row in deduction_rows {
-        transactions.push(row.map_err(ApiError::internal)?);
-    }
-    transactions.sort_by(|left, right| {
-        right["occurredAt"]
-            .as_str()
-            .cmp(&left["occurredAt"].as_str())
-    });
+    let (has_more, next_cursor) =
+        finish_cursor_page(&mut transactions, limit, &scope, &["occurredAt"])?;
     Ok(ok(json!({
         "worker":{"id":id,"fullName":worker_name},"totalWithdrawalsMilli":totals.withdrawals,
         "totalDeductionsMilli":totals.deductions,"totalReturnsMilli":totals.returns,
@@ -2736,7 +3122,7 @@ async fn worker_withdrawal_returns(
         "remainingReturnsMilli":totals.remaining_returns,
         "remainingWithdrawalDebtMilli":totals.withdrawal_debt,
         "outstandingDeductionBalanceMilli":totals.deduction_outstanding,
-        "transactions":transactions
+        "transactions":transactions,"hasMore":has_more,"nextCursor":next_cursor
     })))
 }
 
@@ -2755,20 +3141,20 @@ async fn create_worker_withdrawal_return(
     }
     let amount = parse_milli(&input.amount)?;
     let occurred_at = canonical_timestamp(&input.occurred_at, "تاريخ الحركة غير صالح")?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if notes
-        .as_deref()
-        .is_some_and(|value| value.chars().count() > 500)
-    {
-        return Err(ApiError::bad("الملاحظة طويلة جدًا"));
-    }
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
+    let request_id = operation_request_id(input.client_request_id)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    if let Some(response) = replay_operation(
+        &db.conn,
+        &principal.id,
+        "worker_withdrawal_return.create",
+        request_id.as_deref(),
+    )? {
+        return Ok(ok(response));
+    }
     let worker_name: String = db
         .conn
         .query_row(
@@ -2820,8 +3206,16 @@ async fn create_worker_withdrawal_return(
             &json!({"workerId":worker_id,"workerName":worker_name,"type":input.transaction_type,"amountMilli":amount}),
         ),
     )?;
+    let response = json!({"id":id,"created":true});
+    record_operation(
+        &tx,
+        &principal.id,
+        "worker_withdrawal_return.create",
+        request_id.as_deref(),
+        &response,
+    )?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(json!({"id":id,"created":true})))
+    Ok(ok(response))
 }
 
 async fn update_worker_deduction_payment(
@@ -2836,16 +3230,7 @@ async fn update_worker_deduction_payment(
     }
     let amount = parse_milli(&input.amount)?;
     let occurred_at = canonical_timestamp(&input.occurred_at, "تاريخ الحركة غير صالح")?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if notes
-        .as_deref()
-        .is_some_and(|value| value.chars().count() > 500)
-    {
-        return Err(ApiError::bad("الملاحظة طويلة جدًا"));
-    }
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let mut db = state
         .db
         .lock()
@@ -3057,23 +3442,27 @@ async fn list_showroom_debts(
         "financial.manage",
     )?;
     let (_, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let mut statement = db.conn.prepare(
-        "SELECT showroom.id,showroom.name,showroom.contact_name,showroom.phone,showroom.notes,showroom.is_active,
-                COUNT(wash.id),
-                COALESCE(SUM(wash.price_milli),0) - COALESCE((SELECT SUM(payment.amount_milli)
-                    FROM showroom_payments payment WHERE payment.showroom_id=showroom.id AND payment.paid_at<=?1),0),
-                MAX(wash.occurred_at)
-         FROM showrooms showroom
-         JOIN wash_operations wash ON wash.showroom_id=showroom.id
-             AND wash.payment_type='showroom' AND wash.status='posted' AND wash.occurred_at<=?1
-         GROUP BY showroom.id
-         HAVING COALESCE(SUM(wash.price_milli),0) - COALESCE((SELECT SUM(payment.amount_milli)
-                    FROM showroom_payments payment WHERE payment.showroom_id=showroom.id AND payment.paid_at<=?1),0) > 0
-         ORDER BY MAX(wash.occurred_at) DESC,showroom.name",
+        "WITH wash_totals AS (
+             SELECT showroom_id,COUNT(*) wash_count,COALESCE(SUM(price_milli),0) charges,
+                    MAX(occurred_at) latest_wash_at
+             FROM wash_operations
+             WHERE payment_type='showroom' AND status='posted' AND occurred_at<=?1
+             GROUP BY showroom_id
+         ), payment_totals AS (
+             SELECT showroom_id,COALESCE(SUM(amount_milli),0) payments
+             FROM showroom_payments WHERE paid_at<=?1 GROUP BY showroom_id
+         )
+         SELECT showroom.id,showroom.name,showroom.contact_name,showroom.phone,showroom.notes,showroom.is_active,
+                wash_totals.wash_count,
+                wash_totals.charges-COALESCE(payment_totals.payments,0),
+                wash_totals.latest_wash_at
+         FROM wash_totals
+         JOIN showrooms showroom ON showroom.id=wash_totals.showroom_id
+         LEFT JOIN payment_totals ON payment_totals.showroom_id=showroom.id
+         WHERE wash_totals.charges-COALESCE(payment_totals.payments,0)>0
+         ORDER BY wash_totals.latest_wash_at DESC,showroom.name",
     ).map_err(ApiError::internal)?;
     let rows = statement
         .query_map([to], |row| {
@@ -3115,10 +3504,16 @@ async fn showroom_debt_detail(
     if from > to {
         return Err(ApiError::bad("تاريخ البداية يجب أن يسبق تاريخ النهاية"));
     }
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let operations_limit = history_limit_named(&query, "operationsLimit");
+    let payments_limit = history_limit_named(&query, "paymentsLimit");
+    let operations_scope = cursor_scope(&["showroom-debt-operations", &id, &from, &to]);
+    let payments_scope = cursor_scope(&["showroom-debt-payments", &id, &from, &to]);
+    let operations_cursor = history_cursor(&query, "operationsCursor", &operations_scope)?;
+    let payments_cursor = history_cursor(&query, "paymentsCursor", &payments_scope)?;
+    let (operations_cursor_timestamp, operations_cursor_id) =
+        cursor_boundary(operations_cursor.as_ref());
+    let (payments_cursor_timestamp, payments_cursor_id) = cursor_boundary(payments_cursor.as_ref());
+    let db = state.read_db()?;
     let showroom: Option<Value> = db.conn.query_row(
         "SELECT id,name,contact_name,phone,notes,is_active,created_at FROM showrooms WHERE id=?1",
         [id.clone()],
@@ -3139,9 +3534,11 @@ async fn showroom_debt_detail(
          JOIN users creator ON creator.id=wash.created_by
          WHERE wash.showroom_id=?1 AND wash.payment_type='showroom' AND wash.status='posted'
              AND wash.occurred_at BETWEEN ?2 AND ?3
-         ORDER BY wash.occurred_at DESC,wash.id",
+             AND (wash.occurred_at<?4 OR (wash.occurred_at=?4 AND wash.id<?5))
+         ORDER BY wash.occurred_at DESC,wash.id DESC
+         LIMIT ?6",
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![id,from,to], |row| Ok(json!({
+    let rows = statement.query_map(params![id,from,to,operations_cursor_timestamp,operations_cursor_id,operations_limit+1], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,
         "manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,
         "carColor":row.get::<_,Option<String>>(5)?,"priceMilli":row.get::<_,i64>(6)?,
@@ -3155,10 +3552,16 @@ async fn showroom_debt_detail(
         let operation = row.map_err(ApiError::internal)?;
         operations.push(operation);
     }
-    let total_charges = total_for(&db.conn,
-        "SELECT COALESCE(SUM(price_milli),0) FROM wash_operations
+    let (operations_has_more, operations_next_cursor) = finish_cursor_page(
+        &mut operations,
+        operations_limit,
+        &operations_scope,
+        &["occurredAt"],
+    )?;
+    let (outstanding_wash_count,total_charges):(i64,i64)=db.conn.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(price_milli),0) FROM wash_operations
          WHERE showroom_id=?1 AND payment_type='showroom' AND status='posted' AND occurred_at BETWEEN ?2 AND ?3",
-        params![id,from,to])?;
+        params![id,from,to],|row|Ok((row.get(0)?,row.get(1)?))).map_err(ApiError::internal)?;
     let total_payments = total_for(
         &db.conn,
         "SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments
@@ -3175,29 +3578,44 @@ async fn showroom_debt_detail(
          JOIN showrooms showroom ON showroom.id=payment.showroom_id
          JOIN users user ON user.id=payment.created_by
          WHERE payment.showroom_id=?1 AND payment.paid_at BETWEEN ?2 AND ?3
-         ORDER BY payment.paid_at DESC,payment.id DESC",
+               AND (payment.paid_at<?4 OR (payment.paid_at=?4 AND payment.id<?5))
+         ORDER BY payment.paid_at DESC,payment.id DESC
+         LIMIT ?6",
         )
         .map_err(ApiError::internal)?;
     let payment_rows = payment_statement
-        .query_map(params![id, from, to], |row| {
-            Ok(json!({
-                "id": row.get::<_,String>(0)?, "amountMilli": row.get::<_,i64>(1)?,
-                "paidAt": row.get::<_,String>(2)?, "notes": row.get::<_,Option<String>>(3)?,
-                "showroom": {"id": row.get::<_,String>(4)?, "name": row.get::<_,String>(5)?},
-                "recordedBy": row.get::<_,String>(6)?
-            }))
-        })
+        .query_map(
+            params![
+                id,
+                from,
+                to,
+                payments_cursor_timestamp,
+                payments_cursor_id,
+                payments_limit + 1
+            ],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_,String>(0)?, "amountMilli": row.get::<_,i64>(1)?,
+                    "paidAt": row.get::<_,String>(2)?, "notes": row.get::<_,Option<String>>(3)?,
+                    "showroom": {"id": row.get::<_,String>(4)?, "name": row.get::<_,String>(5)?},
+                    "recordedBy": row.get::<_,String>(6)?
+                }))
+            },
+        )
         .map_err(ApiError::internal)?;
     for row in payment_rows {
         payments.push(row.map_err(ApiError::internal)?);
     }
+    let (payments_has_more, payments_next_cursor) =
+        finish_cursor_page(&mut payments, payments_limit, &payments_scope, &["paidAt"])?;
     Ok(ok(json!({
         "showroom":showroom,"from":from,"to":to,
-        "outstandingWashCount":operations.len(),
+        "outstandingWashCount":outstanding_wash_count,
         "totalChargesMilli":total_charges,
         "totalPaymentsMilli":total_payments,
         "totalOutstandingMilli":(total_charges - total_payments).max(0),
-        "operations":operations,"payments":payments
+        "operations":operations,"operationsHasMore":operations_has_more,"operationsNextCursor":operations_next_cursor,
+        "payments":payments,"paymentsHasMore":payments_has_more,"paymentsNextCursor":payments_next_cursor
     })))
 }
 
@@ -3213,19 +3631,16 @@ async fn list_showrooms(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let mut items = Vec::new();
     if principal.has_permission("financial.manage") {
-        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(CASE WHEN w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 THEN 1 END),COALESCE(SUM(CASE WHEN w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 THEN w.price_milli ELSE 0 END),0),COALESCE((SELECT SUM(amount_milli) FROM showroom_payments sp WHERE sp.showroom_id=s.id AND sp.paid_at BETWEEN ?1 AND ?2),0) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
+        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id),COALESCE(SUM(w.price_milli),0),COALESCE((SELECT SUM(amount_milli) FROM showroom_payments sp WHERE sp.showroom_id=s.id AND sp.paid_at BETWEEN ?1 AND ?2),0) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
         let rows=statement.query_map(params![from,to],|row|{let charges:i64=row.get(7)?;let payments:i64=row.get(8)?;Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?,"financial":{"chargesMilli":charges,"paymentsMilli":payments,"outstandingMilli":(charges-payments).max(0)}}))}).map_err(ApiError::internal)?;
         for row in rows {
             items.push(row.map_err(ApiError::internal)?);
         }
     } else {
-        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(CASE WHEN w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 THEN 1 END) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
+        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
         let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?}))).map_err(ApiError::internal)?;
         for row in rows {
             items.push(row.map_err(ApiError::internal)?);
@@ -3246,12 +3661,15 @@ async fn create_showroom(
         "operational.write",
     )?;
     let name = trim_required(&input.name, "اسم المعرض")?;
+    let contact_name = trim_optional(input.contact_name, 120, "اسم جهة الاتصال طويل جدًا")?;
+    let phone = trim_optional(input.phone, 60, "رقم الهاتف طويل جدًا")?;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let id = new_id();
     let db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    db.conn.execute("INSERT INTO showrooms(id,name,contact_name,phone,notes,is_active,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id,name,input.contact_name.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),if input.is_active.unwrap_or(true){1}else{0},now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المعرض: {error}")))?;
+    db.conn.execute("INSERT INTO showrooms(id,name,contact_name,phone,notes,is_active,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id,name,contact_name,phone,notes,if input.is_active.unwrap_or(true){1}else{0},now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المعرض: {error}")))?;
     insert_audit(
         &db.conn,
         Some(&principal.id),
@@ -3278,6 +3696,9 @@ async fn update_showroom(
         "operational.write",
     )?;
     let name = trim_required(&input.name, "اسم المعرض")?;
+    let contact_name = trim_optional(input.contact_name, 120, "اسم جهة الاتصال طويل جدًا")?;
+    let phone = trim_optional(input.phone, 60, "رقم الهاتف طويل جدًا")?;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let db = state
         .db
         .lock()
@@ -3296,7 +3717,7 @@ async fn update_showroom(
         .is_active
         .map(|value| if value { 1 } else { 0 })
         .unwrap_or(previous_active);
-    let count=db.conn.execute("UPDATE showrooms SET name=?1,contact_name=?2,phone=?3,notes=?4,is_active=?5,updated_at=?6 WHERE id=?7",params![name,input.contact_name.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.phone.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),is_active,now(),id]).map_err(ApiError::internal)?;
+    let count=db.conn.execute("UPDATE showrooms SET name=?1,contact_name=?2,phone=?3,notes=?4,is_active=?5,updated_at=?6 WHERE id=?7",params![name,contact_name,phone,notes,is_active,now(),id]).map_err(ApiError::internal)?;
     if count == 0 {
         return Err(ApiError::not_found());
     }
@@ -3390,21 +3811,39 @@ async fn showroom_detail(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let can_view_all = principal.is_manager();
+    let can_view_financial = principal.has_permission("financial.manage");
+    let owner_id = principal.id.clone();
+    let scope = cursor_scope(&[
+        "showroom-history",
+        &id,
+        &from,
+        &to,
+        if can_view_all { "all" } else { "owner" },
+        &owner_id,
+        if can_view_financial {
+            "financial"
+        } else {
+            "operational"
+        },
+    ]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let showroom:Option<Value>=db.conn.query_row("SELECT id,name,contact_name,phone,notes,is_active FROM showrooms WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1}))).optional().map_err(ApiError::internal)?;
     let showroom = showroom.ok_or_else(ApiError::not_found)?;
     let mut history = Vec::new();
-    let can_view_all = principal.is_manager();
-    let owner_id = principal.id.clone();
-    let mut statement=db.conn.prepare("SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.price_milli,w.occurred_at,w.status,worker.full_name FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id WHERE w.showroom_id=?1 AND w.occurred_at BETWEEN ?2 AND ?3 AND (?4=1 OR w.created_by=?5) ORDER BY w.occurred_at DESC").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![id,from,to,if can_view_all { 1 } else { 0 },owner_id],|row|{let mut value=json!({"id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,"manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,"occurredAt":row.get::<_,String>(6)?,"status":row.get::<_,String>(7)?,"workerName":row.get::<_,String>(8)?});if principal.has_permission("financial.manage"){value["priceMilli"]=json!(row.get::<_,i64>(5)?);}Ok(value)}).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.price_milli,w.occurred_at,w.status,worker.full_name FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id WHERE w.showroom_id=?1 AND w.occurred_at BETWEEN ?2 AND ?3 AND (?4=1 OR w.created_by=?5) AND (w.occurred_at<?6 OR (w.occurred_at=?6 AND w.id<?7)) ORDER BY w.occurred_at DESC,w.id DESC LIMIT ?8").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![id,from,to,if can_view_all { 1 } else { 0 },owner_id,cursor_timestamp,cursor_id,limit+1],|row|{let mut value=json!({"id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,"manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,"occurredAt":row.get::<_,String>(6)?,"status":row.get::<_,String>(7)?,"workerName":row.get::<_,String>(8)?});if can_view_financial{value["priceMilli"]=json!(row.get::<_,i64>(5)?);}Ok(value)}).map_err(ApiError::internal)?;
     for row in rows {
         history.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"showroom":showroom,"history":history})))
+    let (history_has_more, history_next_cursor) =
+        finish_cursor_page(&mut history, limit, &scope, &["occurredAt"])?;
+    Ok(ok(
+        json!({"showroom":showroom,"history":history,"historyHasMore":history_has_more,"historyNextCursor":history_next_cursor}),
+    ))
 }
 
 async fn showroom_statistics(
@@ -3433,10 +3872,7 @@ async fn showroom_statistics(
         "debt" | "showroom" => Some("showroom"),
         _ => return Err(ApiError::bad("نوع الدفع المحدد غير صالح")),
     };
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let exists: bool = db
         .conn
         .query_row(
@@ -3471,10 +3907,11 @@ async fn showroom_financial(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["showroom-financial-payments", &id, &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let exists: Option<String> = db
         .conn
         .query_row(
@@ -3490,13 +3927,15 @@ async fn showroom_financial(
     let charges=total_for(&db.conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND showroom_id=?1 AND occurred_at BETWEEN ?2 AND ?3",params![id,from,to])?;
     let paid=total_for(&db.conn,"SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE showroom_id=?1 AND paid_at BETWEEN ?2 AND ?3",params![id,from,to])?;
     let mut payments = Vec::new();
-    let mut statement=db.conn.prepare("SELECT sp.id,sp.amount_milli,sp.paid_at,sp.notes,s.id,s.name,u.full_name FROM showroom_payments sp JOIN showrooms s ON s.id=sp.showroom_id JOIN users u ON u.id=sp.created_by WHERE sp.showroom_id=?1 AND sp.paid_at BETWEEN ?2 AND ?3 ORDER BY sp.paid_at DESC").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![id,from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"paidAt":row.get::<_,String>(2)?,"notes":row.get::<_,Option<String>>(3)?,"showroom":{"id":row.get::<_,String>(4)?,"name":row.get::<_,String>(5)?},"recordedBy":row.get::<_,String>(6)?}))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT sp.id,sp.amount_milli,sp.paid_at,sp.notes,s.id,s.name,u.full_name FROM showroom_payments sp JOIN showrooms s ON s.id=sp.showroom_id JOIN users u ON u.id=sp.created_by WHERE sp.showroom_id=?1 AND sp.paid_at BETWEEN ?2 AND ?3 AND (sp.paid_at<?4 OR (sp.paid_at=?4 AND sp.id<?5)) ORDER BY sp.paid_at DESC,sp.id DESC LIMIT ?6").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![id,from,to,cursor_timestamp,cursor_id,limit+1],|row|Ok(json!({"id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"paidAt":row.get::<_,String>(2)?,"notes":row.get::<_,Option<String>>(3)?,"showroom":{"id":row.get::<_,String>(4)?,"name":row.get::<_,String>(5)?},"recordedBy":row.get::<_,String>(6)?}))).map_err(ApiError::internal)?;
     for row in rows {
         payments.push(row.map_err(ApiError::internal)?);
     }
+    let (payments_has_more, payments_next_cursor) =
+        finish_cursor_page(&mut payments, limit, &scope, &["paidAt"])?;
     Ok(ok(
-        json!({"chargesMilli":charges,"paymentsMilli":paid,"outstandingMilli":(charges-paid).max(0),"payments":payments}),
+        json!({"chargesMilli":charges,"paymentsMilli":paid,"outstandingMilli":(charges-paid).max(0),"payments":payments,"paymentsHasMore":payments_has_more,"paymentsNextCursor":payments_next_cursor}),
     ))
 }
 
@@ -3507,6 +3946,7 @@ struct PaymentInput {
     amount: String,
     paid_at: Option<String>,
     notes: Option<String>,
+    client_request_id: Option<String>,
 }
 
 fn payment_time(value: &Option<String>) -> Result<String, ApiError> {
@@ -3562,10 +4002,7 @@ async fn update_showroom_payment(
         .to_owned();
     let amount = parse_milli(&input.amount)?;
     let paid_at = payment_time(&input.paid_at)?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let mut db = state
         .db
         .lock()
@@ -3742,10 +4179,8 @@ async fn payroll_summary(
         Some(date) => date.format("%Y-%m").to_string(),
         None => parse_payroll_month(query.get("month"))?,
     };
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let (month_start, month_end) = business_month_range_from_key(&month)?;
+    let db = state.read_db()?;
     let mut employees = Vec::new();
     let mut total_salary = 0_i64;
     let mut total_withdrawals = 0_i64;
@@ -3753,23 +4188,29 @@ async fn payroll_summary(
     let mut statement = db
         .conn
         .prepare(
-            "SELECT employee.id,employee.full_name,employee.is_active,
+            "WITH withdrawal_totals AS (
+                SELECT employee_id,COALESCE(SUM(amount_milli),0) total
+                FROM salary_withdrawals
+                WHERE withdrawn_at BETWEEN ?2 AND ?3 GROUP BY employee_id
+             ), deduction_totals AS (
+                SELECT employee_id,COALESCE(SUM(amount_milli),0) total
+                FROM salary_deductions
+                WHERE deducted_at BETWEEN ?2 AND ?3 GROUP BY employee_id
+             )
+             SELECT employee.id,employee.full_name,employee.is_active,
                 COALESCE((SELECT rate.salary_milli FROM payroll_salary_rates rate
                           WHERE rate.employee_id=employee.id AND rate.effective_month<=?1
                           ORDER BY rate.effective_month DESC LIMIT 1),0),
-                COALESCE((SELECT SUM(sw.amount_milli) FROM salary_withdrawals sw
-                          WHERE sw.employee_id=employee.id
-                            AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?1),0)
-                ,COALESCE((SELECT SUM(sd.amount_milli) FROM salary_deductions sd
-                          WHERE sd.employee_id=employee.id
-                            AND strftime('%Y-%m',sd.deducted_at,'+2 hours')=?1),0)
+                COALESCE(withdrawal_totals.total,0),COALESCE(deduction_totals.total,0)
          FROM payroll_employees employee
+         LEFT JOIN withdrawal_totals ON withdrawal_totals.employee_id=employee.id
+         LEFT JOIN deduction_totals ON deduction_totals.employee_id=employee.id
          WHERE employee.is_active=1
          ORDER BY employee.full_name,employee.id",
         )
         .map_err(ApiError::internal)?;
     let rows = statement
-        .query_map([month.clone()], |row| {
+        .query_map(params![month.clone(), month_start, month_end], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -3960,6 +4401,7 @@ struct SalaryWithdrawalInput {
     amount: String,
     withdrawn_at: String,
     notes: Option<String>,
+    client_request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3970,6 +4412,7 @@ struct SalaryDeductionInput {
     deducted_at: Option<String>,
     month: Option<String>,
     notes: Option<String>,
+    client_request_id: Option<String>,
 }
 
 fn deduction_time(input: &SalaryDeductionInput) -> Result<(String, String), ApiError> {
@@ -4005,22 +4448,26 @@ async fn list_salary_deductions(
         Some(date) => date.format("%Y-%m").to_string(),
         None => parse_payroll_month(query.get("month"))?,
     };
-    let (from, to) = date_range(&query)?;
-    let filter_by_date = if selected_date.is_some() { 1 } else { 0 };
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let (from, to) = match selected_date {
+        Some(_) => date_range(&query)?,
+        None => business_month_range_from_key(&month)?,
+    };
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["salary-deductions", &month, &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut statement = db.conn.prepare(
         "SELECT sd.id,sd.amount_milli,sd.deducted_at,sd.notes,employee.id,employee.full_name,creator.full_name,sd.created_at,sd.updated_at
          FROM salary_deductions sd
          JOIN payroll_employees employee ON employee.id=sd.employee_id
          JOIN users creator ON creator.id=sd.created_by
-         WHERE (?1=0 AND strftime('%Y-%m',sd.deducted_at,'+2 hours')=?2)
-            OR (?1=1 AND sd.deducted_at BETWEEN ?3 AND ?4)
-         ORDER BY sd.deducted_at DESC,sd.created_at DESC"
+         WHERE sd.deducted_at BETWEEN ?1 AND ?2
+               AND (sd.deducted_at<?3 OR (sd.deducted_at=?3 AND sd.id<?4))
+         ORDER BY sd.deducted_at DESC,sd.id DESC
+         LIMIT ?5"
     ).map_err(ApiError::internal)?;
-    let rows = statement.query_map(params![filter_by_date,month,from,to], |row| Ok(json!({
+    let rows = statement.query_map(params![from,to,cursor_timestamp,cursor_id,limit+1], |row| Ok(json!({
         "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"deductedAt":row.get::<_,String>(2)?,
         "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
         "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
@@ -4029,7 +4476,10 @@ async fn list_salary_deductions(
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["deductedAt"])?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn create_salary_deduction(
@@ -4049,14 +4499,20 @@ async fn create_salary_deduction(
     }
     let amount = parse_milli(&input.amount)?;
     let (month, deducted_at) = deduction_time(&input)?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
+    let request_id = operation_request_id(input.client_request_id)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    if let Some(response) = replay_operation(
+        &db.conn,
+        &principal.id,
+        "salary_deduction.create",
+        request_id.as_deref(),
+    )? {
+        return Ok(ok(response));
+    }
     let employee_name: String = db
         .conn
         .query_row(
@@ -4084,10 +4540,16 @@ async fn create_salary_deduction(
         "تم تسجيل خصم موظف",
         Some(&json!({"employeeId":employee_id,"amountMilli":amount,"month":month})),
     )?;
+    let response = json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp});
+    record_operation(
+        &tx,
+        &principal.id,
+        "salary_deduction.create",
+        request_id.as_deref(),
+        &response,
+    )?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(
-        json!({"id":id,"amountMilli":amount,"month":month,"deductedAt":deducted_at,"notes":notes,"employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp}),
-    ))
+    Ok(ok(response))
 }
 
 async fn update_salary_deduction(
@@ -4108,10 +4570,7 @@ async fn update_salary_deduction(
     }
     let amount = parse_milli(&input.amount)?;
     let (month, deducted_at) = deduction_time(&input)?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let mut db = state
         .db
         .lock()
@@ -4211,16 +4670,20 @@ async fn list_salary_withdrawals(
         Some(date) => date.format("%Y-%m").to_string(),
         None => parse_payroll_month(query.get("month"))?,
     };
-    let (from, to) = date_range(&query)?;
-    let filter_by_date = if selected_date.is_some() { 1 } else { 0 };
+    let (from, to) = match selected_date {
+        Some(_) => date_range(&query)?,
+        None => business_month_range_from_key(&month)?,
+    };
     let employee_filter = query
         .get("employeeId")
         .map(|value| value.trim())
         .filter(|value| !value.is_empty());
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let employee_scope = employee_filter.unwrap_or("");
+    let scope = cursor_scope(&["salary-withdrawals", &month, &from, &to, employee_scope]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut items = Vec::new();
     if let Some(employee_id) = employee_filter {
         let mut statement = db.conn.prepare(
@@ -4228,12 +4691,12 @@ async fn list_salary_withdrawals(
              FROM salary_withdrawals sw
              JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
-             WHERE ((?1=0 AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?2)
-                    OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4))
-               AND sw.employee_id=?5
-             ORDER BY sw.withdrawn_at DESC,sw.created_at DESC",
+             WHERE sw.withdrawn_at BETWEEN ?1 AND ?2 AND sw.employee_id=?3
+                   AND (sw.withdrawn_at<?4 OR (sw.withdrawn_at=?4 AND sw.id<?5))
+             ORDER BY sw.withdrawn_at DESC,sw.id DESC
+             LIMIT ?6",
         ).map_err(ApiError::internal)?;
-        let rows = statement.query_map(params![filter_by_date,month,from,to,employee_id], |row| Ok(json!({
+        let rows = statement.query_map(params![from,to,employee_id,cursor_timestamp,cursor_id,limit+1], |row| Ok(json!({
             "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"withdrawnAt":row.get::<_,String>(2)?,
             "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
             "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
@@ -4247,11 +4710,12 @@ async fn list_salary_withdrawals(
              FROM salary_withdrawals sw
              JOIN payroll_employees employee ON employee.id=sw.employee_id
              JOIN users creator ON creator.id=sw.created_by
-             WHERE (?1=0 AND strftime('%Y-%m',sw.withdrawn_at,'+2 hours')=?2)
-                OR (?1=1 AND sw.withdrawn_at BETWEEN ?3 AND ?4)
-             ORDER BY sw.withdrawn_at DESC,sw.created_at DESC",
+             WHERE sw.withdrawn_at BETWEEN ?1 AND ?2
+                   AND (sw.withdrawn_at<?3 OR (sw.withdrawn_at=?3 AND sw.id<?4))
+             ORDER BY sw.withdrawn_at DESC,sw.id DESC
+             LIMIT ?5",
         ).map_err(ApiError::internal)?;
-        let rows = statement.query_map(params![filter_by_date,month,from,to], |row| Ok(json!({
+        let rows = statement.query_map(params![from,to,cursor_timestamp,cursor_id,limit+1], |row| Ok(json!({
             "id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"withdrawnAt":row.get::<_,String>(2)?,
             "notes":row.get::<_,Option<String>>(3)?,"employee":{"id":row.get::<_,String>(4)?,"fullName":row.get::<_,String>(5)?},
             "recordedBy":row.get::<_,String>(6)?,"createdAt":row.get::<_,String>(7)?,"updatedAt":row.get::<_,String>(8)?
@@ -4260,7 +4724,10 @@ async fn list_salary_withdrawals(
             items.push(row.map_err(ApiError::internal)?);
         }
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["withdrawnAt"])?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn create_salary_withdrawal(
@@ -4280,14 +4747,20 @@ async fn create_salary_withdrawal(
     }
     let amount = parse_milli(&input.amount)?;
     let withdrawn_at = withdrawal_time(&input.withdrawn_at)?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
+    let request_id = operation_request_id(input.client_request_id)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    if let Some(response) = replay_operation(
+        &db.conn,
+        &principal.id,
+        "salary_withdrawal.create",
+        request_id.as_deref(),
+    )? {
+        return Ok(ok(response));
+    }
     let employee_name: String = db
         .conn
         .query_row(
@@ -4315,11 +4788,19 @@ async fn create_salary_withdrawal(
         "تم تسجيل مسحوب موظف",
         Some(&json!({"employeeId":employee_id,"amountMilli":amount})),
     )?;
-    tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(json!({
+    let response = json!({
         "id":id,"amountMilli":amount,"withdrawnAt":withdrawn_at,"notes":notes,
         "employee":{"id":employee_id,"fullName":employee_name},"recordedBy":principal.full_name,"createdAt":timestamp,"updatedAt":timestamp
-    })))
+    });
+    record_operation(
+        &tx,
+        &principal.id,
+        "salary_withdrawal.create",
+        request_id.as_deref(),
+        &response,
+    )?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(ok(response))
 }
 
 async fn update_salary_withdrawal(
@@ -4340,10 +4821,7 @@ async fn update_salary_withdrawal(
     }
     let amount = parse_milli(&input.amount)?;
     let withdrawn_at = withdrawal_time(&input.withdrawn_at)?;
-    let notes = input
-        .notes
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let mut db = state
         .db
         .lock()
@@ -4436,17 +4914,21 @@ async fn list_showroom_payments(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["showroom-payments", &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT sp.id,sp.amount_milli,sp.paid_at,sp.notes,s.id,s.name,u.full_name FROM showroom_payments sp JOIN showrooms s ON s.id=sp.showroom_id JOIN users u ON u.id=sp.created_by WHERE sp.paid_at BETWEEN ?1 AND ?2 ORDER BY sp.paid_at DESC").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"paidAt":row.get::<_,String>(2)?,"notes":row.get::<_,Option<String>>(3)?,"showroom":{"id":row.get::<_,String>(4)?,"name":row.get::<_,String>(5)?},"recordedBy":row.get::<_,String>(6)?}))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT sp.id,sp.amount_milli,sp.paid_at,sp.notes,s.id,s.name,u.full_name FROM showroom_payments sp JOIN showrooms s ON s.id=sp.showroom_id JOIN users u ON u.id=sp.created_by WHERE sp.paid_at BETWEEN ?1 AND ?2 AND (sp.paid_at<?3 OR (sp.paid_at=?3 AND sp.id<?4)) ORDER BY sp.paid_at DESC,sp.id DESC LIMIT ?5").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![from,to,cursor_timestamp,cursor_id,limit+1],|row|Ok(json!({"id":row.get::<_,String>(0)?,"amountMilli":row.get::<_,i64>(1)?,"paidAt":row.get::<_,String>(2)?,"notes":row.get::<_,Option<String>>(3)?,"showroom":{"id":row.get::<_,String>(4)?,"name":row.get::<_,String>(5)?},"recordedBy":row.get::<_,String>(6)?}))).map_err(ApiError::internal)?;
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["paidAt"])?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn create_showroom_payment(
@@ -4469,10 +4951,20 @@ async fn create_showroom_payment(
         .to_owned();
     let amount = parse_milli(&input.amount)?;
     let paid_at = payment_time(&input.paid_at)?;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
+    let request_id = operation_request_id(input.client_request_id)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    if let Some(response) = replay_operation(
+        &db.conn,
+        &principal.id,
+        "showroom_payment.create",
+        request_id.as_deref(),
+    )? {
+        return Ok(ok(response));
+    }
     let exists: Option<String> = db
         .conn
         .query_row(
@@ -4487,7 +4979,7 @@ async fn create_showroom_payment(
     }
     let id = new_id();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
-    tx.execute("INSERT INTO showroom_payments(id,showroom_id,amount_milli,paid_at,notes,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,showroom_id,amount,paid_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),principal.id,now()]).map_err(ApiError::internal)?;
+    tx.execute("INSERT INTO showroom_payments(id,showroom_id,amount_milli,paid_at,notes,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,showroom_id,amount,paid_at,notes,principal.id,now()]).map_err(ApiError::internal)?;
     add_financial_transaction(
         &tx,
         "showroom_payment",
@@ -4514,8 +5006,16 @@ async fn create_showroom_payment(
         "تم تسجيل دفعة معرض",
         Some(&json!({"showroomId":showroom_id})),
     )?;
+    let response = showroom_payment_item_by_id(&tx, &id)?;
+    record_operation(
+        &tx,
+        &principal.id,
+        "showroom_payment.create",
+        request_id.as_deref(),
+        &response,
+    )?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(showroom_payment_item_by_id(&db.conn, &id)?))
+    Ok(ok(response))
 }
 
 #[derive(Deserialize)]
@@ -4529,6 +5029,7 @@ struct ExpenseInput {
     notes: Option<String>,
     allocation_type: String,
     business_bps: Option<i64>,
+    client_request_id: Option<String>,
 }
 
 async fn list_expenses(
@@ -4543,17 +5044,21 @@ async fn list_expenses(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = history_limit(&query);
+    let scope = cursor_scope(&["expenses", &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let db = state.read_db()?;
     let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT e.id,e.description,e.category,e.payment_method,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_bps,e.workers_bps,e.business_amount_milli,e.workers_amount_milli,u.full_name FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.occurred_at BETWEEN ?1 AND ?2 ORDER BY e.occurred_at DESC").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"paymentMethod":row.get::<_,String>(3)?,"amountMilli":row.get::<_,i64>(4)?,"occurredAt":row.get::<_,String>(5)?,"notes":row.get::<_,Option<String>>(6)?,"allocationType":row.get::<_,String>(7)?,"businessBps":row.get::<_,i64>(8)?,"workersBps":row.get::<_,i64>(9)?,"businessAmountMilli":row.get::<_,i64>(10)?,"workersAmountMilli":row.get::<_,i64>(11)?,"recordedBy":row.get::<_,String>(12)?}))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT e.id,e.description,e.category,e.payment_method,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_bps,e.workers_bps,e.business_amount_milli,e.workers_amount_milli,u.full_name FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (e.occurred_at<?3 OR (e.occurred_at=?3 AND e.id<?4)) ORDER BY e.occurred_at DESC,e.id DESC LIMIT ?5").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![from,to,cursor_timestamp,cursor_id,limit+1],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"paymentMethod":row.get::<_,String>(3)?,"amountMilli":row.get::<_,i64>(4)?,"occurredAt":row.get::<_,String>(5)?,"notes":row.get::<_,Option<String>>(6)?,"allocationType":row.get::<_,String>(7)?,"businessBps":row.get::<_,i64>(8)?,"workersBps":row.get::<_,i64>(9)?,"businessAmountMilli":row.get::<_,i64>(10)?,"workersAmountMilli":row.get::<_,i64>(11)?,"recordedBy":row.get::<_,String>(12)?}))).map_err(ApiError::internal)?;
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["occurredAt"])?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn create_expense(
@@ -4591,10 +5096,20 @@ async fn create_expense(
     };
     let business_amount = round_percentage(amount, business_bps);
     let workers_amount = amount - business_amount;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
+    let request_id = operation_request_id(input.client_request_id)?;
     let mut db = state
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    if let Some(response) = replay_operation(
+        &db.conn,
+        &principal.id,
+        "expense.create",
+        request_id.as_deref(),
+    )? {
+        return Ok(ok(response));
+    }
     let workers: Vec<String> = if workers_amount > 0 {
         let mut statement = db
             .conn
@@ -4614,7 +5129,7 @@ async fn create_expense(
     }
     let id = new_id();
     let tx = db.conn.transaction().map_err(ApiError::internal)?;
-    tx.execute("INSERT INTO expenses(id,description,category,payment_method,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![id,description,category,payment_method,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,principal.id,now()]).map_err(ApiError::internal)?;
+    tx.execute("INSERT INTO expenses(id,description,category,payment_method,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![id,description,category,payment_method,amount,occurred_at,notes,input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,principal.id,now()]).map_err(ApiError::internal)?;
     if workers_amount > 0 {
         let each = workers_amount / workers.len() as i64;
         let remainder = workers_amount % workers.len() as i64;
@@ -4657,10 +5172,16 @@ async fn create_expense(
             Some(&json!({"workerCount":workers.len(),"workersAmountMilli":workers_amount})),
         )?;
     }
+    let response = json!({"id":id,"businessAmountMilli":business_amount,"workersAmountMilli":workers_amount,"workerCount":workers.len()});
+    record_operation(
+        &tx,
+        &principal.id,
+        "expense.create",
+        request_id.as_deref(),
+        &response,
+    )?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(ok(
-        json!({"id":id,"businessAmountMilli":business_amount,"workersAmountMilli":workers_amount,"workerCount":workers.len()}),
-    ))
+    Ok(ok(response))
 }
 
 async fn expense_detail(
@@ -4674,10 +5195,7 @@ async fn expense_detail(
         "section.finance.access",
         "financial.manage",
     )?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let expense = db.conn.query_row("SELECT e.id,e.description,e.category,e.payment_method,e.amount_milli,e.occurred_at,e.notes,e.allocation_type,e.business_amount_milli,e.workers_amount_milli,u.full_name,e.created_at FROM expenses e JOIN users u ON u.id=e.created_by WHERE e.id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"description":row.get::<_,String>(1)?,"category":row.get::<_,String>(2)?,"paymentMethod":row.get::<_,String>(3)?,"amountMilli":row.get::<_,i64>(4)?,"occurredAt":row.get::<_,String>(5)?,"notes":row.get::<_,Option<String>>(6)?,"allocationType":row.get::<_,String>(7)?,"businessAmountMilli":row.get::<_,i64>(8)?,"workersAmountMilli":row.get::<_,i64>(9)?,"recordedBy":row.get::<_,String>(10)?,"createdAt":row.get::<_,String>(11)?}))).optional().map_err(ApiError::internal)?.ok_or_else(ApiError::not_found)?;
     let mut allocations = Vec::new();
     let mut statement=db.conn.prepare("SELECT ea.worker_id,w.full_name,ea.amount_milli,ea.created_at FROM expense_allocations ea JOIN workers w ON w.id=ea.worker_id WHERE ea.expense_id=?1 ORDER BY ea.allocation_order").map_err(ApiError::internal)?;
@@ -4715,6 +5233,7 @@ async fn update_expense(
     };
     let business_amount = round_percentage(amount, business_bps);
     let workers_amount = amount - business_amount;
+    let notes = trim_optional(input.notes, 500, "الملاحظة طويلة جدًا")?;
     let mut db = state
         .db
         .lock()
@@ -4769,7 +5288,7 @@ async fn update_expense(
             tx.execute("INSERT INTO expense_allocations(id,expense_id,worker_id,amount_milli,allocation_order,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![new_id(),id,worker_id,share,order as i64,now()]).map_err(ApiError::internal)?;
         }
     }
-    tx.execute("UPDATE expenses SET description=?1,category=?2,payment_method=?3,amount_milli=?4,occurred_at=?5,notes=?6,allocation_type=?7,business_bps=?8,workers_bps=?9,business_amount_milli=?10,workers_amount_milli=?11 WHERE id=?12",params![description,category,payment_method,amount,occurred_at,input.notes.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty()),input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,id]).map_err(ApiError::internal)?;
+    tx.execute("UPDATE expenses SET description=?1,category=?2,payment_method=?3,amount_milli=?4,occurred_at=?5,notes=?6,allocation_type=?7,business_bps=?8,workers_bps=?9,business_amount_milli=?10,workers_amount_milli=?11 WHERE id=?12",params![description,category,payment_method,amount,occurred_at,notes,input.allocation_type,business_bps,workers_bps,business_amount,workers_amount,id]).map_err(ApiError::internal)?;
     add_financial_transaction(
         &tx,
         "expense_edit_post",
@@ -4879,31 +5398,120 @@ async fn delete_expense(
     Ok(ok(json!({"deleted":true})))
 }
 
+#[derive(Default)]
+struct FinancialTotals {
+    revenue: i64,
+    cash: i64,
+    paid_customer_revenue: i64,
+    showroom_revenue: i64,
+    showroom_commissions: i64,
+    commissions: i64,
+    business_share: i64,
+    paid_cars_profit: i64,
+    expenses: i64,
+    business_expenses: i64,
+    workers_expenses: i64,
+    worker_withdrawals: i64,
+    showroom_payments: i64,
+    worker_deductions: i64,
+}
+
+fn financial_summary_value(totals: &FinancialTotals) -> Value {
+    let outstanding_worker = (totals.commissions - totals.worker_deductions).max(0);
+    let outstanding_showroom = totals.showroom_revenue - totals.showroom_payments;
+    json!({
+        "totalWashRevenueMilli": totals.revenue,
+        "cashRevenueMilli": totals.cash,
+        "paidCustomerRevenueMilli": totals.paid_customer_revenue,
+        "paidCustomerRevenueAfterDeductionsMilli": totals.paid_customer_revenue - totals.expenses - totals.worker_withdrawals,
+        "showroomRevenueMilli": totals.showroom_revenue,
+        "showroomNetProfitMilli": totals.showroom_revenue - totals.showroom_commissions,
+        "businessShareMilli": totals.business_share,
+        "paidCarsProfitMilli": totals.paid_cars_profit,
+        "workerCommissionsMilli": totals.commissions,
+        "workerDeductionsMilli": totals.worker_deductions,
+        "workerWithdrawalsMilli": totals.worker_withdrawals,
+        "outstandingWorkerBalancesMilli": outstanding_worker,
+        "expensesMilli": totals.expenses,
+        "businessExpensesMilli": totals.business_expenses,
+        "workerExpensesMilli": totals.workers_expenses,
+        "showroomPaymentsMilli": totals.showroom_payments,
+        "outstandingShowroomDebtMilli": outstanding_showroom,
+        "netProfitBeforeExpensesMilli": totals.paid_cars_profit,
+        "netProfitAfterExpensesMilli": totals.paid_cars_profit - totals.business_expenses - totals.worker_withdrawals,
+        "netBusinessProfitMilli": totals.business_share - totals.business_expenses,
+    })
+}
+
 fn financial_summary(
     conn: &Connection,
     from: &str,
     to: &str,
     owner_id: Option<&str>,
 ) -> Result<Value, ApiError> {
-    let revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let cash=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let paid_customer_revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let showroom_revenue=total_for(conn,"SELECT COALESCE(SUM(price_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let showroom_commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let commissions=total_for(conn,"SELECT COALESCE(SUM(commission_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let business_share=total_for(conn,"SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let paid_cars_profit=total_for(conn,"SELECT COALESCE(SUM(business_share_milli),0) FROM wash_operations WHERE status='posted' AND payment_type='cash' AND is_paid=1 AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let expenses = total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let business_expenses=total_for(conn,"SELECT COALESCE(SUM(business_amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let worker_withdrawals=total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM salary_withdrawals WHERE withdrawn_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let workers_expenses=total_for(conn,"SELECT COALESCE(SUM(workers_amount_milli),0) FROM expenses WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let showroom_payments=total_for(conn,"SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)",params![from,to,owner_id])?;
-    let worker_deductions=total_for(conn,"SELECT COALESCE(SUM(ea.amount_milli),0) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)",params![from,to,owner_id])?;
-    let outstanding_worker=total_for(conn,"SELECT MAX(0, COALESCE((SELECT SUM(commission_milli) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)-COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)),0))",params![from,to,owner_id])?;
-    let outstanding_showroom=total_for(conn,"SELECT COALESCE((SELECT SUM(price_milli) FROM wash_operations WHERE status='posted' AND payment_type='showroom' AND occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3))-(SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)),0)",params![from,to,owner_id])?;
-    Ok(
-        json!({"totalWashRevenueMilli":revenue,"cashRevenueMilli":cash,"paidCustomerRevenueMilli":paid_customer_revenue,"paidCustomerRevenueAfterDeductionsMilli":paid_customer_revenue-expenses-worker_withdrawals,"showroomRevenueMilli":showroom_revenue,"showroomNetProfitMilli":showroom_revenue-showroom_commissions,"businessShareMilli":business_share,"paidCarsProfitMilli":paid_cars_profit,"workerCommissionsMilli":commissions,"workerDeductionsMilli":worker_deductions,"workerWithdrawalsMilli":worker_withdrawals,"outstandingWorkerBalancesMilli":outstanding_worker,"expensesMilli":expenses,"businessExpensesMilli":business_expenses,"workerExpensesMilli":workers_expenses,"showroomPaymentsMilli":showroom_payments,"outstandingShowroomDebtMilli":outstanding_showroom,"netProfitBeforeExpensesMilli":paid_cars_profit,"netProfitAfterExpensesMilli":paid_cars_profit-business_expenses-worker_withdrawals,"netBusinessProfitMilli":business_share-business_expenses}),
-    )
+    let totals = conn
+        .query_row(
+            "WITH
+             wash AS (
+                SELECT COALESCE(SUM(price_milli),0) revenue,
+                       COALESCE(SUM(CASE WHEN payment_type='cash' THEN price_milli ELSE 0 END),0) cash,
+                       COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0) paid_customer_revenue,
+                       COALESCE(SUM(CASE WHEN payment_type='showroom' THEN price_milli ELSE 0 END),0) showroom_revenue,
+                       COALESCE(SUM(CASE WHEN payment_type='showroom' THEN commission_milli ELSE 0 END),0) showroom_commissions,
+                       COALESCE(SUM(commission_milli),0) commissions,
+                       COALESCE(SUM(business_share_milli),0) business_share,
+                       COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0) paid_cars_profit
+                FROM wash_operations
+                WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2
+                  AND (?3 IS NULL OR created_by=?3)
+             ),
+             expense AS (
+                SELECT COALESCE(SUM(amount_milli),0) expenses,
+                       COALESCE(SUM(business_amount_milli),0) business_expenses,
+                       COALESCE(SUM(workers_amount_milli),0) workers_expenses
+                FROM expenses
+                WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+             ),
+             withdrawal AS (
+                SELECT COALESCE(SUM(amount_milli),0) worker_withdrawals
+                FROM salary_withdrawals
+                WHERE withdrawn_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+             ),
+             payment AS (
+                SELECT COALESCE(SUM(amount_milli),0) showroom_payments
+                FROM showroom_payments
+                WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+             ),
+             deduction AS (
+                SELECT COALESCE(SUM(ea.amount_milli),0) worker_deductions
+                FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id
+                WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)
+             )
+             SELECT wash.revenue,wash.cash,wash.paid_customer_revenue,wash.showroom_revenue,
+                    wash.showroom_commissions,wash.commissions,wash.business_share,wash.paid_cars_profit,
+                    expense.expenses,expense.business_expenses,expense.workers_expenses,
+                    withdrawal.worker_withdrawals,payment.showroom_payments,deduction.worker_deductions
+             FROM wash,expense,withdrawal,payment,deduction",
+            params![from, to, owner_id],
+            |row| Ok(FinancialTotals {
+                revenue: row.get(0)?,
+                cash: row.get(1)?,
+                paid_customer_revenue: row.get(2)?,
+                showroom_revenue: row.get(3)?,
+                showroom_commissions: row.get(4)?,
+                commissions: row.get(5)?,
+                business_share: row.get(6)?,
+                paid_cars_profit: row.get(7)?,
+                expenses: row.get(8)?,
+                business_expenses: row.get(9)?,
+                workers_expenses: row.get(10)?,
+                worker_withdrawals: row.get(11)?,
+                showroom_payments: row.get(12)?,
+                worker_deductions: row.get(13)?,
+            }),
+        )
+        .map_err(ApiError::internal)?;
+    Ok(financial_summary_value(&totals))
 }
 
 async fn finance_overview(
@@ -4918,20 +5526,21 @@ async fn finance_overview(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    Ok(ok(financial_summary(
-        &db.conn,
-        &from,
-        &to,
-        if principal.is_manager() {
-            None
-        } else {
-            Some(&principal.id)
-        },
-    )?))
+    let result = blocking(move || {
+        let db = state.read_db()?;
+        financial_summary(
+            &db.conn,
+            &from,
+            &to,
+            if principal.is_manager() {
+                None
+            } else {
+                Some(&principal.id)
+            },
+        )
+    })
+    .await?;
+    Ok(ok(result))
 }
 
 async fn operational_report(
@@ -4946,28 +5555,71 @@ async fn operational_report(
         "operational.read",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
     let can_view_all = principal.is_manager();
     let owner_id = principal.id.clone();
-    let wash_count=total_for(&db.conn,"SELECT COUNT(*) FROM wash_operations WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR created_by=?4)",params![&from,&to,if can_view_all { 1 } else { 0 },&owner_id])?;
+    let scope = cursor_scope(&[
+        "operational-report-washes",
+        &from,
+        &to,
+        if can_view_all { "all" } else { "owner" },
+        &owner_id,
+    ]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+    let result = blocking(move || {
+    let db = state.read_db()?;
     let mut workers = Vec::new();
-    let mut statement=db.conn.prepare("SELECT worker.id,worker.full_name,COUNT(w.id) FROM workers worker LEFT JOIN wash_operations w ON w.worker_id=worker.id AND w.status='posted' AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) GROUP BY worker.id ORDER BY COUNT(w.id) DESC,worker.full_name").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![&from,&to,if can_view_all { 1 } else { 0 },&owner_id],|row|Ok(json!({"workerId":row.get::<_,String>(0)?,"workerName":row.get::<_,String>(1)?,"carsWashed":row.get::<_,i64>(2)?}))).map_err(ApiError::internal)?;
-    for row in rows {
-        workers.push(row.map_err(ApiError::internal)?);
+    let mut wash_count = 0_i64;
+    if can_view_all {
+        let mut statement = db.conn.prepare(
+            "SELECT worker.id,worker.full_name,COUNT(w.worker_id)
+             FROM workers worker
+             LEFT JOIN wash_operations w ON w.worker_id=worker.id AND w.status='posted'
+                  AND w.occurred_at BETWEEN ?1 AND ?2
+             GROUP BY worker.id
+             ORDER BY COUNT(w.worker_id) DESC,worker.full_name",
+        ).map_err(ApiError::internal)?;
+        let rows = statement.query_map(params![&from, &to], |row| Ok(json!({
+            "workerId":row.get::<_,String>(0)?,"workerName":row.get::<_,String>(1)?,"carsWashed":row.get::<_,i64>(2)?
+        }))).map_err(ApiError::internal)?;
+        for row in rows {
+            let worker = row.map_err(ApiError::internal)?;
+            wash_count += worker["carsWashed"].as_i64().unwrap_or(0);
+            workers.push(worker);
+        }
+    } else {
+        let mut statement = db.conn.prepare(
+            "SELECT worker.id,worker.full_name,COUNT(w.worker_id)
+             FROM workers worker
+             LEFT JOIN wash_operations w ON w.worker_id=worker.id AND w.status='posted'
+                  AND w.occurred_at BETWEEN ?1 AND ?2 AND w.created_by=?3
+             GROUP BY worker.id
+             ORDER BY COUNT(w.worker_id) DESC,worker.full_name",
+        ).map_err(ApiError::internal)?;
+        let rows = statement.query_map(params![&from, &to, &owner_id], |row| Ok(json!({
+            "workerId":row.get::<_,String>(0)?,"workerName":row.get::<_,String>(1)?,"carsWashed":row.get::<_,i64>(2)?
+        }))).map_err(ApiError::internal)?;
+        for row in rows {
+            let worker = row.map_err(ApiError::internal)?;
+            wash_count += worker["carsWashed"].as_i64().unwrap_or(0);
+            workers.push(worker);
+        }
     }
     let mut washes = Vec::new();
-    let mut history=db.conn.prepare("SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.occurred_at,w.payment_type,w.status,worker.id,worker.full_name,showroom.id,showroom.name FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id WHERE w.status='posted' AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) ORDER BY w.occurred_at DESC LIMIT 300").map_err(ApiError::internal)?;
-    let rows=history.query_map(params![&from,&to,if can_view_all { 1 } else { 0 },&owner_id],|row|Ok(json!({"id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,"manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,"occurredAt":row.get::<_,String>(5)?,"paymentType":row.get::<_,String>(6)?,"status":row.get::<_,String>(7)?,"worker":{"id":row.get::<_,String>(8)?,"fullName":row.get::<_,String>(9)?},"showroom":row.get::<_,Option<String>>(10)?.map(|id|json!({"id":id,"name":row.get::<_,Option<String>>(11).ok().flatten()}))}))).map_err(ApiError::internal)?;
+    let mut history=db.conn.prepare("SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.occurred_at,w.payment_type,w.status,worker.id,worker.full_name,showroom.id,showroom.name FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id LEFT JOIN showrooms showroom ON showroom.id=w.showroom_id WHERE w.status='posted' AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) AND (w.occurred_at<?5 OR (w.occurred_at=?5 AND w.id<?6)) ORDER BY w.occurred_at DESC,w.id DESC LIMIT ?7").map_err(ApiError::internal)?;
+    let rows=history.query_map(params![&from,&to,if can_view_all { 1 } else { 0 },&owner_id,cursor_timestamp,cursor_id,limit+1],|row|Ok(json!({"id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,"vehicleModel":row.get::<_,String>(2)?,"manufactureYear":row.get::<_,Option<i32>>(3)?,"licensePlate":row.get::<_,Option<String>>(4)?,"occurredAt":row.get::<_,String>(5)?,"paymentType":row.get::<_,String>(6)?,"status":row.get::<_,String>(7)?,"worker":{"id":row.get::<_,String>(8)?,"fullName":row.get::<_,String>(9)?},"showroom":row.get::<_,Option<String>>(10)?.map(|id|json!({"id":id,"name":row.get::<_,Option<String>>(11).ok().flatten()}))}))).map_err(ApiError::internal)?;
     for row in rows {
         washes.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(
-        json!({"from":from,"to":to,"carsWashed":wash_count,"workerPerformance":workers,"washes":washes}),
-    ))
+    let (has_more,next_cursor)=finish_cursor_page(&mut washes,limit,&scope,&["occurredAt"])?;
+    Ok(json!({"from":from,"to":to,"carsWashed":wash_count,"workerPerformance":workers,"washes":washes,"washesHasMore":has_more,"washesNextCursor":next_cursor}))
+    }).await?;
+    Ok(ok(result))
 }
 
 async fn financial_report(
@@ -4982,31 +5634,127 @@ async fn financial_report(
         "financial.manage",
     )?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let summary = financial_summary(
-        &db.conn,
-        &from,
-        &to,
-        if principal.is_manager() {
-            None
-        } else {
-            Some(&principal.id)
-        },
-    )?;
+    let result = blocking(move || {
+    let db = state.read_db()?;
     let mut workers = Vec::new();
-    let can_view_all = principal.is_manager();
-    let owner_id = principal.id.clone();
-    let mut statement=db.conn.prepare("SELECT worker.id,worker.full_name,COUNT(w.id),COALESCE(SUM(w.price_milli),0),COALESCE(SUM(w.commission_milli),0),COALESCE((SELECT SUM(ea.amount_milli) FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id WHERE ea.worker_id=worker.id AND e.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR e.created_by=?4)),0) FROM workers worker LEFT JOIN wash_operations w ON w.worker_id=worker.id AND w.status='posted' AND w.occurred_at BETWEEN ?1 AND ?2 AND (?3=1 OR w.created_by=?4) GROUP BY worker.id ORDER BY worker.full_name").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![from,to,if can_view_all { 1 } else { 0 },owner_id],|row|{let commission:i64=row.get(4)?;let deductions:i64=row.get(5)?;Ok(json!({"workerId":row.get::<_,String>(0)?,"workerName":row.get::<_,String>(1)?,"carsWashed":row.get::<_,i64>(2)?,"revenueMilli":row.get::<_,i64>(3)?,"commissionMilli":commission,"deductionsMilli":deductions,"remainingMilli":(commission-deductions).max(0)}))}).map_err(ApiError::internal)?;
+    let owner_id = if principal.is_manager() { None } else { Some(principal.id.as_str()) };
+    let mut statement = db.conn.prepare(
+        "WITH
+         deduction_by_worker AS (
+            SELECT ea.worker_id,COALESCE(SUM(ea.amount_milli),0) deductions_milli
+            FROM expense_allocations ea JOIN expenses e ON e.id=ea.expense_id
+            WHERE e.occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR e.created_by=?3)
+            GROUP BY ea.worker_id
+         ),
+         wash_by_worker AS (
+            SELECT worker_id,COUNT(*) cars_washed,
+                   COALESCE(SUM(price_milli),0) revenue_milli,
+                   COALESCE(SUM(commission_milli),0) commission_milli,
+                   COALESCE(SUM(CASE WHEN payment_type='cash' THEN price_milli ELSE 0 END),0) cash_milli,
+                   COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0) paid_customer_revenue_milli,
+                   COALESCE(SUM(CASE WHEN payment_type='showroom' THEN price_milli ELSE 0 END),0) showroom_revenue_milli,
+                   COALESCE(SUM(CASE WHEN payment_type='showroom' THEN commission_milli ELSE 0 END),0) showroom_commissions_milli,
+                   COALESCE(SUM(business_share_milli),0) business_share_milli,
+                   COALESCE(SUM(CASE WHEN payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0) paid_cars_profit_milli
+            FROM wash_operations
+            WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2
+                  AND (?3 IS NULL OR created_by=?3)
+            GROUP BY worker_id
+         ),
+         worker_rows AS (
+            SELECT worker.id worker_id,worker.full_name worker_name,
+                   COALESCE(wash_by_worker.cars_washed,0) cars_washed,
+                   COALESCE(wash_by_worker.revenue_milli,0) revenue_milli,
+                   COALESCE(wash_by_worker.commission_milli,0) commission_milli,
+                   COALESCE(deduction_by_worker.deductions_milli,0) deductions_milli,
+                   COALESCE(wash_by_worker.cash_milli,0) cash_milli,
+                   COALESCE(wash_by_worker.paid_customer_revenue_milli,0) paid_customer_revenue_milli,
+                   COALESCE(wash_by_worker.showroom_revenue_milli,0) showroom_revenue_milli,
+                   COALESCE(wash_by_worker.showroom_commissions_milli,0) showroom_commissions_milli,
+                   COALESCE(wash_by_worker.business_share_milli,0) business_share_milli,
+                   COALESCE(wash_by_worker.paid_cars_profit_milli,0) paid_cars_profit_milli
+            FROM workers worker
+            LEFT JOIN wash_by_worker ON wash_by_worker.worker_id=worker.id
+            LEFT JOIN deduction_by_worker ON deduction_by_worker.worker_id=worker.id
+         ),
+         report_totals AS (
+            SELECT COALESCE(SUM(revenue_milli),0) revenue,
+                   COALESCE(SUM(cash_milli),0) cash,
+                   COALESCE(SUM(paid_customer_revenue_milli),0) paid_customer_revenue,
+                   COALESCE(SUM(showroom_revenue_milli),0) showroom_revenue,
+                   COALESCE(SUM(showroom_commissions_milli),0) showroom_commissions,
+                   COALESCE(SUM(commission_milli),0) commissions,
+                   COALESCE(SUM(business_share_milli),0) business_share,
+                   COALESCE(SUM(paid_cars_profit_milli),0) paid_cars_profit,
+                   COALESCE(SUM(deductions_milli),0) worker_deductions
+            FROM worker_rows
+         ),
+         expense AS (
+            SELECT COALESCE(SUM(amount_milli),0) expenses,
+                   COALESCE(SUM(business_amount_milli),0) business_expenses,
+                   COALESCE(SUM(workers_amount_milli),0) workers_expenses
+            FROM expenses
+            WHERE occurred_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+         ),
+         withdrawal AS (
+            SELECT COALESCE(SUM(amount_milli),0) worker_withdrawals
+            FROM salary_withdrawals
+            WHERE withdrawn_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+         ),
+         payment AS (
+            SELECT COALESCE(SUM(amount_milli),0) showroom_payments
+            FROM showroom_payments
+            WHERE paid_at BETWEEN ?1 AND ?2 AND (?3 IS NULL OR created_by=?3)
+         )
+         SELECT worker_rows.worker_id,worker_rows.worker_name,worker_rows.cars_washed,
+                worker_rows.revenue_milli,worker_rows.commission_milli,worker_rows.deductions_milli,
+                report_totals.revenue,report_totals.cash,report_totals.paid_customer_revenue,
+                report_totals.showroom_revenue,report_totals.showroom_commissions,
+                report_totals.commissions,report_totals.business_share,report_totals.paid_cars_profit,
+                expense.expenses,expense.business_expenses,expense.workers_expenses,
+                withdrawal.worker_withdrawals,payment.showroom_payments,report_totals.worker_deductions
+         FROM (SELECT 1) anchor
+         LEFT JOIN worker_rows ON 1=1
+         CROSS JOIN report_totals CROSS JOIN expense CROSS JOIN withdrawal CROSS JOIN payment
+         ORDER BY worker_rows.worker_name",
+    ).map_err(ApiError::internal)?;
+    let rows = statement.query_map(params![&from, &to, owner_id], |row| {
+        let worker_id = row.get::<_, Option<String>>(0)?;
+        let worker_name = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        let cars_washed = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+        let revenue_milli = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+        let commission = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+        let deductions = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+        let worker = worker_id.map(|id| json!({
+            "workerId": id,
+            "workerName": worker_name,
+            "carsWashed": cars_washed,
+            "revenueMilli": revenue_milli,
+            "commissionMilli": commission,
+            "deductionsMilli": deductions,
+            "remainingMilli": (commission-deductions).max(0)
+        }));
+        let totals = FinancialTotals {
+            revenue: row.get(6)?, cash: row.get(7)?, paid_customer_revenue: row.get(8)?,
+            showroom_revenue: row.get(9)?, showroom_commissions: row.get(10)?,
+            commissions: row.get(11)?, business_share: row.get(12)?, paid_cars_profit: row.get(13)?,
+            expenses: row.get(14)?, business_expenses: row.get(15)?, workers_expenses: row.get(16)?,
+            worker_withdrawals: row.get(17)?, showroom_payments: row.get(18)?, worker_deductions: row.get(19)?,
+        };
+        Ok((worker, totals))
+    }).map_err(ApiError::internal)?;
+    let mut totals = None;
     for row in rows {
-        workers.push(row.map_err(ApiError::internal)?);
+        let (worker, row_totals) = row.map_err(ApiError::internal)?;
+        totals.get_or_insert(row_totals);
+        if let Some(worker) = worker {
+            workers.push(worker);
+        }
     }
-    Ok(ok(
-        json!({"from":from,"to":to,"summary":summary,"workerPerformance":workers}),
-    ))
+    let summary = financial_summary_value(&totals.unwrap_or_default());
+    Ok(json!({"from":from,"to":to,"summary":summary,"workerPerformance":workers}))
+    }).await?;
+    Ok(ok(result))
 }
 
 async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
@@ -5016,10 +5764,7 @@ async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiR
         "section.settings.access",
         "settings.manage",
     )?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let mut values = serde_json::Map::new();
     let mut statement = db
         .conn
@@ -5159,18 +5904,54 @@ fn role_id_for(conn: &Connection, role_code: &str) -> Result<String, ApiError> {
 async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let _principal =
         authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let mut items = Vec::new();
     let mut statement=db.conn.prepare("SELECT u.id,u.full_name,u.username_norm,u.is_active,u.created_at,r.code,r.name_ar,COALESCE(p.theme,'light') FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id LEFT JOIN user_preferences p ON p.user_id=u.id WHERE u.deleted_at IS NULL ORDER BY u.created_at").map_err(ApiError::internal)?;
     let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,json!({"id":row.get::<_,String>(0)?,"fullName":row.get::<_,String>(1)?,"username":row.get::<_,String>(2)?,"isActive":row.get::<_,i64>(3)?==1,"createdAt":row.get::<_,String>(4)?,"roleCode":row.get::<_,String>(5)?,"roleName":row.get::<_,String>(6)?,"theme":row.get::<_,String>(7)?})))).map_err(ApiError::internal)?;
     for row in rows {
-        let (user_id, mut item) = row.map_err(ApiError::internal)?;
-        item["permissions"] = json!(permission_codes_for_user(&db.conn, &user_id)?);
-        items.push(item);
+        items.push(row.map_err(ApiError::internal)?);
     }
+    drop(statement);
+    let mut permissions_by_user: HashMap<String, Vec<String>> = HashMap::new();
+    let mut permission_statement = db
+        .conn
+        .prepare(
+            "SELECT DISTINCT user_id,code FROM (
+             SELECT role.user_id user_id,permission.code code
+             FROM user_roles role
+             JOIN users user ON user.id=role.user_id AND user.deleted_at IS NULL
+             LEFT JOIN user_permission_profiles profile ON profile.user_id=role.user_id
+             JOIN role_permissions role_permission ON role_permission.role_id=role.role_id
+             JOIN permissions permission ON permission.id=role_permission.permission_id
+             WHERE profile.user_id IS NULL
+             UNION ALL
+             SELECT user_permission.user_id,permission.code
+             FROM user_permissions user_permission
+             JOIN users user ON user.id=user_permission.user_id AND user.deleted_at IS NULL
+             JOIN permissions permission ON permission.id=user_permission.permission_id
+         )
+         ORDER BY user_id,code",
+        )
+        .map_err(ApiError::internal)?;
+    let permission_rows = permission_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(ApiError::internal)?;
+    for row in permission_rows {
+        let (user_id, permission) = row.map_err(ApiError::internal)?;
+        permissions_by_user
+            .entry(user_id)
+            .or_default()
+            .push(permission);
+    }
+    let items = items
+        .into_iter()
+        .map(|(user_id, mut item)| {
+            item["permissions"] = json!(permissions_by_user.remove(&user_id).unwrap_or_default());
+            item
+        })
+        .collect::<Vec<_>>();
     Ok(ok(json!({"items":items})))
 }
 
@@ -5186,7 +5967,7 @@ async fn create_user(
     let full_name = trim_required(&input.full_name, "الاسم الكامل")?;
     let username = normalized_username(&input.username)?;
     valid_password(&input.password)?;
-    let hash = hash_password(&input.password)?;
+    let hash = hash_password_blocking(input.password.clone()).await?;
     let mut db = state
         .db
         .lock()
@@ -5234,6 +6015,26 @@ async fn update_user(
     {
         return Err(ApiError::bad("لا يمكنك خفض دور حسابك الحالي"));
     }
+    // Normalize and hash request data before entering the writer critical section. In particular,
+    // Argon2 is intentionally expensive and must not serialize unrelated financial writes.
+    let full_name = match input.full_name.as_deref() {
+        Some(value) => Some(trim_required(value, "الاسم الكامل")?),
+        None => None,
+    };
+    let username = match input.username.as_deref() {
+        Some(value) => Some(normalized_username(value)?),
+        None => None,
+    };
+    let password_hash = match input.password.as_deref() {
+        Some(value) => {
+            valid_password(value)?;
+            Some(hash_password_blocking(value.to_owned()).await?)
+        }
+        None => None,
+    };
+    let password_changed = password_hash.is_some();
+    let revoke_sessions =
+        password_changed || input.role_code.is_some() || input.is_active == Some(false);
     let mut db = state
         .db
         .lock()
@@ -5260,21 +6061,6 @@ async fn update_user(
     {
         return Err(ApiError::forbidden());
     }
-    let full_name = match input.full_name {
-        Some(value) => Some(trim_required(&value, "الاسم الكامل")?),
-        None => None,
-    };
-    let username = match input.username {
-        Some(value) => Some(normalized_username(&value)?),
-        None => None,
-    };
-    let password_hash = match input.password {
-        Some(value) => {
-            valid_password(&value)?;
-            Some(hash_password(&value)?)
-        }
-        None => None,
-    };
     let role_id = match input.role_code.as_deref() {
         Some(code) => Some(role_id_for(&db.conn, code)?),
         None => None,
@@ -5322,6 +6108,13 @@ async fn update_user(
         )
         .map_err(ApiError::internal)?;
     }
+    if revoke_sessions {
+        tx.execute(
+            "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL",
+            params![now(), id],
+        )
+        .map_err(ApiError::internal)?;
+    }
     let action = if input.is_active == Some(false) {
         "USER_DISABLED"
     } else if input.role_code.is_some() {
@@ -5339,15 +6132,9 @@ async fn update_user(
         None,
     )?;
     tx.commit().map_err(ApiError::internal)?;
-    if input.role_code.is_some() || input.is_active == Some(false) {
-        db.conn
-            .execute(
-                "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2",
-                params![now(), id],
-            )
-            .map_err(ApiError::internal)?;
-    }
-    Ok(ok(json!({"updated":true})))
+    Ok(ok(
+        json!({"updated":true,"reauthenticationRequired":password_changed}),
+    ))
 }
 
 async fn delete_user(
@@ -5455,10 +6242,7 @@ async fn update_user_permissions(
 async fn list_roles(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let _principal =
         authorize_section(&state, &headers, "section.settings.access", "users.manage")?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let mut roles = Vec::new();
     let mut statement=db.conn.prepare("SELECT id,code,name_ar,is_system FROM roles ORDER BY CASE code WHEN 'manager' THEN 0 ELSE 1 END").map_err(ApiError::internal)?;
     let rows=statement.query_map([],|row|{let id:String=row.get(0)?;let mut permissions=Vec::new();let mut ps=db.conn.prepare("SELECT p.code,p.name_ar FROM role_permissions rp JOIN permissions p ON p.id=rp.permission_id WHERE rp.role_id=?1 ORDER BY p.code").map_err(|_|rusqlite::Error::InvalidQuery)?;let prs=ps.query_map([id.clone()],|p|Ok(json!({"code":p.get::<_,String>(0)?,"name":p.get::<_,String>(1)?})))?;for permission in prs{permissions.push(permission?);}Ok(json!({"id":id,"code":row.get::<_,String>(1)?,"name":row.get::<_,String>(2)?,"isSystem":row.get::<_,i64>(3)?==1,"permissions":permissions}))}).map_err(ApiError::internal)?;
@@ -5578,22 +6362,25 @@ async fn list_audit_logs(
 ) -> ApiResult {
     let _principal = authorize_section(&state, &headers, "section.audit.access", "audit.read")?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+    let db = state.read_db()?;
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(150)
         .clamp(1, 500);
+    let scope = cursor_scope(&["audit-logs", &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
     let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT a.id,a.action,a.entity_type,a.entity_id,a.description,a.created_at,u.full_name FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id WHERE a.created_at BETWEEN ?1 AND ?2 ORDER BY a.created_at DESC LIMIT ?3").map_err(ApiError::internal)?;
-    let rows=statement.query_map(params![from,to,limit],|row|Ok(json!({"id":row.get::<_,String>(0)?,"action":row.get::<_,String>(1)?,"entityType":row.get::<_,String>(2)?,"entityId":row.get::<_,Option<String>>(3)?,"description":row.get::<_,String>(4)?,"createdAt":row.get::<_,String>(5)?,"userName":row.get::<_,Option<String>>(6)?}))).map_err(ApiError::internal)?;
+    let mut statement=db.conn.prepare("SELECT a.id,a.action,a.entity_type,a.entity_id,a.description,a.created_at,u.full_name FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id WHERE a.created_at BETWEEN ?1 AND ?2 AND (a.created_at<?3 OR (a.created_at=?3 AND a.id<?4)) ORDER BY a.created_at DESC,a.id DESC LIMIT ?5").map_err(ApiError::internal)?;
+    let rows=statement.query_map(params![from,to,cursor_timestamp,cursor_id,limit+1],|row|Ok(json!({"id":row.get::<_,String>(0)?,"action":row.get::<_,String>(1)?,"entityType":row.get::<_,String>(2)?,"entityId":row.get::<_,Option<String>>(3)?,"description":row.get::<_,String>(4)?,"createdAt":row.get::<_,String>(5)?,"userName":row.get::<_,Option<String>>(6)?}))).map_err(ApiError::internal)?;
     for row in rows {
         items.push(row.map_err(ApiError::internal)?);
     }
-    Ok(ok(json!({"items":items})))
+    let (has_more, next_cursor) = finish_cursor_page(&mut items, limit, &scope, &["createdAt"])?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 fn safe_backup_path(data_dir: &FsPath, requested: Option<&str>) -> Result<PathBuf, ApiError> {
@@ -5614,13 +6401,111 @@ fn safe_backup_path(data_dir: &FsPath, requested: Option<&str>) -> Result<PathBu
     {
         return Err(ApiError::bad("يجب أن يكون امتداد ملف النسخة الاحتياطية .db"));
     }
-    let parent = path
-        .parent()
+    path.parent()
         .ok_or_else(|| ApiError::bad("مسار النسخة الاحتياطية غير صالح"))?;
-    fs::create_dir_all(parent).map_err(ApiError::internal)?;
     Ok(path)
 }
 
+const FILE_IO_BUFFER_BYTES: usize = 256 * 1024;
+
+fn temporary_sibling(path: &FsPath, purpose: &str) -> Result<PathBuf, ApiError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ApiError::internal("مسار الملف المؤقت غير صالح"))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("backup.db");
+    Ok(parent.join(format!(".{name}.{purpose}-{}.db", new_id())))
+}
+
+fn digest_hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn sha256_file(path: &FsPath) -> Result<String, ApiError> {
+    let file = fs::File::open(path).map_err(ApiError::internal)?;
+    let mut reader = BufReader::with_capacity(FILE_IO_BUFFER_BYTES, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; FILE_IO_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).map_err(ApiError::internal)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(digest_hex(hasher.finalize()))
+}
+
+fn copy_file_hashed(source: &FsPath, destination: &FsPath) -> Result<(u64, String), ApiError> {
+    let source_file = fs::File::open(source).map_err(ApiError::internal)?;
+    let destination_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(ApiError::internal)?;
+    let mut reader = BufReader::with_capacity(FILE_IO_BUFFER_BYTES, source_file);
+    let mut writer = BufWriter::with_capacity(FILE_IO_BUFFER_BYTES, destination_file);
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; FILE_IO_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).map_err(ApiError::internal)?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(ApiError::internal)?;
+        hasher.update(&buffer[..read]);
+        copied += read as u64;
+    }
+    writer.flush().map_err(ApiError::internal)?;
+    writer.get_ref().sync_all().map_err(ApiError::internal)?;
+    Ok((copied, digest_hex(hasher.finalize())))
+}
+
+fn finalize_new_file(temporary: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+    if target.exists() {
+        let _ = fs::remove_file(temporary);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "ملف النسخة الاحتياطية موجود بالفعل",
+        ));
+    }
+    fs::rename(temporary, target).map_err(ApiError::internal)
+}
+
+fn replace_file_atomically(temporary: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+    if !target.exists() {
+        return fs::rename(temporary, target).map_err(ApiError::internal);
+    }
+    let displaced = temporary_sibling(target, "previous")?;
+    fs::rename(target, &displaced).map_err(ApiError::internal)?;
+    match fs::rename(temporary, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(displaced);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&displaced, target);
+            Err(ApiError::internal(error))
+        }
+    }
+}
+
+fn expected_backup_hash(notes: Option<&str>) -> Option<&str> {
+    notes?.strip_prefix("sha256:")
+}
+
+/// Writes the snapshot only. `VACUUM INTO` has to run on the live connection, so this is the one
+/// backup step that legitimately holds the database lock; callers verify the produced file
+/// afterwards, off the lock, via [`blocking`].
 fn vacuum_into(conn: &Connection, path: &FsPath) -> Result<(), ApiError> {
     if path.exists() {
         return Err(ApiError::new(
@@ -5630,7 +6515,13 @@ fn vacuum_into(conn: &Connection, path: &FsPath) -> Result<(), ApiError> {
     }
     let escaped = path.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)
+}
+
+/// Full snapshot verification for the restore path, where the live connection is already held and
+/// correctness outranks latency. Kept so emergency-snapshot creation kept its previous guarantees.
+fn vacuum_into_verified(conn: &Connection, path: &FsPath) -> Result<(), ApiError> {
+    vacuum_into(conn, path)?;
     Database::verify_backup(path).map_err(ApiError::internal)
 }
 
@@ -5646,42 +6537,73 @@ async fn list_backups(
 ) -> ApiResult {
     let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let (from, to) = date_range(&query)?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let mut items = Vec::new();
-    let mut statement=db.conn.prepare("SELECT id,backup_path,created_at FROM backup_history WHERE status='completed' AND created_at BETWEEN ?1 AND ?2 ORDER BY created_at DESC LIMIT 100").map_err(ApiError::internal)?;
-    let rows = statement
-        .query_map(params![from, to], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(ApiError::internal)?;
-    let mut stale = Vec::new();
-    for row in rows {
-        let (id, path, created_at) = row.map_err(ApiError::internal)?;
-        let Some(path) = path.map(PathBuf::from) else {
-            stale.push(id);
-            continue;
-        };
-        if !path.is_file() || Database::verify_backup(&path).is_err() {
-            stale.push(id);
-            continue;
-        }
-        let size = fs::metadata(&path).map_err(ApiError::internal)?.len();
-        items.push(json!({"id":id.clone(),"path":path.to_string_lossy(),"createdAt":created_at,"sizeBytes":size,"downloadUrl":format!("/api/backups/{id}/download")}));
-    }
-    drop(statement);
-    for id in stale {
-        db.conn
-            .execute("DELETE FROM backup_history WHERE id=?1", [id])
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 100);
+    let scope = cursor_scope(&["backup-history", &from, &to]);
+    let cursor = history_cursor(&query, "cursor", &scope)?;
+    let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
+
+    // Phase 1: read the index rows under a short lock on an indexed, bounded query.
+    let mut rows: Vec<(String, Option<String>, String)> = {
+        let db = state.read_db()?;
+        let mut statement=db.conn.prepare("SELECT id,backup_path,created_at FROM backup_history WHERE status='completed' AND created_at BETWEEN ?1 AND ?2 AND (created_at<?3 OR (created_at=?3 AND id<?4)) ORDER BY created_at DESC,id DESC LIMIT ?5").map_err(ApiError::internal)?;
+        let mapped = statement
+            .query_map(
+                params![from, to, cursor_timestamp, cursor_id, limit + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
             .map_err(ApiError::internal)?;
+        let mut collected = Vec::new();
+        for row in mapped {
+            collected.push(row.map_err(ApiError::internal)?);
+        }
+        collected
+    }; // the database guard is released here, before any filesystem access
+    let has_more = rows.len() > limit as usize;
+    if has_more {
+        rows.pop();
     }
-    Ok(ok(json!({"items":items})))
+    let next_cursor = if has_more {
+        let last = rows
+            .last()
+            .ok_or_else(|| ApiError::internal("تعذر إنشاء مؤشر سجل النسخ"))?;
+        Some(encode_page_cursor(&last.2, &last.0, &scope)?)
+    } else {
+        None
+    };
+
+    // Phase 2: off the lock, one `stat` per row. Listing deliberately does NOT open backup files as
+    // SQLite databases: integrity verification is reserved for download, export and restore, where
+    // the file is actually consumed. Missing files are omitted without mutating history from GET;
+    // explicit deletion remains the only destructive list operation.
+    let items = blocking(move || {
+        let mut items = Vec::new();
+        for (id, path, created_at) in rows {
+            let Some(path) = path.map(PathBuf::from) else {
+                continue;
+            };
+            match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    items.push(json!({"id":id.clone(),"path":path.to_string_lossy(),"createdAt":created_at,"sizeBytes":metadata.len(),"downloadUrl":format!("/api/backups/{id}/download")}));
+                }
+                _ => {}
+            }
+        }
+        Ok(items)
+    })
+    .await?;
+    Ok(ok(
+        json!({"items":items,"hasMore":has_more,"nextCursor":next_cursor}),
+    ))
 }
 
 async fn create_backup(
@@ -5691,40 +6613,92 @@ async fn create_backup(
 ) -> ApiResult {
     let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let path = safe_backup_path(&state.data_dir, input.path.as_deref())?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    vacuum_into(&db.conn, &path)?;
+    let temporary_path = temporary_sibling(&path, "creating")?;
+
+    // Phase 1: the snapshot itself. `VACUUM INTO` must read the live connection, so the lock is
+    // held for exactly this step and nothing else. It runs on the blocking pool because a large
+    // database copy is synchronous even though independent WAL readers can continue.
+    let snapshot_state = state.clone();
+    let snapshot_path = temporary_path.clone();
+    let snapshot_result = blocking(move || {
+        let parent = snapshot_path
+            .parent()
+            .ok_or_else(|| ApiError::bad("مسار النسخة الاحتياطية غير صالح"))?;
+        fs::create_dir_all(parent).map_err(ApiError::internal)?;
+        let db = snapshot_state
+            .db
+            .lock()
+            .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+        vacuum_into(&db.conn, &snapshot_path)
+    })
+    .await;
+    if let Err(error) = snapshot_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    // Phase 2: verify the produced file off the lock. A backup is still never recorded as
+    // 'completed' unless it passes verification; a failed snapshot is removed rather than kept.
+    let verify_path = temporary_path.clone();
+    let final_path = path.clone();
+    let verification = blocking(move || {
+        let result = (|| {
+            Database::verify_backup(&verify_path).map_err(|_| {
+                ApiError::internal("تعذر التحقق من سلامة النسخة الاحتياطية بعد إنشائها")
+            })?;
+            let size = fs::metadata(&verify_path)
+                .map_err(ApiError::internal)?
+                .len();
+            let hash = sha256_file(&verify_path)?;
+            fs::File::open(&verify_path)
+                .and_then(|file| file.sync_all())
+                .map_err(ApiError::internal)?;
+            finalize_new_file(&verify_path, &final_path)?;
+            Ok((size, hash))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&verify_path);
+        }
+        result
+    })
+    .await;
+    let (size, hash) = verification?;
+
+    // Phase 3: record the verified backup, under a short lock.
     let id = new_id();
-    db.conn.execute("INSERT INTO backup_history(id,backup_path,created_by,created_at,status,notes) VALUES(?1,?2,?3,?4,'completed',NULL)",params![id,path.to_string_lossy().to_string(),principal.id,now()]).map_err(ApiError::internal)?;
-    insert_audit(
-        &db.conn,
-        Some(&principal.id),
-        "BACKUP_CREATED",
-        "backup",
-        Some(&id),
-        "تم إنشاء نسخة احتياطية آمنة لقاعدة البيانات",
-        None,
-    )
-    .map_err(ApiError::internal)?;
-    let size = fs::metadata(&path).map_err(ApiError::internal)?.len();
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+        db.conn.execute("INSERT INTO backup_history(id,backup_path,created_by,created_at,status,notes) VALUES(?1,?2,?3,?4,'completed',?5)",params![id,path.to_string_lossy().to_string(),principal.id,now(),format!("sha256:{hash}")]).map_err(ApiError::internal)?;
+        insert_audit(
+            &db.conn,
+            Some(&principal.id),
+            "BACKUP_CREATED",
+            "backup",
+            Some(&id),
+            "تم إنشاء نسخة احتياطية آمنة لقاعدة البيانات",
+            None,
+        )
+        .map_err(ApiError::internal)?;
+    }
     Ok(ok(
-        json!({"id":id.clone(),"path":path.to_string_lossy(),"createdAt":now(),"sizeBytes":size,"downloadUrl":format!("/api/backups/{id}/download")}),
+        json!({"id":id.clone(),"path":path.to_string_lossy(),"createdAt":now(),"sizeBytes":size,"sha256":hash,"downloadUrl":format!("/api/backups/{id}/download")}),
     ))
 }
 
-fn backup_path_for_id(conn: &Connection, id: &str) -> Result<PathBuf, ApiError> {
-    let path: Option<Option<String>> = conn
+fn backup_path_for_id(conn: &Connection, id: &str) -> Result<(PathBuf, Option<String>), ApiError> {
+    let record: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT backup_path FROM backup_history WHERE id=?1 AND status='completed'",
+            "SELECT backup_path,notes FROM backup_history WHERE id=?1 AND status='completed'",
             [id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(ApiError::internal)?;
-    path.flatten()
-        .map(PathBuf::from)
+    record
+        .and_then(|(path, notes)| path.map(|path| (PathBuf::from(path), notes)))
         .ok_or_else(ApiError::not_found)
 }
 
@@ -5734,31 +6708,44 @@ async fn download_backup(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let path = backup_path_for_id(&db.conn, &id)?;
-    if !path.is_file() || Database::verify_backup(&path).is_err() {
-        return Err(ApiError::not_found());
-    }
-    let bytes = fs::read(&path).map_err(ApiError::internal)?;
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| value.is_ascii())
-        .unwrap_or("alkaheli-backup.db");
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    let (path, notes) = {
+        let db = state.read_db()?;
+        backup_path_for_id(&db.conn, &id)?
+    };
+    // Verification is retained here because the file is about to leave the application, but it now
+    // runs off the database lock together with the full-file read.
+    let (path, filename, size, hash) = blocking(move || {
+        if !path.is_file() || Database::verify_backup(&path).is_err() {
+            return Err(ApiError::not_found());
+        }
+        let hash = sha256_file(&path)?;
+        if expected_backup_hash(notes.as_deref()).is_some_and(|expected| expected != hash.as_str())
+        {
+            return Err(ApiError::not_found());
+        }
+        let size = fs::metadata(&path).map_err(ApiError::internal)?.len();
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| value.is_ascii())
+            .unwrap_or("alkaheli-backup.db")
+            .to_owned();
+        Ok((path, filename, size, hash))
+    })
+    .await?;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(ApiError::internal)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::ETAG, format!("\"{hash}\""))
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .map_err(ApiError::internal)
 }
 
 async fn delete_backup(
@@ -5767,27 +6754,36 @@ async fn delete_backup(
     Path(id): Path<String>,
 ) -> ApiResult {
     let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let path = backup_path_for_id(&db.conn, &id)?;
-    if path.is_file() {
-        fs::remove_file(&path).map_err(ApiError::internal)?;
-    }
-    db.conn
-        .execute("DELETE FROM backup_history WHERE id=?1", [id.clone()])
+    let (path, _) = {
+        let db = state.read_db()?;
+        backup_path_for_id(&db.conn, &id)?
+    };
+    blocking(move || {
+        if path.is_file() {
+            fs::remove_file(&path).map_err(ApiError::internal)?;
+        }
+        Ok(())
+    })
+    .await?;
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
+        db.conn
+            .execute("DELETE FROM backup_history WHERE id=?1", [id.clone()])
+            .map_err(ApiError::internal)?;
+        insert_audit(
+            &db.conn,
+            Some(&principal.id),
+            "BACKUP_DELETED",
+            "backup",
+            Some(&id),
+            "تم حذف ملف نسخة احتياطية نهائيًا",
+            None,
+        )
         .map_err(ApiError::internal)?;
-    insert_audit(
-        &db.conn,
-        Some(&principal.id),
-        "BACKUP_DELETED",
-        "backup",
-        Some(&id),
-        "تم حذف ملف نسخة احتياطية نهائيًا",
-        None,
-    )
-    .map_err(ApiError::internal)?;
+    }
     Ok(ok(json!({"deleted":true})))
 }
 
@@ -5799,20 +6795,43 @@ async fn export_backup(
 ) -> ApiResult {
     let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
     let target = safe_backup_path(&state.data_dir, input.path.as_deref())?;
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let source = backup_path_for_id(&db.conn, &id)?;
-    if !source.is_file() || Database::verify_backup(&source).is_err() {
-        return Err(ApiError::not_found());
-    }
-    if source.canonicalize().ok() == target.canonicalize().ok() {
-        return Err(ApiError::bad("اختر موقعًا مختلفًا لحفظ النسخة"));
-    }
-    fs::copy(&source, &target).map_err(ApiError::internal)?;
-    Database::verify_backup(&target).map_err(|_| ApiError::bad("تعذر التحقق من الملف المنزّل"))?;
-    Ok(ok(json!({"exported":true,"path":target.to_string_lossy()})))
+    let (source, notes) = {
+        let db = state.read_db()?;
+        backup_path_for_id(&db.conn, &id)?
+    };
+    // Source and target verification are both retained: the exported copy leaves the application.
+    // Only the lock is given up, not any validation.
+    let exported = blocking(move || {
+        let parent = target
+            .parent()
+            .ok_or_else(|| ApiError::bad("مسار النسخة الاحتياطية غير صالح"))?;
+        fs::create_dir_all(parent).map_err(ApiError::internal)?;
+        let temporary = temporary_sibling(&target, "exporting")?;
+        let result = (|| {
+            if !source.is_file() || Database::verify_backup(&source).is_err() {
+                return Err(ApiError::not_found());
+            }
+            if source.canonicalize().ok() == target.canonicalize().ok() {
+                return Err(ApiError::bad("اختر موقعًا مختلفًا لحفظ النسخة"));
+            }
+            let (_, copied_hash) = copy_file_hashed(&source, &temporary)?;
+            if expected_backup_hash(notes.as_deref())
+                .is_some_and(|expected| expected != copied_hash.as_str())
+            {
+                return Err(ApiError::bad("فشل التحقق من بصمة النسخة الاحتياطية"));
+            }
+            Database::verify_backup(&temporary)
+                .map_err(|_| ApiError::bad("تعذر التحقق من الملف المنزّل"))?;
+            replace_file_atomically(&temporary, &target)?;
+            Ok(target.to_string_lossy().to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    })
+    .await?;
+    Ok(ok(json!({"exported":true,"path":exported})))
 }
 
 #[derive(Deserialize)]
@@ -5833,7 +6852,7 @@ async fn restore_backup(
         ));
     }
     let source = PathBuf::from(input.path.trim());
-    let payload = apply_restore(&state, &principal, &source)?;
+    let payload = blocking(move || apply_restore(&state, &principal, &source)).await?;
     Ok(ok(payload))
 }
 
@@ -5842,37 +6861,84 @@ async fn restore_backup_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult {
-    let principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
-    let upload_dir = state.data_dir.join("restore-uploads");
-    fs::create_dir_all(&upload_dir).map_err(ApiError::internal)?;
-    let staged = upload_dir.join(format!("restore-upload-{}.db", new_id()));
+    let _principal = authorize_section(&state, &headers, "section.backup.access", "backup.manage")?;
+    let staging_dir = state.data_dir.join(format!("restore-staged-{}", new_id()));
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(ApiError::internal)?;
+    let staged = staging_dir.join("carwash.db");
     let mut saved = false;
     let mut confirmed = false;
-    while let Some(field) = multipart.next_field().await.map_err(ApiError::internal)? {
-        match field.name() {
-            Some("confirmation") => {
-                confirmed = field.text().await.map_err(ApiError::internal)?.trim() == "RESTORE";
-            }
-            Some("backup") => {
-                let bytes = field.bytes().await.map_err(ApiError::internal)?;
-                if bytes.len() > 100 * 1024 * 1024 {
-                    return Err(ApiError::bad("حجم النسخة الاحتياطية يتجاوز الحد المسموح"));
+    let mut uploaded_hash = None;
+    let intake: Result<(), ApiError> = async {
+        while let Some(mut field) = multipart.next_field().await.map_err(ApiError::internal)? {
+            let field_name = field.name().map(str::to_owned);
+            match field_name.as_deref() {
+                Some("confirmation") => {
+                    let mut value = Vec::new();
+                    while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
+                        if value.len().saturating_add(chunk.len()) > 64 {
+                            return Err(ApiError::bad("قيمة تأكيد الاستعادة غير صالحة"));
+                        }
+                        value.extend_from_slice(&chunk);
+                    }
+                    confirmed = std::str::from_utf8(&value)
+                        .map_err(|_| ApiError::bad("قيمة تأكيد الاستعادة غير صالحة"))?
+                        .trim()
+                        == "RESTORE";
                 }
-                fs::write(&staged, &bytes).map_err(ApiError::internal)?;
-                saved = true;
+                Some("backup") => {
+                    if saved {
+                        return Err(ApiError::bad("أرسل ملف نسخة احتياطية واحدًا فقط"));
+                    }
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&staged)
+                        .await
+                        .map_err(ApiError::internal)?;
+                    let mut hasher = Sha256::new();
+                    while let Some(chunk) = field.chunk().await.map_err(ApiError::internal)? {
+                        file.write_all(&chunk).await.map_err(ApiError::internal)?;
+                        hasher.update(&chunk);
+                    }
+                    file.flush().await.map_err(ApiError::internal)?;
+                    file.sync_all().await.map_err(ApiError::internal)?;
+                    uploaded_hash = Some(digest_hex(hasher.finalize()));
+                    saved = true;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = intake {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(error);
     }
     if !saved {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(ApiError::bad("اختر ملف نسخة احتياطية صالحًا"));
     }
     if !confirmed {
-        let _ = fs::remove_file(&staged);
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(ApiError::bad("لم يتم تأكيد استعادة النسخة الاحتياطية"));
     }
-    let result = apply_restore(&state, &principal, &staged);
-    let _ = fs::remove_file(&staged);
+    let expected_hash =
+        uploaded_hash.ok_or_else(|| ApiError::bad("تعذر حساب بصمة ملف النسخة الاحتياطية"))?;
+    let result = blocking(move || {
+        let result = apply_staged_restore(
+            &state,
+            &staging_dir,
+            "ملف نسخة احتياطية مرفوع",
+            Some(&expected_hash),
+            || Ok(()),
+        );
+        let _ = fs::remove_dir_all(&staging_dir);
+        result
+    })
+    .await;
     Ok(ok(result?))
 }
 
@@ -5900,25 +6966,45 @@ where
     if source.canonicalize().ok() == current_path.canonicalize().ok() {
         return Err(ApiError::bad("لا يمكن استعادة قاعدة البيانات نفسها"));
     }
-    let staged = state
-        .data_dir
-        .join(format!("restore-staged-{}.db", new_id()));
-    fs::copy(source, &staged).map_err(|_| ApiError::bad("تعذر قراءة ملف النسخة الاحتياطية"))?;
-    if Database::verify_backup_for_restore(&staged, &state.data_dir).is_err() {
-        let _ = fs::remove_file(&staged);
-        return Err(ApiError::bad(
-            "ملف النسخة الاحتياطية غير مكتمل أو غير متوافق مع هذا الإصدار",
-        ));
-    }
-
-    let result = apply_verified_restore(
-        state,
-        &staged,
-        source.to_string_lossy().as_ref(),
-        post_replace,
-    );
-    let _ = fs::remove_file(&staged);
+    let staging_dir = state.data_dir.join(format!("restore-staged-{}", new_id()));
+    fs::create_dir_all(&staging_dir).map_err(ApiError::internal)?;
+    let staged = staging_dir.join("carwash.db");
+    let result = (|| {
+        let (_, copied_hash) = copy_file_hashed(source, &staged)
+            .map_err(|_| ApiError::bad("تعذر قراءة ملف النسخة الاحتياطية"))?;
+        apply_staged_restore(
+            state,
+            &staging_dir,
+            source.to_string_lossy().as_ref(),
+            Some(&copied_hash),
+            post_replace,
+        )
+    })();
+    let _ = fs::remove_dir_all(&staging_dir);
     result
+}
+
+fn apply_staged_restore<F>(
+    state: &AppState,
+    staging_dir: &FsPath,
+    source_description: &str,
+    expected_hash: Option<&str>,
+    post_replace: F,
+) -> Result<Value, ApiError>
+where
+    F: FnOnce() -> Result<(), ApiError>,
+{
+    let staged = staging_dir.join("carwash.db");
+    if !staged.is_file() {
+        return Err(ApiError::bad("ملف النسخة الاحتياطية غير موجود"));
+    }
+    let staged_hash = sha256_file(&staged)?;
+    if expected_hash.is_some_and(|expected| expected != staged_hash.as_str()) {
+        return Err(ApiError::bad("فشل التحقق من بصمة ملف النسخة الاحتياطية"));
+    }
+    Database::prepare_restore_candidate(staging_dir)
+        .map_err(|_| ApiError::bad("ملف النسخة الاحتياطية غير مكتمل أو غير متوافق مع هذا الإصدار"))?;
+    apply_verified_restore(state, &staged, source_description, post_replace)
 }
 
 fn remove_database_sidecars(path: &FsPath) {
@@ -5942,6 +7028,23 @@ fn reopen_from_snapshot(
     Ok(database)
 }
 
+fn reopen_from_displaced(
+    data_dir: &FsPath,
+    current_path: &FsPath,
+    displaced: &FsPath,
+) -> Result<Database, String> {
+    remove_database_sidecars(current_path);
+    let _ = fs::remove_file(current_path);
+    fs::rename(displaced, current_path)
+        .map_err(|error| format!("failed to restore displaced database: {error}"))?;
+    let database = Database::open(data_dir)
+        .map_err(|error| format!("failed to reopen displaced database: {error}"))?;
+    database
+        .verify_runtime_database()
+        .map_err(|error| format!("displaced database verification failed: {error}"))?;
+    Ok(database)
+}
+
 fn apply_verified_restore<F>(
     state: &AppState,
     staged: &FsPath,
@@ -5951,6 +7054,8 @@ fn apply_verified_restore<F>(
 where
     F: FnOnce() -> Result<(), ApiError>,
 {
+    // The writer lock protects the consistent emergency snapshot and prevents mutations while
+    // restore metadata is collected. Independent WAL readers can continue during this long copy.
     let mut db = state
         .db
         .lock()
@@ -5965,11 +7070,9 @@ where
         .parent()
         .ok_or_else(|| ApiError::internal("مسار نسخة الطوارئ غير صالح"))?;
     fs::create_dir_all(emergency_parent).map_err(ApiError::internal)?;
-    vacuum_into(&db.conn, &emergency)?;
-    if Database::verify_backup_for_restore(&emergency, &state.data_dir).is_err() {
-        return Err(ApiError::internal(
-            "تعذر التحقق من نسخة الطوارئ قبل الاستعادة",
-        ));
+    if let Err(error) = vacuum_into_verified(&db.conn, &emergency) {
+        let _ = fs::remove_file(&emergency);
+        return Err(error);
     }
 
     let mut preserved_backups = Vec::new();
@@ -5999,8 +7102,15 @@ where
         }
     }
 
-    // Close the live connection only after both the restore candidate and emergency
-    // snapshot have passed a full isolated open/migration/schema validation.
+    // Only file replacement and reopen require every independent read connection to be closed.
+    // Candidate hashing/migration/validation and emergency snapshot creation all happen first.
+    let _exclusive_restore = state
+        .read_gate
+        .write()
+        .map_err(|_| ApiError::internal("قفل استعادة قاعدة البيانات"))?;
+
+    // Close the live connection only after both the restore candidate and emergency snapshot
+    // have passed full integrity checks.
     let old_conn = std::mem::replace(
         &mut db.conn,
         Connection::open_in_memory().map_err(ApiError::internal)?,
@@ -6013,7 +7123,7 @@ where
 
     let restore_attempt: Result<Database, ApiError> = (|| {
         fs::rename(&current_path, &displaced).map_err(ApiError::internal)?;
-        fs::copy(staged, &current_path).map_err(ApiError::internal)?;
+        fs::rename(staged, &current_path).map_err(ApiError::internal)?;
         post_replace()?;
         let mut reopened = Database::open(&state.data_dir).map_err(ApiError::internal)?;
         reopened
@@ -6059,45 +7169,35 @@ where
         }
         Err(_restore_error) => {
             eprintln!(
-                "Restore failed after live replacement; rolling back from {}",
-                emergency.display()
+                "Restore failed after live replacement; rolling back the displaced live database"
             );
-            match reopen_from_snapshot(&state.data_dir, &current_path, &emergency) {
+            match reopen_from_displaced(&state.data_dir, &current_path, &displaced) {
                 Ok(original) => {
                     *db = original;
-                    let _ = fs::remove_file(&displaced);
                     Err(ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "فشلت الاستعادة وتمت إعادة قاعدة البيانات الأصلية بأمان",
                     ))
                 }
                 Err(rollback_error) => {
-                    eprintln!("Emergency snapshot rollback failed: {rollback_error}");
-                    remove_database_sidecars(&current_path);
-                    let _ = fs::remove_file(&current_path);
-                    let displaced_rollback = fs::rename(&displaced, &current_path)
-                        .map_err(ApiError::internal)
-                        .and_then(|_| {
-                            let original =
-                                Database::open(&state.data_dir).map_err(ApiError::internal)?;
-                            original
-                                .verify_runtime_database()
-                                .map_err(ApiError::internal)?;
-                            Ok(original)
-                        });
-                    match displaced_rollback {
+                    eprintln!(
+                        "Displaced database rollback failed ({rollback_error}); using {}",
+                        emergency.display()
+                    );
+                    match reopen_from_snapshot(&state.data_dir, &current_path, &emergency) {
                         Ok(original) => {
                             *db = original;
+                            let _ = fs::remove_file(&displaced);
                             Err(ApiError::new(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "فشلت الاستعادة وتمت إعادة قاعدة البيانات الأصلية بأمان",
                             ))
                         }
-                        Err(displaced_error) => {
+                        Err(emergency_error) => {
                             eprintln!(
                                 "Critical restore rollback failure after both recovery attempts"
                             );
-                            Err(displaced_error)
+                            Err(ApiError::internal(emergency_error))
                         }
                     }
                 }
@@ -6149,6 +7249,93 @@ mod paid_cars_tests {
     }
 
     #[test]
+    fn percentage_rounding_remains_exact_for_large_integer_money_values() {
+        let amount = i64::MAX - 7;
+        assert_eq!(round_percentage(amount, 10_000), amount);
+        assert_eq!(
+            round_percentage(amount, 5_000),
+            (((amount as i128) * 5_000 + 5_000) / 10_000) as i64
+        );
+    }
+
+    #[test]
+    fn incremental_sha256_and_streamed_copy_match_reference_digest() {
+        let directory = std::env::temp_dir()
+            .join("alkaheli-streamed-file-tests")
+            .join(new_id());
+        fs::create_dir_all(&directory).expect("test directory");
+        let source = directory.join("source.db");
+        let target = directory.join("target.db");
+        let bytes: Vec<u8> = (0..(FILE_IO_BUFFER_BYTES * 2 + 31))
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect();
+        fs::write(&source, &bytes).expect("source file");
+
+        let reference = digest_hex(Sha256::digest(&bytes));
+        assert_eq!(sha256_file(&source).expect("streamed hash"), reference);
+        let (copied, copied_hash) =
+            copy_file_hashed(&source, &target).expect("streamed copy and hash");
+        assert_eq!(copied, bytes.len() as u64);
+        assert_eq!(copied_hash, reference);
+        assert_eq!(sha256_file(&target).expect("copied file hash"), reference);
+        assert_eq!(fs::read(&target).expect("copied bytes"), bytes);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn restore_hash_mismatch_is_rejected_before_live_replacement() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-restore-hash-tests")
+            .join(new_id());
+        let staging_dir = data_dir.join(format!("restore-staged-{}", new_id()));
+        let live_database = Database::open(&data_dir).expect("live test database");
+        live_database
+            .conn
+            .execute(
+                "INSERT INTO settings(key,value_json,updated_by,updated_at) VALUES('restore-hash-marker','\"original\"',NULL,?1)",
+                [now()],
+            )
+            .expect("original marker");
+        let state = AppState {
+            db: Arc::new(Mutex::new(live_database)),
+            data_dir: data_dir.clone(),
+            db_path: data_dir.join("carwash.db"),
+            read_gate: Arc::new(RwLock::new(())),
+        };
+        let candidate = Database::open(&staging_dir).expect("restore candidate");
+        candidate
+            .verify_runtime_database()
+            .expect("valid restore candidate");
+        drop(candidate);
+
+        let result = apply_staged_restore(
+            &state,
+            &staging_dir,
+            "hash-mismatch-test",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            || Ok(()),
+        );
+        assert!(
+            result.is_err(),
+            "mismatched candidate hash must be rejected"
+        );
+        let database = state.db.lock().expect("live database lock");
+        let marker: String = database
+            .conn
+            .query_row(
+                "SELECT value_json FROM settings WHERE key='restore-hash-marker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("live marker remains");
+        assert_eq!(marker, "\"original\"");
+        drop(database);
+        drop(state);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn restore_failure_after_replacement_rolls_back_and_reconnects_original_database() {
         let data_dir = std::env::temp_dir()
             .join("alkaheli-restore-rollback-tests")
@@ -6167,6 +7354,8 @@ mod paid_cars_tests {
         let state = AppState {
             db: Arc::new(Mutex::new(live_database)),
             data_dir: data_dir.clone(),
+            db_path: data_dir.join("carwash.db"),
+            read_gate: Arc::new(RwLock::new(())),
         };
 
         let source_database = Database::open(&source_dir).expect("source test database");

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -52,6 +52,8 @@ import {
   X,
 } from 'lucide-react';
 import { api, ApiError } from './api';
+import { appendUnique } from './pagination';
+import { VirtualizedList, WindowedTableBody } from './VirtualizedList';
 import type {
   AppSettings,
   AuditLog,
@@ -194,11 +196,29 @@ function safeNumber(value: number | string | undefined | null) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+const numberFormatters = new Map<string, Intl.NumberFormat>();
+const dateFormatter = new Intl.DateTimeFormat(UI_LOCALE, {
+  dateStyle: 'medium', numberingSystem: LATIN_NUMBERING_SYSTEM,
+});
+const dateTimeFormatter = new Intl.DateTimeFormat(UI_LOCALE, {
+  dateStyle: 'medium', timeStyle: 'short', numberingSystem: LATIN_NUMBERING_SYSTEM,
+});
+const businessDatePartsFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: BUSINESS_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+});
+const workingDateFormatter = new Intl.DateTimeFormat(UI_LOCALE, {
+  dateStyle: 'medium', numberingSystem: LATIN_NUMBERING_SYSTEM, timeZone: BUSINESS_TIME_ZONE,
+});
+
 function formatNumber(value: number | string | undefined | null, options?: Intl.NumberFormatOptions) {
-  return westernDigits(new Intl.NumberFormat(UI_LOCALE, {
-    ...options,
-    numberingSystem: LATIN_NUMBERING_SYSTEM,
-  }).format(safeNumber(value)));
+  const resolved = { ...options, numberingSystem: LATIN_NUMBERING_SYSTEM };
+  const key = JSON.stringify(resolved);
+  let formatter = numberFormatters.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(UI_LOCALE, resolved);
+    numberFormatters.set(key, formatter);
+  }
+  return westernDigits(formatter.format(safeNumber(value)));
 }
 
 function money(value: number | string | undefined | null, currency = 'د.ل') {
@@ -212,20 +232,11 @@ function dateFormat(value?: string | null, withTime = false) {
   if (!value) return '—';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return westernDigits(value);
-  return westernDigits(new Intl.DateTimeFormat(UI_LOCALE, {
-    dateStyle: 'medium',
-    ...(withTime ? { timeStyle: 'short' as const } : {}),
-    numberingSystem: LATIN_NUMBERING_SYSTEM,
-  }).format(parsed));
+  return westernDigits((withTime ? dateTimeFormatter : dateFormatter).format(parsed));
 }
 
 function businessDateKey(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: BUSINESS_TIME_ZONE,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(date);
+  const parts = businessDatePartsFormatter.formatToParts(date);
   const value = (type: 'year' | 'month' | 'day') => parts.find((part) => part.type === type)?.value ?? '';
   return `${value('year')}-${value('month')}-${value('day')}`;
 }
@@ -251,11 +262,7 @@ function initialWorkingDate(today: string) {
 
 function workingDateFormat(dateKey: string) {
   const date = new Date(`${dateKey}T12:00:00Z`);
-  return westernDigits(new Intl.DateTimeFormat(UI_LOCALE, {
-    dateStyle: 'medium',
-    numberingSystem: LATIN_NUMBERING_SYSTEM,
-    timeZone: BUSINESS_TIME_ZONE,
-  }).format(date));
+  return westernDigits(workingDateFormatter.format(date));
 }
 
 function dateInputValue(date = new Date()) {
@@ -585,13 +592,13 @@ function AuthScreen({
             </FormField>
             <FormField label="كلمة المرور" required hint={isSetup ? 'استخدم كلمة مرور قوية لا تقل عن 8 أحرف.' : undefined}>
               <div className="password-input">
-                <input value={password} onChange={(event) => setPassword(event.target.value)} type={showPassword ? 'text' : 'password'} placeholder="أدخل كلمة المرور" required minLength={isSetup ? 8 : undefined} autoComplete={isSetup ? 'new-password' : 'current-password'} dir="ltr" />
+                <input value={password} onChange={(event) => setPassword(event.target.value)} type={showPassword ? 'text' : 'password'} placeholder="أدخل كلمة المرور" required minLength={isSetup ? 10 : undefined} maxLength={128} autoComplete={isSetup ? 'new-password' : 'current-password'} dir="ltr" />
                 <button type="button" onClick={() => setShowPassword((current) => !current)} aria-label={showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'}>{showPassword ? <EyeOff size={18} /> : <Eye size={18} />}</button>
               </div>
             </FormField>
             {isSetup && (
               <FormField label="تأكيد كلمة المرور" required>
-                <input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} type="password" placeholder="أعد إدخال كلمة المرور" required minLength={8} autoComplete="new-password" dir="ltr" />
+                <input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} type="password" placeholder="أعد إدخال كلمة المرور" required minLength={10} maxLength={128} autoComplete="new-password" dir="ltr" />
               </FormField>
             )}
             <Button type="submit" className="button--full" disabled={saving} icon={saving ? <LoaderCircle size={18} className="spin" /> : <ChevronLeft size={18} />}>
@@ -648,7 +655,7 @@ function AppShell({ user, theme, onThemeChange, onLogout }: { user: AuthUser; th
     return () => window.clearInterval(timer);
   }, []);
 
-  const selectView = (next: View) => {
+  const selectView = useCallback((next: View) => {
     if (!canAccessView(user, next)) {
       setToast({ tone: 'error', text: 'لا تملك صلاحية الوصول إلى هذه الصفحة.' });
       next = firstAccessibleView(user);
@@ -656,7 +663,7 @@ function AppShell({ user, theme, onThemeChange, onLogout }: { user: AuthUser; th
     setView(next);
     window.location.hash = `#/${next}`;
     setSideOpen(false);
-  };
+  }, [user]);
 
   useEffect(() => {
     const handler = () => {
@@ -674,7 +681,7 @@ function AppShell({ user, theme, onThemeChange, onLogout }: { user: AuthUser; th
     return () => window.removeEventListener('hashchange', handler);
   }, [user]);
 
-  const notify = (message: ToastMessage) => setToast(message);
+  const notify = useCallback((message: ToastMessage) => setToast(message), []);
   const name = user.full_name || user.username;
 
   return (
@@ -809,7 +816,7 @@ function NavButton({ active, onClick, icon, children }: { active: boolean; onCli
   return <button className={`nav-button ${active ? 'is-active' : ''}`} onClick={onClick} aria-label={label} title={label}>{icon}<span>{children}</span>{active && <ChevronLeft size={16} />}</button>;
 }
 
-function ViewRouter({ view, user, selectedDate, canWrite, canFinancial, navigate, notify }: { view: View; user: AuthUser; selectedDate: string; canWrite: boolean; canFinancial: boolean; navigate: (view: View) => void; notify: (message: ToastMessage) => void }) {
+const ViewRouter = memo(function ViewRouter({ view, user, selectedDate, canWrite, canFinancial, navigate, notify }: { view: View; user: AuthUser; selectedDate: string; canWrite: boolean; canFinancial: boolean; navigate: (view: View) => void; notify: (message: ToastMessage) => void }) {
   if (!canAccessView(user, view)) return <AccessDenied onBack={() => navigate(firstAccessibleView(user))} />;
   switch (view) {
     case 'dashboard': return <DashboardView userId={user.id} selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
@@ -827,7 +834,7 @@ function ViewRouter({ view, user, selectedDate, canWrite, canFinancial, navigate
     case 'backup': return <BackupView selectedDate={selectedDate} onNotify={notify} />;
     default: return <DashboardView userId={user.id} selectedDate={selectedDate} isManager={managerOf(user)} canFinancial={canFinancial} canWrite={canWrite} navigate={navigate} />;
   }
-}
+});
 
 function AccessDenied({ onBack }: { onBack: () => void }) {
   return (
@@ -877,6 +884,7 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const pointerDragOrder = useRef<DashboardCardId[] | null>(null);
+  const pointerDragStartOrder = useRef<DashboardCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadSequence = useRef(0);
@@ -912,10 +920,10 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
   }, [userId]);
   useEffect(() => {
     if (!draggedCardId) return undefined;
-    const finishPointerDrag = () => {
-      pointerDragOrder.current = null;
-      setDraggedCardId(null);
-    };
+    // Window-level listeners remain the safety net for WebView2 pointer-capture loss, where the
+    // element's own pointerup never fires. They now commit the order rather than discarding it, so
+    // a capture-loss drag still persists exactly once.
+    const finishPointerDrag = () => { commitCardPointerDrag(); };
     window.addEventListener('pointerup', finishPointerDrag);
     window.addEventListener('pointercancel', finishPointerDrag);
     return () => {
@@ -935,12 +943,30 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
       .then(() => api.updateDashboardCardOrder(validOrder));
     void cardOrderSaveQueue.current.catch(() => setCardOrderStatus('تعذر حفظ ترتيب بطاقات لوحة المتابعة؛ يمكنك المحاولة مرة أخرى.'));
   };
+  // Moves the card locally without persisting. Keeps the drag visually continuous while the write
+  // is deferred to the single commit at drag end.
+  const previewCardOrder = (nextOrder: DashboardCardId[]) => {
+    cardOrderChanged.current = true;
+    setCardOrder(validDashboardCardOrder(nextOrder));
+  };
+  // Single persistence point for a completed drag, whichever path ends it. Clearing the refs first
+  // makes it idempotent, so element pointerup and the window fallback cannot both write.
+  const commitCardPointerDrag = () => {
+    const nextOrder = pointerDragOrder.current;
+    const startOrder = pointerDragStartOrder.current;
+    pointerDragOrder.current = null;
+    pointerDragStartOrder.current = null;
+    setDraggedCardId(null);
+    if (!nextOrder || !startOrder) return;
+    if (nextOrder.length !== startOrder.length || nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
+  };
   const beginCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: DashboardCardId) => {
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     pointerDragOrder.current = cardOrder;
+    pointerDragStartOrder.current = cardOrder;
     setDraggedCardId(cardId);
   };
   const moveCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: DashboardCardId) => {
@@ -951,14 +977,15 @@ function DashboardView({ userId, selectedDate, isManager, canFinancial, canWrite
     const currentOrder = pointerDragOrder.current;
     if (!targetId || targetId === cardId || !DASHBOARD_CARD_IDS.includes(targetId)) return;
     const nextOrder = moveDashboardCard(currentOrder, cardId, currentOrder.indexOf(targetId));
+    // The ref carries the latest order across every intermediate move, so the commit below always
+    // persists the final arrangement rather than any stale intermediate one.
     pointerDragOrder.current = nextOrder;
-    applyCardOrder(nextOrder);
+    previewCardOrder(nextOrder);
   };
   const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (!pointerDragOrder.current) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    pointerDragOrder.current = null;
-    setDraggedCardId(null);
+    commitCardPointerDrag();
   };
   const dashboardCards: Record<DashboardCardId, Omit<MetricCardProps, 'reorder'> | null> = {
     carsToday: { label: 'السيارات اليوم', value: data.operational?.cars_today ?? 0, note: 'عملية مسجلة اليوم', icon: <Car size={21} /> },
@@ -1027,11 +1054,9 @@ function InlineRetry({ error, onRetry }: { error: string; onRetry: () => void })
   return <div className="inline-retry glass-card"><AlertTriangle size={22} /><p>{error}</p><Button variant="secondary" onClick={onRetry} icon={<RefreshCw size={16} />}>إعادة المحاولة</Button></div>;
 }
 
-function WashList({ washes, compact = false, showWorkerEntitlement = true, showPaidStatus = false, showCreator = false, showCarColor = false, showWashType = false, paidActionLabel, paidUpdatingId, onTogglePaid, onEdit, onDelete, canDelete }: { washes: Wash[]; compact?: boolean; showWorkerEntitlement?: boolean; showPaidStatus?: boolean; showCreator?: boolean; showCarColor?: boolean; showWashType?: boolean; paidActionLabel?: string; paidUpdatingId?: string | null; onTogglePaid?: (wash: Wash) => void | Promise<void>; onEdit?: (wash: Wash) => void; onDelete?: (wash: Wash) => void; canDelete?: (wash: Wash) => boolean }) {
+const WashList = memo(function WashList({ washes, compact = false, showWorkerEntitlement = true, showPaidStatus = false, showCreator = false, showCarColor = false, showWashType = false, paidActionLabel, paidUpdatingId, onTogglePaid, onEdit, onDelete, canDelete }: { washes: Wash[]; compact?: boolean; showWorkerEntitlement?: boolean; showPaidStatus?: boolean; showCreator?: boolean; showCarColor?: boolean; showWashType?: boolean; paidActionLabel?: string; paidUpdatingId?: string | null; onTogglePaid?: (wash: Wash) => void | Promise<void>; onEdit?: (wash: Wash) => void; onDelete?: (wash: Wash) => void; canDelete?: (wash: Wash) => boolean }) {
   if (washes.length === 0) return <EmptyState title="لا توجد بيانات" />;
-  return (
-    <div className={`wash-list ${compact ? 'wash-list--compact' : ''} ${showWashType ? 'wash-list--with-type' : ''}`}>
-      {washes.map((wash) => (
+  const renderWash = (wash: Wash) => (
         <div className="wash-row" key={wash.id}>
           <div className="wash-row__car"><div><Car size={18} /></div><span><strong>{wash.vehicle_make} {wash.vehicle_model}</strong><small>{wash.license_plate || 'بدون لوحة'} {wash.manufacturing_year ? `• ${wash.manufacturing_year}` : ''}{showCarColor && wash.car_color ? ` • ${wash.car_color}` : ''}</small></span></div>
           {showWashType && <span className="wash-row__type"><small>نوع الغسيل</small><strong>{wash.wash_type || 'غير محدد'}</strong></span>}
@@ -1041,39 +1066,56 @@ function WashList({ washes, compact = false, showWorkerEntitlement = true, showP
           {wash.price !== undefined && <span className="wash-row__price"><strong>{money(wash.price)}</strong>{showWorkerEntitlement && wash.worker_due !== undefined && <small>مستحق العامل: {money(wash.worker_due)}</small>}</span>}
           {(onTogglePaid || onEdit || (onDelete && (!canDelete || canDelete(wash)))) && <div className="row-actions">{onTogglePaid && <button type="button" className={`paid-action ${paidActionLabel ? 'paid-action--labeled' : ''} ${wash.is_paid ? 'is-paid' : ''}`} disabled={paidUpdatingId === wash.id} aria-pressed={wash.is_paid === true} onClick={() => void onTogglePaid(wash)} aria-label={wash.is_paid ? 'إرجاع العملية إلى غير خالصة' : paidActionLabel || 'تعليم العملية كخالصة'} title={wash.is_paid ? 'إرجاع إلى غير خالصة' : paidActionLabel || 'تعليم كخالصة'}>{paidUpdatingId === wash.id ? <LoaderCircle className="spin" size={15} /> : wash.is_paid ? <Undo2 size={15} /> : <CheckCircle2 size={15} />}{paidActionLabel && <span>{paidActionLabel}</span>}</button>}{onEdit && <button onClick={() => onEdit(wash)} aria-label="تعديل العملية"><Pencil size={15} /></button>}{onDelete && (!canDelete || canDelete(wash)) && <button className="danger-action" onClick={() => onDelete(wash)} aria-label="حذف العملية"><Trash2 size={15} /></button>}</div>}
         </div>
-      ))}
-    </div>
   );
-}
+  return <VirtualizedList items={washes} className={`wash-list ${compact ? 'wash-list--compact' : ''} ${showWashType ? 'wash-list--with-type' : ''}`} estimateSize={compact ? 58 : 68} getKey={(wash) => wash.id} renderItem={renderWash} ariaLabel="سجل عمليات الغسيل" />;
+});
 
 function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedDate: string; isManager: boolean; canWrite: boolean; onNotify: (message: ToastMessage) => void }) {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [showrooms, setShowrooms] = useState<Showroom[]>([]);
   const [washes, setWashes] = useState<Wash[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<Wash | null>(null);
   const [paidUpdatingId, setPaidUpdatingId] = useState<string | null>(null);
   const cancellingWashIds = useRef(new Set<string>());
+  const loadSequence = useRef(0);
+  const createRequestId = useRef(crypto.randomUUID());
   const [form, setForm] = useState({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', wash_type: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
 
   const load = async () => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     try {
       const [loadedWorkers, loadedShowrooms, loadedWashes] = await Promise.all([
         api.workers({ status: 'active', include_financials: false }),
         api.showrooms({ include_financials: false }),
-        api.washes({ date: selectedDate, limit: 300 }),
+        api.washPage({ date: selectedDate, limit: 150 }),
       ]);
-      setWorkers(loadedWorkers);
-      setShowrooms(loadedShowrooms);
-      setWashes(loadedWashes);
+      if (sequence !== loadSequence.current) return;
+      setWorkers(loadedWorkers); setShowrooms(loadedShowrooms); setWashes(loadedWashes.items);
+      setHasMore(loadedWashes.has_more); setNextCursor(loadedWashes.next_cursor);
     } catch (error) {
-      onNotify({ tone: 'error', text: friendlyError(error) });
-    } finally { setLoading(false); }
+      if (sequence === loadSequence.current) onNotify({ tone: 'error', text: friendlyError(error) });
+    } finally { if (sequence === loadSequence.current) setLoading(false); }
   };
 
-  useEffect(() => { void load(); }, [selectedDate]);
+  useEffect(() => { setWashes([]); setHasMore(false); setNextCursor(null); void load(); }, [selectedDate]);
+  const loadMore = async () => {
+    if (loadingMore || !hasMore || !nextCursor) return;
+    const sequence = loadSequence.current;
+    const cursor = nextCursor;
+    setLoadingMore(true);
+    try {
+      const page = await api.washPage({ date: selectedDate, limit: 150, cursor });
+      if (sequence !== loadSequence.current) return;
+      setWashes((current) => appendUnique(current, page.items)); setHasMore(page.has_more); setNextCursor(page.next_cursor);
+    } catch (error) { if (sequence === loadSequence.current) onNotify({ tone: 'error', text: friendlyError(error) }); }
+    finally { if (sequence === loadSequence.current) setLoadingMore(false); }
+  };
   const update = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
 
   const submit = async (event: FormEvent) => {
@@ -1101,7 +1143,9 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
         payment_type: form.payment_type,
         showroom_id: form.payment_type === 'showroom_account' ? form.showroom_id : null,
         showroom_payment_method: form.payment_type === 'showroom_account' ? form.showroom_payment_method : null,
+        client_request_id: createRequestId.current,
       });
+      createRequestId.current = crypto.randomUUID();
       setForm({ vehicle_make: '', vehicle_model: '', manufacturing_year: '', license_plate: '', car_color: '', wash_type: '', price: '', worker_id: '', performed_at: dateTimeInputValue(), payment_type: 'cash', showroom_id: '', showroom_payment_method: '' });
       void load();
       refreshDashboard();
@@ -1110,15 +1154,15 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
       onNotify({ tone: 'error', text: friendlyError(error) });
     } finally { setSaving(false); }
   };
-  const removeWash = async (wash: Wash) => {
+  const removeWash = useCallback(async (wash: Wash) => {
     if (!window.confirm(`هل تريد حذف عملية ${wash.vehicle_make} ${wash.vehicle_model}؟ سيتم عكس آثارها المالية بأمان.`)) return;
     if (cancellingWashIds.current.has(wash.id)) return;
     cancellingWashIds.current.add(wash.id);
     try { await api.voidWash(wash.id, 'حذف العملية بواسطة مدير النظام'); setWashes((current) => current.filter((item) => item.id !== wash.id)); refreshDashboard(); onNotify({ tone: 'success', text: 'تم حذف العملية وعكس آثارها المالية.' }); }
     catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); }
     finally { cancellingWashIds.current.delete(wash.id); }
-  };
-  const togglePaid = async (wash: Wash) => {
+  }, [onNotify]);
+  const togglePaid = useCallback(async (wash: Wash) => {
     if (paidUpdatingId) return;
     setPaidUpdatingId(wash.id);
     try {
@@ -1133,7 +1177,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
     } finally {
       setPaidUpdatingId(null);
     }
-  };
+  }, [paidUpdatingId, selectedDate, onNotify]);
 
   return (
     <>
@@ -1162,7 +1206,7 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
         <aside className="wash-side-note glass-card"><div className="wash-side-note__icon"><ShieldCheck size={24} /></div><h3>سجل موحّد وآمن</h3><p>لا تحتاج إلى إدخال العملية مرة أخرى للعمال أو للمعارض؛ تُنشأ القيود المرتبطة تلقائيًا ضمن معاملة واحدة.</p><div><CheckCircle2 size={17} /> سجل العامل</div><div><CheckCircle2 size={17} /> حساب المعرض</div><div><CheckCircle2 size={17} /> التقارير</div></aside>
       </div>}
       <SectionCard title="أحدث العمليات" subtitle={`عمليات الغسيل المسجلة ليوم ${workingDateFormat(selectedDate)}.`} className="data-card">
-        {loading ? <LoadingBlock /> : washes.length ? <WashList washes={washes} showWashType showPaidStatus paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? togglePaid : undefined} onEdit={canWrite ? setEditing : undefined} onDelete={canWrite ? removeWash : undefined} /> : <EmptyState icon={<Car size={28} />} title="لا توجد عمليات مسجلة حتى الآن" description="استخدم النموذج أعلاه لإضافة أول عملية." />}
+        {loading ? <LoadingBlock /> : washes.length ? <><WashList washes={washes} showWashType showPaidStatus paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? togglePaid : undefined} onEdit={canWrite ? setEditing : undefined} onDelete={canWrite ? removeWash : undefined} />{hasMore && <div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? 'جارٍ التحميل...' : 'تحميل عمليات أقدم'}</Button></div>}</> : <EmptyState icon={<Car size={28} />} title="لا توجد عمليات مسجلة حتى الآن" description="استخدم النموذج أعلاه لإضافة أول عملية." />}
       </SectionCard>
       {editing && <EditWashModal wash={editing} workers={workers} showrooms={showrooms} isManager={isManager || canWrite} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); void load(); refreshDashboard(); onNotify({ tone: 'success', text: 'تم حفظ حالة العملية وتحديث السجلات المرتبطة.' }); }} onNotify={onNotify} />}
     </>
@@ -1171,34 +1215,60 @@ function WashesView({ selectedDate, isManager, canWrite, onNotify }: { selectedD
 
 function PaidCarsView({ selectedDate, isManager, canWrite, onNotify }: { selectedDate: string; isManager: boolean; canWrite: boolean; onNotify: (message: ToastMessage) => void }) {
   const [items, setItems] = useState<Wash[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
   const [settlement, setSettlement] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [paidUpdatingId, setPaidUpdatingId] = useState<string | null>(null);
+  const loadSequence = useRef(0);
 
   const load = async () => {
+    const sequence = ++loadSequence.current;
     setLoading(true);
     setError(null);
     try {
-      const result = await api.paidCars({ date: selectedDate });
+      const result = await api.paidCars({ date: selectedDate, limit: 150 });
+      if (sequence !== loadSequence.current) return;
       setItems(result.items);
+      setTotalCount(result.total_count ?? result.items.length);
       setSettlement(safeNumber(result.settlement));
+      setHasMore(result.has_more === true);
+      setNextCursor(result.next_cursor ?? null);
     } catch (requestError) {
-      setError(friendlyError(requestError));
+      if (sequence === loadSequence.current) setError(friendlyError(requestError));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); }, [selectedDate]);
+  useEffect(() => { setItems([]); setHasMore(false); setNextCursor(null); void load(); }, [selectedDate]);
 
-  const revertToUnpaid = async (wash: Wash) => {
+  const loadMore = async () => {
+    if (loadingMore || !hasMore || !nextCursor) return;
+    const sequence = loadSequence.current;
+    const cursor = nextCursor;
+    setLoadingMore(true);
+    try {
+      const result = await api.paidCars({ date: selectedDate, limit: 150, cursor });
+      if (sequence !== loadSequence.current) return;
+      setItems((current) => appendUnique(current, result.items));
+      setHasMore(result.has_more === true);
+      setNextCursor(result.next_cursor ?? null);
+    } catch (requestError) { if (sequence === loadSequence.current) setError(friendlyError(requestError)); }
+    finally { if (sequence === loadSequence.current) setLoadingMore(false); }
+  };
+
+  const revertToUnpaid = useCallback(async (wash: Wash) => {
     if (paidUpdatingId) return;
     if (!window.confirm(wash.is_overnight ? 'هل تريد إرجاع هذه السيارة إلى سيارات المبيت؟' : 'هل تريد إرجاع هذه السيارة إلى أحدث العمليات؟')) return;
     setPaidUpdatingId(wash.id);
     try {
       const result = await api.setWashPaid(wash.id, false, selectedDate);
       setItems((current) => current.filter((item) => item.id !== wash.id));
+      setTotalCount((current) => Math.max(0, current - 1));
       setSettlement(result.settlement);
       refreshFinancialViews();
       onNotify({ tone: 'success', text: wash.is_overnight ? 'تم إرجاع السيارة إلى سيارات المبيت مع الاحتفاظ بتاريخ العملية الأصلي.' : 'تم إرجاع السيارة إلى غير خالصة وإعادة احتساب التسوية المالية.' });
@@ -1207,16 +1277,16 @@ function PaidCarsView({ selectedDate, isManager, canWrite, onNotify }: { selecte
     } finally {
       setPaidUpdatingId(null);
     }
-  };
+  }, [paidUpdatingId, selectedDate, onNotify]);
 
   return <>
     <PageHeader eyebrow="سجل التشغيل" title="السيارات الخالصة" description={`${isManager ? 'جميع العمليات الخالصة' : 'العمليات الخالصة المرتبطة بحسابك'} ليوم ${workingDateFormat(selectedDate)}.`} actions={<Button variant="secondary" onClick={() => void load()} icon={<RefreshCw size={17} />}>تحديث</Button>} />
     <div className="metric-grid paid-cars-summary">
-      <MetricCard label="عدد السيارات الخالصة" value={items.length} note={isManager ? 'من جميع حسابات الموظفين' : 'من عمليات حسابك فقط'} icon={<CheckCircle2 size={21} />} tone="teal" />
+      <MetricCard label="عدد السيارات الخالصة" value={totalCount} note={isManager ? 'من جميع حسابات الموظفين' : 'من عمليات حسابك فقط'} icon={<CheckCircle2 size={21} />} tone="teal" />
       <MetricCard label="التسوية المالية" value={money(settlement)} note="إجمالي أسعار السيارات الخالصة فقط" icon={<CircleDollarSign size={21} />} tone="blue" />
     </div>
     <SectionCard title="سجل السيارات الخالصة" subtitle={items.length ? `${items.length} عملية خالصة مرتبطة بسجل الغسيل الأصلي.` : 'تظهر هنا العمليات بعد اعتماد علامة الخالص.'} className="data-card">
-      {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={load} /> : items.length ? <WashList washes={items} showWashType showPaidStatus showCreator={isManager} showCarColor showWorkerEntitlement={isManager} paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? revertToUnpaid : undefined} /> : <EmptyState icon={<CheckCircle2 size={29} />} title="لا توجد سيارات خالصة" description="استخدم علامة الصح بجانب عملية الغسيل لاعتمادها كخالصة." />}
+      {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={load} /> : items.length ? <><WashList washes={items} showWashType showPaidStatus showCreator={isManager} showCarColor showWorkerEntitlement={isManager} paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite ? revertToUnpaid : undefined} />{hasMore && <div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? 'جارٍ التحميل...' : 'تحميل سيارات أقدم'}</Button></div>}</> : <EmptyState icon={<CheckCircle2 size={29} />} title="لا توجد سيارات خالصة" description="استخدم علامة الصح بجانب عملية الغسيل لاعتمادها كخالصة." />}
     </SectionCard>
   </>;
 }
@@ -1239,12 +1309,18 @@ function OvernightCarsView({ selectedDate, canWrite, onNotify }: { selectedDate:
   const [deletingId,setDeletingId]=useState<string|null>(null);
   const [paidUpdatingId,setPaidUpdatingId]=useState<string|null>(null);
   const [loading,setLoading]=useState(true);
+  const [loadingMore,setLoadingMore]=useState(false);
+  const [hasMore,setHasMore]=useState(false);
+  const [nextCursor,setNextCursor]=useState<string|null>(null);
   const [error,setError]=useState<string|null>(null);
-  const load=async()=>{setLoading(true);setError(null);try{const [overnight,activeWorkers,availableShowrooms]=await Promise.all([api.overnightCars({date:selectedDate}),api.workers({status:'active',include_financials:false}),api.showrooms({include_financials:false})]);setItems(overnight);setWorkers(activeWorkers);setShowrooms(availableShowrooms);}catch(requestError){setError(friendlyError(requestError));}finally{setLoading(false);}};
-  useEffect(()=>{void load();},[selectedDate]);
+  const loadSequence=useRef(0);
+  const overnightByWashId=useMemo(()=>new Map(items.map((item)=>[item.wash.id,item])),[items]);
+  const overnightWashes=useMemo(()=>items.map((item)=>item.wash),[items]);
+  const load=async(append=false)=>{if(append&&(loadingMore||!hasMore||!nextCursor))return;const sequence=++loadSequence.current;append?setLoadingMore(true):setLoading(true);setError(null);try{const pagePromise=api.overnightCarPage({date:selectedDate,limit:100,cursor:append?nextCursor:null});if(append){const page=await pagePromise;if(sequence===loadSequence.current){setItems(current=>appendUnique(current,page.items));setHasMore(page.has_more);setNextCursor(page.next_cursor);}}else{const [page,activeWorkers,availableShowrooms]=await Promise.all([pagePromise,api.workers({status:'active',include_financials:false}),api.showrooms({include_financials:false})]);if(sequence===loadSequence.current){setItems(page.items);setHasMore(page.has_more);setNextCursor(page.next_cursor);setWorkers(activeWorkers);setShowrooms(availableShowrooms);}}}catch(requestError){if(sequence===loadSequence.current)setError(friendlyError(requestError));}finally{if(sequence===loadSequence.current){setLoading(false);setLoadingMore(false);}}};
+  useEffect(()=>{setItems([]);setHasMore(false);setNextCursor(null);void load();},[selectedDate]);
   const remove=async(item:OvernightCar)=>{if(deletingId||!window.confirm(`هل تريد حذف سجل سيارة ${item.wash.vehicle_make} ${item.wash.vehicle_model}؟ ستبقى عملية الغسيل الأصلية محفوظة.`))return;setDeletingId(item.id);try{await api.deleteOvernightCar(item.id);setItems(current=>current.filter(entry=>entry.id!==item.id));onNotify({tone:'success',text:'تم حذف سجل سيارة المبيت مع الاحتفاظ بعملية الغسيل الأصلية.'});}catch(requestError){onNotify({tone:'error',text:friendlyError(requestError)});}finally{setDeletingId(null);}};
   const complete=async(wash:Wash)=>{if(paidUpdatingId)return;setPaidUpdatingId(wash.id);try{await api.setWashPaid(wash.id,true,selectedDate);setItems(current=>current.filter(entry=>entry.wash.id!==wash.id));refreshFinancialViews();onNotify({tone:'success',text:'تم نقل السيارة إلى السيارات الخالصة مع الاحتفاظ بتاريخ العملية الأصلي.'});}catch(requestError){onNotify({tone:'error',text:friendlyError(requestError)});}finally{setPaidUpdatingId(null);}};
-  return <><PageHeader eyebrow="سجل التشغيل" title="سيارات المبيت" description={`السيارات المرتبطة بعمليات يوم ${workingDateFormat(selectedDate)} والمعلّمة للمبيت.`}/><SectionCard title="سجل سيارات المبيت" subtitle={items.length?`${items.length} سيارة مسجلة للمبيت`:'تظهر هنا السيارات التي يحددها المستخدم من تعديل عملية الغسيل.'} className="data-card">{loading?<LoadingBlock/>:error?<InlineRetry error={error} onRetry={load}/>:items.length?<WashList washes={items.map(item=>item.wash)} showWashType paidActionLabel="تم الخلاص" paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite?complete:undefined} onEdit={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)setEditing(item);}) : undefined} onDelete={canWrite ? (wash=>{const item=items.find(entry=>entry.wash.id===wash.id);if(item)void remove(item);}) : undefined}/>:<EmptyState icon={<Moon size={28}/>} title="لا توجد سيارات مبيت" description="يمكن تعليم السيارة للمبيت من نافذة تعديل عملية الغسيل."/>}</SectionCard>{editing&&<EditWashModal wash={editing.wash} workers={workers} showrooms={showrooms} isManager={canWrite} onClose={()=>setEditing(null)} onSaved={()=>{setEditing(null);void load();onNotify({tone:'success',text:'تم تحديث بيانات سيارة المبيت والعملية المرتبطة.'});}} onNotify={onNotify}/>}</>;
+  return <><PageHeader eyebrow="سجل التشغيل" title="سيارات المبيت" description={`السيارات المرتبطة بعمليات يوم ${workingDateFormat(selectedDate)} والمعلّمة للمبيت.`}/><SectionCard title="سجل سيارات المبيت" subtitle={items.length?`${items.length} سيارة محملة للمبيت`:'تظهر هنا السيارات التي يحددها المستخدم من تعديل عملية الغسيل.'} className="data-card">{loading?<LoadingBlock/>:error?<InlineRetry error={error} onRetry={()=>void load()}/>:items.length?<><WashList washes={overnightWashes} showWashType paidActionLabel="تم الخلاص" paidUpdatingId={paidUpdatingId} onTogglePaid={canWrite?complete:undefined} onEdit={canWrite ? (wash=>{const item=overnightByWashId.get(wash.id);if(item)setEditing(item);}) : undefined} onDelete={canWrite ? (wash=>{const item=overnightByWashId.get(wash.id);if(item)void remove(item);}) : undefined}/>{hasMore&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={()=>void load(true)}>{loadingMore?'جارٍ التحميل...':'تحميل سيارات مبيت أقدم'}</Button></div>}</>:<EmptyState icon={<Moon size={28}/>} title="لا توجد سيارات مبيت" description="يمكن تعليم السيارة للمبيت من نافذة تعديل عملية الغسيل."/>}</SectionCard>{editing&&<EditWashModal wash={editing.wash} workers={workers} showrooms={showrooms} isManager={canWrite} onClose={()=>setEditing(null)} onSaved={()=>{setEditing(null);void load();onNotify({tone:'success',text:'تم تحديث بيانات سيارة المبيت والعملية المرتبطة.'});}} onNotify={onNotify}/>}</>;
 }
 
 function WorkersView({ selectedDate, currentUserId, isManager, canWrite, canFinancial, onNotify }: { selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; canFinancial: boolean; onNotify: (message: ToastMessage) => void }) {
@@ -1266,7 +1342,10 @@ function WorkersView({ selectedDate, currentUserId, isManager, canWrite, canFina
   };
 
   useEffect(() => { void load(); }, [selectedDate]);
-  const filteredWorkers = workers.filter((worker) => worker.name.toLowerCase().includes(query.toLowerCase()));
+  const filteredWorkers = useMemo(() => {
+    const normalizedQuery = query.toLowerCase();
+    return workers.filter((worker) => worker.name.toLowerCase().includes(normalizedQuery));
+  }, [workers, query]);
 
   return (
     <>
@@ -1302,19 +1381,23 @@ function WorkerCard({ worker, canFinancial, onClick }: { worker: Worker; canFina
 }
 
 function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWrite, canFinancial, range, onClose, onChanged, onDeleted, onNotify }: { workerId: string; selectedDate: string; currentUserId: string; isManager: boolean; canWrite: boolean; canFinancial: boolean; range: DateRange; onClose: () => void; onChanged: () => void; onDeleted: (workerId: string) => void; onNotify: (message: ToastMessage) => void }) {
-  const [worker, setWorker] = useState<(Worker & { washes?: Wash[] }) | null>(null);
+  const [worker, setWorker] = useState<(Worker & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null }) | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [editing, setEditing] = useState(false);
   const [ledgerOpen, setLedgerOpen] = useState(false);
   const deletingWashIds = useRef(new Set<string>());
+  const historyGeneration=useRef(0);
 
   useEffect(() => {
+    const generation=++historyGeneration.current;
     let mounted = true;
+    setWorker(null);
     const load = async () => {
       setLoading(true);
       try {
         const result = await api.worker(workerId, canFinancial, selectedDate);
-        if (mounted) setWorker(result);
+        if (mounted&&generation===historyGeneration.current) setWorker(result);
       } catch (error) {
         onNotify({ tone: 'error', text: friendlyError(error) });
         onClose();
@@ -1323,6 +1406,17 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
     void load();
     return () => { mounted = false; };
   }, [workerId, selectedDate, canFinancial]);
+
+  const loadMoreWashes = async () => {
+    if (!worker?.washes_has_more || loadingMore) return;
+    const generation=historyGeneration.current;
+    setLoadingMore(true);
+    try {
+      const page = await api.workerHistoryPage(workerId, selectedDate, worker.washes_next_cursor ?? '');
+      if(generation===historyGeneration.current)setWorker((current) => current ? { ...current, washes: appendUnique(current.washes ?? [], page.items), washes_has_more: page.has_more, washes_next_cursor: page.next_cursor } : current);
+    } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); }
+    finally { setLoadingMore(false); }
+  };
 
   const removeWash = async (wash: Wash) => {
     if (deletingWashIds.current.has(wash.id) || !window.confirm(`هل تريد حذف عملية ${wash.vehicle_make} ${wash.vehicle_model} من سجل العامل؟ سيتم عكس آثارها المالية بأمان.`)) return;
@@ -1356,7 +1450,7 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
         </section>
       )}
       {isManager && <button type="button" className="worker-ledger-entry glass-card" onClick={() => setLedgerOpen(true)}><div className="worker-ledger-entry__icon"><WalletCards size={21} /></div><div><strong>المسحوبات والمرتجعات</strong><span>السجل الكامل والرصيد القائم للعامل</span></div><ChevronLeft size={18} /></button>}
-      <section className="profile-history"><div className="profile-section-heading"><h3>سجل عمليات الغسيل</h3><span>{worker.washes?.length ?? 0} عملية</span></div>{worker.washes?.length ? <WashList washes={worker.washes} compact onDelete={canWrite ? (wash) => void removeWash(wash) : undefined} canDelete={(wash) => isManager || wash.created_by_id === currentUserId} /> : <EmptyState title="لا توجد عمليات ضمن هذه الفترة" />}</section>
+      <section className="profile-history"><div className="profile-section-heading"><h3>سجل عمليات الغسيل</h3><span>{worker.washes?.length ?? 0} عملية محملة</span></div>{worker.washes?.length ? <><WashList washes={worker.washes} compact onDelete={canWrite ? (wash) => void removeWash(wash) : undefined} canDelete={(wash) => isManager || wash.created_by_id === currentUserId} />{worker.washes_has_more && <div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={() => void loadMoreWashes()}>{loadingMore ? 'جارٍ التحميل...' : 'تحميل عمليات أقدم'}</Button></div>}</> : <EmptyState title="لا توجد عمليات ضمن هذه الفترة" />}</section>
       {editing&&<EditWorkerModal worker={worker} canFinancial={canFinancial} onClose={()=>setEditing(false)} onSaved={()=>{setEditing(false);onChanged();onNotify({tone:'success',text:'تم تحديث بيانات العامل.'});}} onNotify={onNotify}/>}
       {ledgerOpen && <WorkerWithdrawalsReturnsView workerId={worker.id} workerName={worker.name} selectedDate={selectedDate} onClose={() => setLedgerOpen(false)} onNotify={onNotify} />}
     </SidePanel>
@@ -1366,14 +1460,16 @@ function WorkerProfile({ workerId, selectedDate, currentUserId, isManager, canWr
 function WorkerWithdrawalsReturnsView({ workerId, workerName, selectedDate, onClose, onNotify }: { workerId: string; workerName: string; selectedDate: string; onClose: () => void; onNotify: (message: ToastMessage) => void }) {
   const [ledger, setLedger] = useState<WorkerWithdrawalReturnLedger | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [entryType, setEntryType] = useState<'withdrawal' | 'return' | 'deduction_payment' | null>(null);
   const [editingPayment, setEditingPayment] = useState<WorkerWithdrawalReturnLedger['transactions'][number] | null>(null);
   const [settling, setSettling] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [deletingMovementId, setDeletingMovementId] = useState<string | null>(null);
-  const load = async () => { setLoading(true); setError(null); try { setLedger(await api.workerWithdrawalReturns(workerId, { from: '0000-01-01T00:00:00Z', to: '9999-12-31T23:59:59Z' })); } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); } };
-  useEffect(() => { void load(); }, [workerId, selectedDate]);
+  const loadSequence = useRef(0);
+  const load = async (append = false) => { if(append&&(loadingMore||!ledger?.has_more||!ledger.next_cursor))return; const sequence=++loadSequence.current; append?setLoadingMore(true):setLoading(true); setError(null); try { const next=await api.workerWithdrawalReturns(workerId, { from: '0000-01-01T00:00:00Z', to: '9999-12-31T23:59:59Z', limit:100, cursor:append?ledger?.next_cursor:null }); if(sequence===loadSequence.current)setLedger(current=>append&&current?{...next,transactions:appendUnique(current.transactions,next.transactions)}:next); } catch (requestError) { if(sequence===loadSequence.current)setError(friendlyError(requestError)); } finally { if(sequence===loadSequence.current){setLoading(false);setLoadingMore(false);} } };
+  useEffect(() => { setLedger(null); void load(); }, [workerId, selectedDate]);
   const settle = async () => {
     if (!ledger || Number(ledger.remaining_withdrawal_debt) <= 0 || !window.confirm(`هل تريد تسوية كامل دين المسحوبات للعامل ${workerName}؟ ستُحفظ التسوية كحركة مستقلة ولن تُحذف الحركات السابقة.`)) return;
     setSettling(true);
@@ -1408,12 +1504,12 @@ function WorkerWithdrawalsReturnsView({ workerId, workerName, selectedDate, onCl
     {loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : ledger && <>
       <div className="mini-metric-grid worker-ledger-summary"><MiniMetric label="إجمالي المسحوبات" value={ledger.total_withdrawals} tone="danger" /><MiniMetric label="باقي دين المسحوبات" value={ledger.remaining_withdrawal_debt} tone="warning" /><MiniMetric label="إجمالي الاستقطاعات" value={ledger.total_deductions} tone="danger" /><MiniMetric label="تسديد الاستقطاع" value={ledger.total_deduction_payments} tone="success" /><MiniMetric label="الرصيد القائم" value={ledger.outstanding_deduction_balance} tone="warning" /></div>
       <div className="profile-actions"><Button onClick={() => setEntryType('withdrawal')} icon={<ArrowDownLeft size={17} />}>إضافة مسحوب</Button><Button variant="secondary" onClick={() => setEntryType('return')} disabled={Number(ledger.remaining_withdrawal_debt) <= 0} icon={<ArrowUpLeft size={17} />}>إضافة مرتجع</Button><Button variant="secondary" onClick={() => setEntryType('deduction_payment')} disabled={Number(ledger.outstanding_deduction_balance) <= 0} icon={<Banknote size={17} />}>تسديد استقطاع</Button><Button variant="secondary" onClick={() => void settle()} disabled={settling || Number(ledger.remaining_withdrawal_debt) <= 0} icon={settling ? <LoaderCircle size={17} className="spin" /> : <CheckCircle2 size={17} />}>{settling ? 'جارٍ التسوية...' : 'تسوية دين المسحوبات'}</Button><Button variant="danger" onClick={() => void resetAll()} disabled={resetting} icon={resetting ? <LoaderCircle size={17} className="spin" /> : <Trash2 size={17} />}>{resetting ? 'جارٍ التصفير...' : 'تصفير جميع السجلات'}</Button></div>
-      <SectionCard title="سجل الحركات" subtitle={`${ledger.transactions.length} حركة مسجلة للعامل المحدد فقط.`}>
-        {ledger.transactions.length === 0 ? <EmptyState icon={<WalletCards size={27} />} title="لا توجد حركات مالية" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>النوع</th><th>المبلغ</th><th>التاريخ</th><th>الملاحظة</th><th>سجله</th><th>إجراء</th></tr></thead><tbody>{ledger.transactions.map((transaction) => {
+      <SectionCard title="سجل الحركات" subtitle={`${ledger.transactions.length} حركة محملة للعامل المحدد فقط.`}>
+        {ledger.transactions.length === 0 ? <EmptyState icon={<WalletCards size={27} />} title="لا توجد حركات مالية" /> : <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>النوع</th><th>المبلغ</th><th>التاريخ</th><th>الملاحظة</th><th>سجله</th><th>إجراء</th></tr></thead><WindowedTableBody items={ledger.transactions} getKey={(item)=>item.id} columnCount={6} label="الحركات المحملة" renderRow={(transaction) => {
           const label = transaction.type === 'withdrawal' ? 'مسحوب' : transaction.type === 'deduction' ? 'استقطاع' : transaction.type === 'return' ? 'مرتجع' : transaction.type === 'deduction_payment' ? 'تسديد استقطاع' : 'تسوية دين المسحوبات';
           const tone = transaction.type === 'withdrawal' || transaction.type === 'deduction' ? 'danger' : transaction.type === 'return' || transaction.type === 'deduction_payment' ? 'success' : 'info';
           return <tr key={transaction.id}><td><StatusBadge tone={tone}>{label}</StatusBadge></td><td className="money-cell">{money(transaction.amount)}</td><td>{dateFormat(transaction.occurred_at)}</td><td>{transaction.notes || '—'}</td><td>{transaction.created_by_name || '—'}</td><td><div className="worker-ledger-row-actions">{transaction.editable && <button type="button" className="table-action worker-ledger-edit" onClick={() => setEditingPayment(transaction)} title="تعديل تسديد الاستقطاع" aria-label="تعديل تسديد الاستقطاع"><Pencil size={15} /></button>}{transaction.deletable ? <button type="button" className="table-action danger-action worker-ledger-delete" onClick={() => void removeMovement(transaction.id, label)} disabled={deletingMovementId === transaction.id} title={`حذف حركة ${label}`} aria-label={`حذف حركة ${label}`}>{deletingMovementId === transaction.id ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button> : <span className="table-muted" title="يُدار الاستقطاع من المصروف المرتبط">—</span>}</div></td></tr>;
-        })}</tbody></table></div>}
+        }} /></table></div>{ledger.has_more&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={()=>void load(true)}>{loadingMore?'جارٍ التحميل...':'تحميل حركات أقدم'}</Button></div>}</>}
       </SectionCard>
     </>}
     {entryType && <WorkerWithdrawalReturnModal type={entryType} workerId={workerId} selectedDate={selectedDate} onClose={() => setEntryType(null)} onSaved={() => { setEntryType(null); void load(); onNotify({ tone: 'success', text: entryType === 'withdrawal' ? 'تم تسجيل المسحوب وتحديث الرصيد القائم.' : entryType === 'return' ? 'تم تسجيل المرتجع وتحديث الرصيد القائم.' : 'تم تسجيل تسديد الاستقطاع وتحديث الرصيد القائم.' }); }} onNotify={onNotify} />}
@@ -1426,7 +1522,8 @@ function WorkerWithdrawalReturnModal({ type, workerId, selectedDate, movement, o
   const [date, setDate] = useState(movement?.occurred_at.slice(0, 10) || selectedDate);
   const [notes, setNotes] = useState(movement?.notes || '');
   const [saving, setSaving] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { const data = { amount, occurred_at: new Date(`${date}T12:00:00`).toISOString(), notes: notes.trim() || null }; if (movement) await api.updateWorkerDeductionPayment(workerId, movement.id, data); else await api.createWorkerWithdrawalReturn(workerId, { type, ...data }); onSaved(); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
+  const createRequestId = useRef(crypto.randomUUID());
+  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { const data = { amount, occurred_at: new Date(`${date}T12:00:00`).toISOString(), notes: notes.trim() || null }; if (movement) await api.updateWorkerDeductionPayment(workerId, movement.id, data); else await api.createWorkerWithdrawalReturn(workerId, { type, ...data, client_request_id: createRequestId.current }); onSaved(); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
   const title = movement ? 'تعديل تسديد استقطاع' : type === 'withdrawal' ? 'إضافة مسحوب' : type === 'return' ? 'إضافة مرتجع' : 'تسديد استقطاع';
   return <Modal title={title} onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المبلغ" required><input value={amount} onChange={(event) => setAmount(event.target.value)} type="number" min="0.001" step="0.001" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={date} onChange={(event) => setDate(event.target.value)} type="date" required /></FormField><FormField label="ملاحظة"><textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : movement ? 'حفظ التعديل' : 'حفظ الحركة'}</Button></div></form></Modal>;
 }
@@ -1470,7 +1567,10 @@ function ShowroomDebtsView({ selectedDate, reportIssuer, onNotify }: { selectedD
     window.addEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
     return () => window.removeEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
   }, [selectedDate]);
-  const filtered = items.filter((item) => item.showroom.name.toLowerCase().includes(query.toLowerCase()));
+  const filtered = useMemo(() => {
+    const normalizedQuery = query.toLowerCase();
+    return items.filter((item) => item.showroom.name.toLowerCase().includes(normalizedQuery));
+  }, [items, query]);
   return <>
     <PageHeader eyebrow="الحسابات المالية" title="ديون المعارض" description={`أرصدة المعارض كما كانت حتى نهاية ${workingDateFormat(selectedDate)}، مستمدة مباشرة من العمليات والدفعات المسجلة.`} actions={<Button variant="secondary" onClick={() => void load()} icon={<RefreshCw size={17} />}>تحديث</Button>} />
     <SectionCard className="filter-card"><div className="filter-bar"><div className="search-box"><Search size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="ابحث باسم المعرض" /></div><span className="filter-hint"><Building2 size={17} /> تظهر المعارض التي لديها عمليات غسيل آجلة قائمة فقط.</span></div></SectionCard>
@@ -1495,16 +1595,24 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
   const [refreshKey, setRefreshKey] = useState(0);
   const [editingPayment, setEditingPayment] = useState<PaymentRecord | null>(null);
   const [reportGeneratedAt, setReportGeneratedAt] = useState(() => new Date());
+  const [printProfile, setPrintProfile] = useState<ShowroomDebtProfile | null>(null);
+  const [loadingMoreOperations,setLoadingMoreOperations]=useState(false);const[loadingMoreDebtPayments,setLoadingMoreDebtPayments]=useState(false);const[preparingPrint,setPreparingPrint]=useState(false);
+  const requestKey=useRef('');requestKey.current=`${showroomId}:${range.from}:${range.to}:${refreshKey}`;
   const rangeIsComplete = Boolean(range.from && range.to);
   const rangeIsValid = rangeIsComplete && range.from <= range.to;
-  const printDebtReport = () => {
-    setReportGeneratedAt(new Date());
-    window.requestAnimationFrame(() => window.print());
+  const printDebtReport = async () => {
+    if(!profile||preparingPrint)return;setPreparingPrint(true);const key=requestKey.current;
+    try{let operations=[...profile.operations],payments=[...profile.payments],operationsCursor=profile.operations_next_cursor,paymentsCursor=profile.payments_next_cursor,moreOperations=profile.operations_has_more,morePayments=profile.payments_has_more;
+      while(moreOperations&&operationsCursor){const page=await api.showroomDebt(showroomId,range,{operations:operationsCursor});if(key!==requestKey.current)return;operations=appendUnique(operations,page.operations);operationsCursor=page.operations_next_cursor;moreOperations=page.operations_has_more;}
+      while(morePayments&&paymentsCursor){const page=await api.showroomDebt(showroomId,range,{payments:paymentsCursor});if(key!==requestKey.current)return;payments=appendUnique(payments,page.payments);paymentsCursor=page.payments_next_cursor;morePayments=page.payments_has_more;}
+      const complete={...profile,operations,payments,operations_has_more:false,payments_has_more:false,operations_next_cursor:operationsCursor,payments_next_cursor:paymentsCursor};setPrintProfile(complete);setReportGeneratedAt(new Date());window.requestAnimationFrame(()=>window.print());
+    }catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{if(key===requestKey.current)setPreparingPrint(false);}
   };
   useEffect(() => { setRange(selectedDateRange(selectedDate)); }, [selectedDate]);
   useEffect(() => {
     if (!rangeIsValid) { setLoading(false); return; }
     let mounted = true;
+    setProfile(null);
     setLoading(true);
     setError(null);
     api.showroomDebt(showroomId, range)
@@ -1518,6 +1626,13 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
     window.addEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
     return () => window.removeEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
   }, []);
+  useEffect(() => {
+    const clearPrintData = () => setPrintProfile(null);
+    window.addEventListener('afterprint', clearPrintData);
+    return () => window.removeEventListener('afterprint', clearPrintData);
+  }, []);
+  const loadMoreDebtOperations=async()=>{if(!profile?.operations_has_more||!profile.operations_next_cursor||loadingMoreOperations)return;const key=requestKey.current;setLoadingMoreOperations(true);try{const page=await api.showroomDebt(showroomId,range,{operations:profile.operations_next_cursor});if(key===requestKey.current)setProfile(current=>current?{...current,operations:appendUnique(current.operations,page.operations),operations_has_more:page.operations_has_more,operations_next_cursor:page.operations_next_cursor}:current);}catch(error){if(key===requestKey.current)onNotify({tone:'error',text:friendlyError(error)});}finally{if(key===requestKey.current)setLoadingMoreOperations(false);}};
+  const loadMoreDebtPayments=async()=>{if(!profile?.payments_has_more||!profile.payments_next_cursor||loadingMoreDebtPayments)return;const key=requestKey.current;setLoadingMoreDebtPayments(true);try{const page=await api.showroomDebt(showroomId,range,{payments:profile.payments_next_cursor});if(key===requestKey.current)setProfile(current=>current?{...current,payments:appendUnique(current.payments,page.payments),payments_has_more:page.payments_has_more,payments_next_cursor:page.payments_next_cursor}:current);}catch(error){if(key===requestKey.current)onNotify({tone:'error',text:friendlyError(error)});}finally{if(key===requestKey.current)setLoadingMoreDebtPayments(false);}};
   if (!profile && loading) return <Modal title="ملف ديون المعرض" onClose={onClose} wide><LoadingBlock label="جارٍ تحميل عمليات الدين..." /></Modal>;
   if (!profile && error) return <Modal title="ملف ديون المعرض" onClose={onClose} wide><InlineRetry error={error} onRetry={() => setRefreshKey((current) => current + 1)} /></Modal>;
   if (!profile) return null;
@@ -1528,18 +1643,18 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
       <SectionCard title="فترة تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تعتمد على تاريخ عملية الغسيل الفعلي." action={<div className="showroom-debt-print-controls">
         <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => setRange((current) => ({ ...current, from: event.target.value }))} /></label>
         <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => setRange((current) => ({ ...current, to: event.target.value }))} /></label>
-        <Button onClick={printDebtReport} disabled={loading || !rangeIsValid} icon={loading ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>طباعة تقرير الدين</Button>
+        <Button onClick={()=>void printDebtReport()} disabled={loading || preparingPrint || !rangeIsValid} icon={loading||preparingPrint ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>{preparingPrint?'جارٍ تجهيز السجل الكامل...':'طباعة تقرير الدين'}</Button>
       </div>}>
         {!rangeIsComplete ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> يرجى تحديد تاريخ البداية وتاريخ النهاية.</div> : range.from > range.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="date-filter"><CalendarDays size={17} /><span>الفترة المختارة:</span><strong>{workingDateFormat(range.from)} — {workingDateFormat(range.to)}</strong></div>}
       </SectionCard>
       <SectionCard title="عمليات الغسيل الآجلة" subtitle={`${formatNumber(profile.outstanding_wash_count)} عملية ضمن الفترة المحددة.`}>
-        {loading ? <LoadingBlock label="جارٍ تحديث الفترة..." /> : profile.operations.length === 0 ? <EmptyState icon={<Car size={28} />} title="لا توجد عمليات دين ضمن الفترة المحددة" /> : <div className="data-table-wrap"><table className="data-table showroom-debt-table"><thead><tr><th>السيارة</th><th>اللوحة</th><th>اللون</th><th>العامل</th><th>طريقة السداد</th><th>التاريخ والوقت</th><th>السعر</th></tr></thead><tbody>{profile.operations.map((operation) => <tr key={operation.id}><td><strong>{operation.vehicle_make} {operation.vehicle_model}</strong><small>{operation.manufacturing_year || '—'}</small></td><td>{operation.license_plate || '—'}</td><td>{operation.car_color || '—'}</td><td>{operation.worker_name || '—'}</td><td>{operation.showroom_payment_method === 'bank' ? 'مصرفي' : 'نقدي'}</td><td>{dateFormat(operation.performed_at, true)}</td><td className="money-cell">{money(operation.price)}</td></tr>)}</tbody></table></div>}
+        {loading ? <LoadingBlock label="جارٍ تحديث الفترة..." /> : profile.operations.length === 0 ? <EmptyState icon={<Car size={28} />} title="لا توجد عمليات دين ضمن الفترة المحددة" /> : <><div className="data-table-wrap"><table className="data-table showroom-debt-table"><thead><tr><th>السيارة</th><th>اللوحة</th><th>اللون</th><th>العامل</th><th>طريقة السداد</th><th>التاريخ والوقت</th><th>السعر</th></tr></thead><WindowedTableBody items={profile.operations} getKey={(item)=>item.id} columnCount={7} label="عمليات الدين المحملة" renderRow={(operation)=><tr><td><strong>{operation.vehicle_make} {operation.vehicle_model}</strong><small>{operation.manufacturing_year || '—'}</small></td><td>{operation.license_plate || '—'}</td><td>{operation.car_color || '—'}</td><td>{operation.worker_name || '—'}</td><td>{operation.showroom_payment_method === 'bank' ? 'مصرفي' : 'نقدي'}</td><td>{dateFormat(operation.performed_at, true)}</td><td className="money-cell">{money(operation.price)}</td></tr>} /></table></div>{profile.operations_has_more&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMoreOperations} onClick={()=>void loadMoreDebtOperations()}>{loadingMoreOperations?'جارٍ التحميل...':'تحميل عمليات أقدم'}</Button></div>}</>}
       </SectionCard>
       <SectionCard title="سجل دفعات المعرض" subtitle={`${profile.payments.length} دفعة ضمن الفترة المحددة.`}>
-        {profile.payments.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد دفعات ضمن الفترة المحددة" /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{profile.payments.map((payment) => <tr key={payment.id}><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td><td><div className="row-actions"><button type="button" onClick={() => setEditingPayment(payment)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button><button type="button" className="danger-action" onClick={async () => { if (!window.confirm('هل تريد حذف هذه الدفعة؟ سيعود المبلغ إلى رصيد المعرض.')) return; try { await api.deleteShowroomPayment(payment.id); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم حذف الدفعة وإعادة احتساب رصيد المعرض.' }); } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); } }} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+        {profile.payments.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد دفعات ضمن الفترة المحددة" /> : <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><WindowedTableBody items={profile.payments} getKey={(item)=>item.id} columnCount={5} label="دفعات الدين المحملة" renderRow={(payment)=><tr><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td><td><div className="row-actions"><button type="button" onClick={() => setEditingPayment(payment)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button><button type="button" className="danger-action" onClick={async () => { if (!window.confirm('هل تريد حذف هذه الدفعة؟ سيعود المبلغ إلى رصيد المعرض.')) return; try { await api.deleteShowroomPayment(payment.id); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم حذف الدفعة وإعادة احتساب رصيد المعرض.' }); } catch (requestError) { onNotify({ tone: 'error', text: friendlyError(requestError) }); } }} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button></div></td></tr>} /></table></div>{profile.payments_has_more&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMoreDebtPayments} onClick={()=>void loadMoreDebtPayments()}>{loadingMoreDebtPayments?'جارٍ التحميل...':'تحميل دفعات أقدم'}</Button></div>}</>}
       </SectionCard>
     </div>
-    <ShowroomDebtPrintReport profile={profile} range={range} reportIssuer={reportIssuer} generatedAt={reportGeneratedAt} />
+    {printProfile && <ShowroomDebtPrintReport profile={printProfile} range={range} reportIssuer={reportIssuer} generatedAt={reportGeneratedAt} />}
     {editingPayment && <ShowroomPaymentModal payment={editingPayment} showrooms={[profile.showroom]} onClose={() => setEditingPayment(null)} onNotify={onNotify} onSaved={() => { setEditingPayment(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تعديل الدفعة وإعادة احتساب رصيد المعرض.' }); }} />}
   </Modal>;
 }
@@ -1644,8 +1759,11 @@ function ShowroomsView({ selectedDate, canFinancial, canWrite, onNotify }: { sel
     setLoading(true);
     try { setShowrooms(await api.showrooms({ date: selectedDate, include_financials: canFinancial })); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setLoading(false); }
   };
-  useEffect(() => { void load(); }, [canFinancial, selectedDate]);
-  const filteredShowrooms = showrooms.filter((showroom) => showroom.name.toLowerCase().includes(query.toLowerCase()));
+  useEffect(() => { setShowrooms([]); void load(); }, [canFinancial, selectedDate]);
+  const filteredShowrooms = useMemo(() => {
+    const normalizedQuery = query.toLowerCase();
+    return showrooms.filter((showroom) => showroom.name.toLowerCase().includes(normalizedQuery));
+  }, [showrooms, query]);
 
   return (
     <>
@@ -1672,16 +1790,21 @@ function ShowroomCard({ showroom, isManager, canWrite, onClick, onEdit, onDelete
 }
 
 function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotify }: { showroomId: string; selectedDate: string; isManager: boolean; onClose: () => void; onNotify: (message: ToastMessage) => void }) {
-  const [showroom, setShowroom] = useState<(Showroom & { washes?: Wash[] }) | null>(null);
+  const [showroom, setShowroom] = useState<(Showroom & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null; payments_has_more?: boolean; payments_next_cursor?: string | null }) | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMoreWashes, setLoadingMoreWashes] = useState(false);
+  const [loadingMorePayments, setLoadingMorePayments] = useState(false);
   const [statisticsLoading, setStatisticsLoading] = useState(true);
   const [carCount, setCarCount] = useState(0);
   const [statisticsRange, setStatisticsRange] = useState<DateRange>(() => selectedDateRange(selectedDate));
   const [paymentType, setPaymentType] = useState<'all' | 'cash' | 'debt'>('all');
+  const detailGeneration=useRef(0);
   useEffect(() => {
+    const generation=++detailGeneration.current;
     let mounted = true;
+    setShowroom(null);
     const load = async () => {
-      try { const result = await api.showroom(showroomId, isManager, selectedDate); if (mounted) setShowroom(result); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); onClose(); } finally { if (mounted) setLoading(false); }
+      try { const result = await api.showroom(showroomId, isManager, selectedDate); if (mounted&&generation===detailGeneration.current) setShowroom(result); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); onClose(); } finally { if (mounted) setLoading(false); }
     };
     void load();
     const handleRefresh = () => { void load(); };
@@ -1699,6 +1822,8 @@ function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotif
       .finally(() => { if (mounted) setStatisticsLoading(false); });
     return () => { mounted = false; };
   }, [showroomId, statisticsRange.from, statisticsRange.to, paymentType]);
+  const loadMoreWashes = async () => { if(!showroom?.washes_has_more||!showroom.washes_next_cursor||loadingMoreWashes)return;const generation=detailGeneration.current;setLoadingMoreWashes(true);try{const page=await api.showroomHistoryPage(showroomId,selectedDate,showroom.washes_next_cursor);if(generation===detailGeneration.current)setShowroom(current=>current?{...current,washes:appendUnique(current.washes??[],page.items),washes_has_more:page.has_more,washes_next_cursor:page.next_cursor}:current);}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{if(generation===detailGeneration.current)setLoadingMoreWashes(false);} };
+  const loadMorePayments = async () => { if(!showroom?.payments_has_more||!showroom.payments_next_cursor||loadingMorePayments)return;const generation=detailGeneration.current;setLoadingMorePayments(true);try{const page=await api.showroomPaymentPage(showroomId,selectedDate,showroom.payments_next_cursor);if(generation===detailGeneration.current)setShowroom(current=>current?{...current,payments:appendUnique(current.payments??[],page.items),payments_has_more:page.has_more,payments_next_cursor:page.next_cursor}:current);}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{if(generation===detailGeneration.current)setLoadingMorePayments(false);} };
   if (!showroom && loading) return <SidePanel title="ملف المعرض" onClose={onClose}><LoadingBlock /></SidePanel>;
   if (!showroom) return null;
   const finance = isManager ? showroom.financials : undefined;
@@ -1707,7 +1832,7 @@ function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotif
     <div className="showroom-details"><span><Phone size={16} /> {showroom.phone || 'لا يوجد رقم اتصال'}</span>{showroom.address && <span>الموقع: {showroom.address}</span>}</div>
     <div className="exhibition-profile-card-stack">
       {isManager && finance && <section className="profile-financials"><div className="sensitive-label"><LockKeyhole size={14} /> تفاصيل مالية مخولة</div><div className="mini-metric-grid"><MiniMetric label="إجمالي الرسوم" value={finance.total_charges} /><MiniMetric label="المدفوعات" value={finance.total_payments} tone="success" /><MiniMetric label="الرصيد المستحق" value={finance.outstanding_balance} tone="warning" /></div></section>}
-      {isManager && <SectionCard title="سجل دفعات المعرض" subtitle="دفعات منفصلة مرتبطة بهذا المعرض فقط.">{showroom.payments?.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th></tr></thead><tbody>{showroom.payments.map((payment) => <tr key={payment.id}><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td></tr>)}</tbody></table></div> : <EmptyState icon={<Banknote size={26} />} title="لا توجد دفعات مسجلة لهذا المعرض" />}</SectionCard>}
+      {isManager && <SectionCard title="سجل دفعات المعرض" subtitle="دفعات منفصلة مرتبطة بهذا المعرض فقط.">{showroom.payments?.length ? <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th></tr></thead><WindowedTableBody items={showroom.payments} getKey={(item)=>item.id} columnCount={4} label="دفعات المعرض المحملة" renderRow={(payment)=><tr><td className="money-cell">{money(payment.amount)}</td><td>{dateFormat(payment.paid_at || payment.date, true)}</td><td>{payment.notes || '—'}</td><td>{payment.created_by_name || '—'}</td></tr>} /></table></div>{showroom.payments_has_more&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMorePayments} onClick={()=>void loadMorePayments()}>{loadingMorePayments?'جارٍ التحميل...':'تحميل دفعات أقدم'}</Button></div>}</> : <EmptyState icon={<Banknote size={26} />} title="لا توجد دفعات مسجلة لهذا المعرض" />}</SectionCard>}
       <SectionCard title="إحصائيات السيارات" subtitle="العدد الفعلي للعمليات حسب التاريخ وطريقة الدفع.">
       <div className="showroom-statistics-filters">
         <FormField label="من تاريخ"><input type="date" value={statisticsRange.from} onChange={(event) => setStatisticsRange((current) => ({ ...current, from: event.target.value }))} /></FormField>
@@ -1716,7 +1841,7 @@ function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotif
       </div>
       {statisticsRange.from > statisticsRange.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="showroom-statistics-result"><Car size={20} /><span>عدد السيارات</span><strong>{statisticsLoading ? '...' : formatNumber(carCount)}</strong></div>}
       </SectionCard>
-      <section className="profile-history"><div className="profile-section-heading"><h3>سجل الغسيل</h3><span>{showroom.washes?.length ?? 0} عملية</span></div>{showroom.washes?.length ? <WashList washes={showroom.washes} compact /> : <EmptyState title="لا توجد عمليات مسجلة" />}</section>
+      <section className="profile-history"><div className="profile-section-heading"><h3>سجل الغسيل</h3><span>{showroom.washes?.length ?? 0} عملية محملة</span></div>{showroom.washes?.length ? <><WashList washes={showroom.washes} compact />{showroom.washes_has_more&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMoreWashes} onClick={()=>void loadMoreWashes()}>{loadingMoreWashes?'جارٍ التحميل...':'تحميل عمليات أقدم'}</Button></div>}</> : <EmptyState title="لا توجد عمليات مسجلة" />}</section>
     </div>
   </SidePanel>;
 }
@@ -1745,6 +1870,8 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
   const [summary, setSummary] = useState<PayrollSummary | null>(null);
   const [withdrawals, setWithdrawals] = useState<SalaryWithdrawal[]>([]);
   const [deductions, setDeductions] = useState<SalaryDeduction[]>([]);
+  const [withdrawalsHasMore,setWithdrawalsHasMore]=useState(false);const[withdrawalsNextCursor,setWithdrawalsNextCursor]=useState<string|null>(null);const[withdrawalsLoadingMore,setWithdrawalsLoadingMore]=useState(false);
+  const [deductionsHasMore,setDeductionsHasMore]=useState(false);const[deductionsNextCursor,setDeductionsNextCursor]=useState<string|null>(null);const[deductionsLoadingMore,setDeductionsLoadingMore]=useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [addEmployeeOpen, setAddEmployeeOpen] = useState(false);
@@ -1767,8 +1894,8 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
       ]);
       if (sequence === loadSequence.current) {
         setSummary(nextSummary);
-        setWithdrawals(nextWithdrawals);
-        setDeductions(nextDeductions);
+        setWithdrawals(nextWithdrawals.items);setWithdrawalsHasMore(nextWithdrawals.has_more);setWithdrawalsNextCursor(nextWithdrawals.next_cursor);
+        setDeductions(nextDeductions.items);setDeductionsHasMore(nextDeductions.has_more);setDeductionsNextCursor(nextDeductions.next_cursor);
       }
     } catch (requestError) {
       if (sequence === loadSequence.current) setError(friendlyError(requestError));
@@ -1777,7 +1904,9 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
     }
   };
 
-  useEffect(() => { void load(); }, [month, selectedDate]);
+  useEffect(() => { setSummary(null); setWithdrawals([]); setDeductions([]); setWithdrawalsHasMore(false); setDeductionsHasMore(false); setWithdrawalsNextCursor(null); setDeductionsNextCursor(null); void load(); }, [month, selectedDate]);
+  const loadMoreWithdrawals=async()=>{if(withdrawalsLoadingMore||!withdrawalsHasMore||!withdrawalsNextCursor)return;const sequence=loadSequence.current;setWithdrawalsLoadingMore(true);try{const page=await api.salaryWithdrawals(month,selectedDate,withdrawalsNextCursor);if(sequence===loadSequence.current){setWithdrawals(current=>appendUnique(current,page.items));setWithdrawalsHasMore(page.has_more);setWithdrawalsNextCursor(page.next_cursor);}}catch(error){if(sequence===loadSequence.current)onNotify({tone:'error',text:friendlyError(error)});}finally{if(sequence===loadSequence.current)setWithdrawalsLoadingMore(false);}};
+  const loadMoreDeductions=async()=>{if(deductionsLoadingMore||!deductionsHasMore||!deductionsNextCursor)return;const sequence=loadSequence.current;setDeductionsLoadingMore(true);try{const page=await api.salaryDeductions(month,selectedDate,deductionsNextCursor);if(sequence===loadSequence.current){setDeductions(current=>appendUnique(current,page.items));setDeductionsHasMore(page.has_more);setDeductionsNextCursor(page.next_cursor);}}catch(error){if(sequence===loadSequence.current)onNotify({tone:'error',text:friendlyError(error)});}finally{if(sequence===loadSequence.current)setDeductionsLoadingMore(false);}};
 
   const removeWithdrawal = async (withdrawal: SalaryWithdrawal) => {
     if (!window.confirm(`هل تريد حذف مسحوب الموظف «${withdrawal.employee_name}» بقيمة ${money(withdrawal.amount)}؟`)) return;
@@ -1839,10 +1968,10 @@ function SalariesView({ selectedDate, onNotify }: { selectedDate: string; onNoti
             {employees.length === 0 ? <EmptyState icon={<UsersRound size={28} />} title="لا يوجد موظفون مسجلون" /> : <div className="data-table-wrap"><table className="data-table payroll-table"><thead><tr><th>الموظف</th><th>المرتب</th><th>إجمالي المسحوبات</th><th>إجمالي الخصومات</th><th>المتبقي</th><th>إجراءات</th></tr></thead><tbody>{employees.map((employee) => <tr key={employee.employee_id}><td><strong>{employee.employee_name}</strong></td><td className="money-cell">{employee.salary_configured ? money(employee.salary) : <StatusBadge tone="warning">غير محدد</StatusBadge>}</td><td className="money-cell">{money(employee.total_withdrawals)}</td><td className="money-cell">{money(employee.total_deductions)}</td><td className={`money-cell ${safeNumber(employee.remaining_salary) < 0 ? 'salary-remaining--negative' : ''}`}>{money(employee.remaining_salary)}</td><td><div className="row-actions"><button onClick={() => setSalaryEmployee(employee)} aria-label={`تعديل مرتب ${employee.employee_name}`} title="تعديل المرتب"><Pencil size={15} /></button><button onClick={() => setWithdrawalEmployee(employee)} aria-label={`مسحوبات الموظف ${employee.employee_name}`} title="مسحوبات"><Plus size={15} /></button><button onClick={() => setDeductionEmployee(employee)} aria-label={`خصم للموظف ${employee.employee_name}`} title="خصم"><Minus size={15} /></button><button className="danger-action" onClick={() => void removeEmployee(employee)} aria-label={`حذف الموظف ${employee.employee_name}`} title="حذف الموظف"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
           </SectionCard>
           <SectionCard title="مسحوبات الموظف" subtitle={`سجل المسحوبات ليوم ${workingDateFormat(selectedDate)}.`} action={<Button onClick={() => setWithdrawalEmployee(employees[0] ?? null)} disabled={employees.length === 0} icon={<Plus size={17} />}>إضافة مسحوب</Button>}>
-            {withdrawals.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد مسحوبات في اليوم المحدد" description="سجّل أول مسحوب وسيُحتسب المتبقي تلقائيًا." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{withdrawals.map((withdrawal) => <tr key={withdrawal.id}><td>{dateFormat(withdrawal.withdrawn_at)}</td><td><strong>{withdrawal.employee_name}</strong></td><td className="money-cell">{money(withdrawal.amount)}</td><td>{withdrawal.notes || '—'}</td><td>{withdrawal.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingWithdrawal(withdrawal)} aria-label="تعديل المسحوب"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeWithdrawal(withdrawal)} aria-label="حذف المسحوب"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+            {withdrawals.length === 0 ? <EmptyState icon={<Banknote size={28} />} title="لا توجد مسحوبات في اليوم المحدد" description="سجّل أول مسحوب وسيُحتسب المتبقي تلقائيًا." /> : <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>ملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><WindowedTableBody items={withdrawals} getKey={(item)=>item.id} columnCount={6} label="المسحوبات المحملة" renderRow={(withdrawal)=><tr><td>{dateFormat(withdrawal.withdrawn_at)}</td><td><strong>{withdrawal.employee_name}</strong></td><td className="money-cell">{money(withdrawal.amount)}</td><td>{withdrawal.notes || '—'}</td><td>{withdrawal.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingWithdrawal(withdrawal)} aria-label="تعديل المسحوب"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeWithdrawal(withdrawal)} aria-label="حذف المسحوب"><Trash2 size={15} /></button></div></td></tr>} /></table></div>{withdrawalsHasMore&&<div className="section-load-more"><Button variant="secondary" disabled={withdrawalsLoadingMore} onClick={()=>void loadMoreWithdrawals()}>{withdrawalsLoadingMore?'جارٍ التحميل...':'تحميل مسحوبات أقدم'}</Button></div>}</>}
           </SectionCard>
           <SectionCard title="سجل الخصومات" subtitle={`سجل الخصومات ليوم ${workingDateFormat(selectedDate)}.`}>
-            {deductions.length === 0 ? <EmptyState icon={<ReceiptText size={28} />} title="لا توجد خصومات في اليوم المحدد" description="استخدم زر خصم بجانب الموظف لتسجيل أول خصم." /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>السبب / الملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><tbody>{deductions.map((deduction) => <tr key={deduction.id}><td>{dateFormat(deduction.deducted_at)}</td><td><strong>{deduction.employee_name}</strong></td><td className="money-cell">{money(deduction.amount)}</td><td>{deduction.notes || '—'}</td><td>{deduction.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingDeduction(deduction)} aria-label="تعديل الخصم"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeDeduction(deduction)} aria-label="حذف الخصم"><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div>}
+            {deductions.length === 0 ? <EmptyState icon={<ReceiptText size={28} />} title="لا توجد خصومات في اليوم المحدد" description="استخدم زر خصم بجانب الموظف لتسجيل أول خصم." /> : <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>التاريخ</th><th>الموظف</th><th>المبلغ</th><th>السبب / الملاحظات</th><th>سجله</th><th>إجراءات</th></tr></thead><WindowedTableBody items={deductions} getKey={(item)=>item.id} columnCount={6} label="الخصومات المحملة" renderRow={(deduction)=><tr><td>{dateFormat(deduction.deducted_at)}</td><td><strong>{deduction.employee_name}</strong></td><td className="money-cell">{money(deduction.amount)}</td><td>{deduction.notes || '—'}</td><td>{deduction.created_by_name || '—'}</td><td><div className="row-actions"><button onClick={() => setEditingDeduction(deduction)} aria-label="تعديل الخصم"><Pencil size={15} /></button><button className="danger-action" onClick={() => void removeDeduction(deduction)} aria-label="حذف الخصم"><Trash2 size={15} /></button></div></td></tr>} /></table></div>{deductionsHasMore&&<div className="section-load-more"><Button variant="secondary" disabled={deductionsLoadingMore} onClick={()=>void loadMoreDeductions()}>{deductionsLoadingMore?'جارٍ التحميل...':'تحميل خصومات أقدم'}</Button></div>}</>}
           </SectionCard>
         </>
       )}
@@ -1892,13 +2021,14 @@ function SalaryWithdrawalModal({ employees, month, selectedEmployee, withdrawal,
   const defaultDate = withdrawal?.withdrawn_at.slice(0, 10) ?? (month === monthInputValue() ? dateInputValue() : `${month}-01`);
   const [form, setForm] = useState({ employee_id: withdrawal?.employee_id ?? selectedEmployee?.employee_id ?? '', amount: withdrawal ? String(withdrawal.amount) : '', withdrawn_at: defaultDate, notes: withdrawal?.notes ?? '' });
   const [saving, setSaving] = useState(false);
+  const createRequestId = useRef(crypto.randomUUID());
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
     const payload = { employee_id: form.employee_id, amount: form.amount, withdrawn_at: `${form.withdrawn_at}T12:00:00Z`, notes: form.notes.trim() || null };
     try {
       if (withdrawal) await api.updateSalaryWithdrawal(withdrawal.id, payload);
-      else await api.createSalaryWithdrawal(payload);
+      else await api.createSalaryWithdrawal({ ...payload, client_request_id: createRequestId.current });
       onSaved();
     } catch (requestError) {
       onNotify({ tone: 'error', text: friendlyError(requestError) });
@@ -1911,13 +2041,14 @@ function SalaryDeductionModal({ employees, month, selectedEmployee, deduction, o
   const defaultDate = deduction?.deducted_at.slice(0, 10) ?? (month === monthInputValue() ? dateInputValue() : `${month}-01`);
   const [form, setForm] = useState({ employee_id: deduction?.employee_id ?? selectedEmployee?.employee_id ?? '', amount: deduction ? String(deduction.amount) : '', deducted_at: defaultDate, notes: deduction?.notes ?? '' });
   const [saving, setSaving] = useState(false);
+  const createRequestId = useRef(crypto.randomUUID());
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
     const payload = { employee_id: form.employee_id, amount: form.amount, deducted_at: `${form.deducted_at}T12:00:00Z`, notes: form.notes.trim() || null };
     try {
       if (deduction) await api.updateSalaryDeduction(deduction.id, payload);
-      else await api.createSalaryDeduction(payload);
+      else await api.createSalaryDeduction({ ...payload, client_request_id: createRequestId.current });
       onSaved();
     } catch (requestError) {
       onNotify({ tone: 'error', text: friendlyError(requestError) });
@@ -1929,24 +2060,33 @@ function SalaryDeductionModal({ employees, month, selectedEmployee, deduction, o
 function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotify: (message: ToastMessage) => void }) {
   const [showrooms, setShowrooms] = useState<Showroom[]>([]);
   const [showroomPayments, setShowroomPayments] = useState<PaymentRecord[]>([]);
+  const [paymentsHasMore,setPaymentsHasMore]=useState(false);
+  const [paymentsNextCursor,setPaymentsNextCursor]=useState<string|null>(null);
+  const [paymentsLoadingMore,setPaymentsLoadingMore]=useState(false);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<'showroomPayment' | null>(null);
   const [editingShowroomPayment, setEditingShowroomPayment] = useState<PaymentRecord | null>(null);
+  const loadSequence=useRef(0);
 
-  const load = async () => {
-    setLoading(true);
+  const load = async (append=false) => {
+    if(append&&(paymentsLoadingMore||!paymentsHasMore||!paymentsNextCursor))return;
+    const sequence=++loadSequence.current;
+    append?setPaymentsLoadingMore(true):setLoading(true);
     try {
-      const [nextShowrooms, nextShowroomPayments] = await Promise.all([
-        api.showrooms({ date: selectedDate, include_financials: true }),
-        api.showroomPayments({ date: selectedDate, limit: 300 }),
+      const [nextShowrooms, paymentPage] = await Promise.all([
+        append?Promise.resolve(null):api.showrooms({ date: selectedDate, include_financials: true }),
+        api.showroomPayments({ date: selectedDate, limit: 100, cursor:append?paymentsNextCursor:null }),
       ]);
-      setShowrooms(nextShowrooms);
-      setShowroomPayments(nextShowroomPayments);
+      if(sequence!==loadSequence.current)return;
+      if(nextShowrooms)setShowrooms(nextShowrooms);
+      setShowroomPayments(current=>append?appendUnique(current,paymentPage.items):paymentPage.items);
+      setPaymentsHasMore(paymentPage.has_more);setPaymentsNextCursor(paymentPage.next_cursor);
     } catch (error) {
       onNotify({ tone: 'error', text: friendlyError(error) });
-    } finally { setLoading(false); }
+    } finally { if(sequence===loadSequence.current){setLoading(false);setPaymentsLoadingMore(false);} }
   };
   useEffect(() => {
+    setShowrooms([]); setShowroomPayments([]); setPaymentsHasMore(false); setPaymentsNextCursor(null);
     void load();
     const handleRefresh = () => { void load(); };
     window.addEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
@@ -1967,7 +2107,7 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
       <PageHeader eyebrow="وصول الإدارة فقط" title="التنفيذ المالي" description={`إدارة المصروفات ودفعات المعارض ليوم ${workingDateFormat(selectedDate)} من السجلات المالية الأصلية.`} actions={<StatusBadge tone="info"><LockKeyhole size={13} /> عمليات مالية محمية</StatusBadge>} />
       <div className="financial-execution-sections">
         <ExpensesPanel selectedDate={selectedDate} onNotify={onNotify} />
-        {loading ? <LoadingBlock label="جارٍ تحميل دفعات المعارض..." /> : <PaymentsPanel title="دفعات المعارض" records={showroomPayments} personLabel="المعرض" onAdd={() => setModal('showroomPayment')} onEdit={setEditingShowroomPayment} onDelete={(record) => { void deleteShowroomPayment(record); }} empty="لم تسجّل أي دفعة من المعارض بعد." />}
+        {loading ? <LoadingBlock label="جارٍ تحميل دفعات المعارض..." /> : <PaymentsPanel title="دفعات المعارض" records={showroomPayments} personLabel="المعرض" onAdd={() => setModal('showroomPayment')} onEdit={setEditingShowroomPayment} onDelete={(record) => { void deleteShowroomPayment(record); }} empty="لم تسجّل أي دفعة من المعارض بعد." hasMore={paymentsHasMore} loadingMore={paymentsLoadingMore} onLoadMore={()=>void load(true)} />}
       </div>
       {modal === 'showroomPayment' && <ShowroomPaymentModal showrooms={showrooms} onClose={() => setModal(null)} onNotify={onNotify} onSaved={(record) => { setShowroomPayments((current) => [record, ...current]); setModal(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تسجيل دفعة المعرض وتحديث رصيده.' }); void load(); }} />}
       {editingShowroomPayment && <ShowroomPaymentModal payment={editingShowroomPayment} showrooms={showrooms} onClose={() => setEditingShowroomPayment(null)} onNotify={onNotify} onSaved={(record) => { setShowroomPayments((current) => current.map((item) => item.id === record.id ? record : item)); setEditingShowroomPayment(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تعديل دفعة المعرض وتحديث رصيده.' }); void load(); }} />}
@@ -1975,16 +2115,17 @@ function FinanceView({ selectedDate, onNotify }: { selectedDate: string; onNotif
   );
 }
 
-function PaymentsPanel({ title, records, personLabel, onAdd, onEdit, onDelete, empty }: { title: string; records: PaymentRecord[]; personLabel: string; onAdd: () => void; onEdit?: (record: PaymentRecord) => void; onDelete?: (record: PaymentRecord) => void; empty: string }) {
+function PaymentsPanel({ title, records, personLabel, onAdd, onEdit, onDelete, empty, hasMore=false, loadingMore=false, onLoadMore }: { title: string; records: PaymentRecord[]; personLabel: string; onAdd: () => void; onEdit?: (record: PaymentRecord) => void; onDelete?: (record: PaymentRecord) => void; empty: string; hasMore?:boolean; loadingMore?:boolean; onLoadMore?:()=>void }) {
   return <SectionCard title={title} subtitle="كل دفعة تحفظ باسم المستخدم الذي سجلها." action={<Button onClick={onAdd} icon={<Plus size={17} />}>تسجيل دفعة</Button>}>
-    {records.length === 0 ? <EmptyState icon={<Banknote size={28} />} title={empty} /> : <div className="data-table-wrap"><table className="data-table"><thead><tr><th>{personLabel}</th><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th>{(onEdit || onDelete) && <th>إجراءات</th>}</tr></thead><tbody>{records.map((record) => <tr key={record.id}><td>{record.worker_name || record.showroom_name || '—'}</td><td className="money-cell">{money(record.amount)}</td><td>{dateFormat(record.paid_at || record.date, true)}</td><td>{record.notes || '—'}</td><td>{record.created_by_name || '—'}</td>{(onEdit || onDelete) && <td><div className="row-actions">{onEdit && <button type="button" onClick={() => onEdit(record)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button>}{onDelete && <button type="button" className="danger-action" onClick={() => onDelete(record)} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button>}</div></td>}</tr>)}</tbody></table></div>}
+    {records.length === 0 ? <EmptyState icon={<Banknote size={28} />} title={empty} /> : <><div className="data-table-wrap"><table className="data-table"><thead><tr><th>{personLabel}</th><th>المبلغ</th><th>التاريخ</th><th>ملاحظات</th><th>سجله</th>{(onEdit || onDelete) && <th>إجراءات</th>}</tr></thead><WindowedTableBody items={records} getKey={(record) => record.id} columnCount={onEdit || onDelete ? 6 : 5} label={title} renderRow={(record) => <tr><td>{record.worker_name || record.showroom_name || '—'}</td><td className="money-cell">{money(record.amount)}</td><td>{dateFormat(record.paid_at || record.date, true)}</td><td>{record.notes || '—'}</td><td>{record.created_by_name || '—'}</td>{(onEdit || onDelete) && <td><div className="row-actions">{onEdit && <button type="button" onClick={() => onEdit(record)} aria-label="تعديل الدفعة" title="تعديل الدفعة"><Pencil size={15} /></button>}{onDelete && <button type="button" className="danger-action" onClick={() => onDelete(record)} aria-label="حذف الدفعة" title="حذف الدفعة"><Trash2 size={15} /></button>}</div></td>}</tr>} /></table></div>{hasMore&&onLoadMore&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={onLoadMore}>{loadingMore?'جارٍ التحميل...':'تحميل دفعات أقدم'}</Button></div>}</>}
   </SectionCard>;
 }
 
 function ShowroomPaymentModal({ payment, showrooms, onClose, onSaved, onNotify }: { payment?: PaymentRecord; showrooms: Showroom[]; onClose: () => void; onSaved: (record: PaymentRecord) => void; onNotify: (message: ToastMessage) => void }) {
   const [form, setForm] = useState({ showroom_id: payment?.showroom_id ?? '', amount: payment ? String(payment.amount) : '', paid_at: (payment?.paid_at || dateInputValue()).slice(0, 10), notes: payment?.notes ?? '' });
   const [saving, setSaving] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { const payload = { ...form, paid_at: new Date(`${form.paid_at}T12:00:00`).toISOString(), notes: form.notes.trim() || null }; onSaved(payment ? await api.updateShowroomPayment(payment.id, payload) : await api.createShowroomPayment(payload)); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
+  const createRequestId = useRef(crypto.randomUUID());
+  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { const payload = { ...form, paid_at: new Date(`${form.paid_at}T12:00:00`).toISOString(), notes: form.notes.trim() || null }; onSaved(payment ? await api.updateShowroomPayment(payment.id, payload) : await api.createShowroomPayment({ ...payload, client_request_id: createRequestId.current })); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
   return <Modal title={payment ? 'تعديل دفعة المعرض' : 'تسجيل دفعة من معرض'} subtitle="سيخصم المبلغ تلقائيًا من الرصيد المستحق للمعرض." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="المعرض" required><select value={form.showroom_id} onChange={(event) => setForm((current) => ({ ...current, showroom_id: event.target.value }))} required><option value="">اختر المعرض</option>{showrooms.map((showroom) => <option key={showroom.id} value={showroom.id}>{showroom.name}</option>)}</select></FormField><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.01" step="0.01" required dir="ltr" /></FormField><FormField label="التاريخ" required><input value={form.paid_at} onChange={(event) => setForm((current) => ({ ...current, paid_at: event.target.value }))} type="date" required dir="ltr" /></FormField><FormField label="ملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : payment ? 'حفظ التعديل' : 'تسجيل الدفعة'}</Button></div></form></Modal>;
 }
 
@@ -1993,23 +2134,24 @@ const EXPENSE_CATEGORIES = ['مواد تنظيف', 'صيانة', 'مرافق', '
 function ExpenseModal({ onClose, onSaved, onNotify }: { onClose: () => void; onSaved: (record: ExpenseRecord) => void; onNotify: (message: ToastMessage) => void }) {
   const [form, setForm] = useState({ description: '', category: 'أخرى', payment_method: 'cash' as 'cash' | 'bank', amount: '', spent_at: dateInputValue(), notes: '', allocation: 'business_only' as ExpenseAllocation });
   const [saving, setSaving] = useState(false);
+  const createRequestId = useRef(crypto.randomUUID());
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
     try {
-      onSaved(await api.createExpense({ description: form.description.trim(), category: form.category.trim(), payment_method: form.payment_method, amount: form.amount, spent_at: new Date(`${form.spent_at}T12:00:00`).toISOString(), notes: form.notes.trim() || null, allocation: form.allocation, business_percentage: form.allocation === 'shared' ? 50 : 100 }));
+      onSaved(await api.createExpense({ description: form.description.trim(), category: form.category.trim(), payment_method: form.payment_method, amount: form.amount, spent_at: new Date(`${form.spent_at}T12:00:00`).toISOString(), notes: form.notes.trim() || null, allocation: form.allocation, business_percentage: form.allocation === 'shared' ? 50 : 100, client_request_id: createRequestId.current }));
     } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); }
   };
   return <Modal title="تسجيل مصروف جديد" subtitle="يُحفظ في سجل المصروفات نفسه المستخدم في التقارير المالية." onClose={onClose}><form className="entry-form" onSubmit={submit}><div className="form-grid form-grid--two"><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))} type="number" min="0.01" step="0.01" required dir="ltr" autoFocus /></FormField><FormField label="نوع المصروف / التصنيف" required><input list="expense-category-options" value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} required /><datalist id="expense-category-options">{EXPENSE_CATEGORIES.map((category) => <option key={category} value={category} />)}</datalist></FormField><FormField label="التاريخ" required><input value={form.spent_at} onChange={(event) => setForm((current) => ({ ...current, spent_at: event.target.value }))} type="date" required dir="ltr" /></FormField><FormField label="طريقة الدفع" required><select value={form.payment_method} onChange={(event) => setForm((current) => ({ ...current, payment_method: event.target.value as 'cash' | 'bank' }))}><option value="cash">نقدي</option><option value="bank">مصرفي</option></select></FormField></div><FormField label="الوصف" required><input value={form.description} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} placeholder="مثال: شراء مواد تنظيف" required /></FormField><FormField label="الملاحظات"><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} placeholder="اختياري" rows={3} /></FormField><FormField label="تخصيص المصروف" required><select value={form.allocation} onChange={(event) => setForm((current) => ({ ...current, allocation: event.target.value as ExpenseAllocation }))}><option value="business_only">المركز فقط</option><option value="shared">المركز والعمال (50/50)</option></select></FormField>{form.allocation === 'shared' && <div className="allocation-preview"><span>التوزيع التلقائي</span><strong>50% للمركز — 50% للعمال</strong><small>توزّع حصة العمال بالتساوي على العمال النشطين وتحفظ كلقطة تاريخية.</small></div>}<div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'تسجيل المصروف'}</Button></div></form></Modal>;
 }
 
 function ExpensesPanel({selectedDate,onNotify}:{selectedDate:string;onNotify:(message:ToastMessage)=>void}){
-  const[items,setItems]=useState<ExpenseRecord[]>([]);const[loading,setLoading]=useState(true);const[adding,setAdding]=useState(false);const[selected,setSelected]=useState<ExpenseRecord|null>(null);const[editing,setEditing]=useState<ExpenseRecord|null>(null);
-  const load=async()=>{setLoading(true);try{setItems(await api.expenses({date:selectedDate}));}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setLoading(false);}};useEffect(()=>{void load();},[selectedDate]);
+  const[items,setItems]=useState<ExpenseRecord[]>([]);const[loading,setLoading]=useState(true);const[loadingMore,setLoadingMore]=useState(false);const[hasMore,setHasMore]=useState(false);const[nextCursor,setNextCursor]=useState<string|null>(null);const[adding,setAdding]=useState(false);const[selected,setSelected]=useState<ExpenseRecord|null>(null);const[editing,setEditing]=useState<ExpenseRecord|null>(null);const loadSequence=useRef(0);
+  const load=async(append=false)=>{if(append&&(loadingMore||!hasMore||!nextCursor))return;const sequence=++loadSequence.current;append?setLoadingMore(true):setLoading(true);try{const page=await api.expenses({date:selectedDate,limit:100,cursor:append?nextCursor:null});if(sequence===loadSequence.current){setItems(current=>append?appendUnique(current,page.items):page.items);setHasMore(page.has_more);setNextCursor(page.next_cursor);}}catch(error){if(sequence===loadSequence.current)onNotify({tone:'error',text:friendlyError(error)});}finally{if(sequence===loadSequence.current){setLoading(false);setLoadingMore(false);}}};useEffect(()=>{setItems([]);setHasMore(false);setNextCursor(null);void load();},[selectedDate]);
   const openDetail=async(item:ExpenseRecord)=>{try{setSelected(await api.expense(item.id));}catch(error){onNotify({tone:'error',text:friendlyError(error)});}};
-  const remove=async(item:ExpenseRecord)=>{if(!window.confirm(`هل تريد حذف المصروف «${item.description}»؟ سيتم عكس جميع استقطاعات العمال المرتبطة به.`))return;try{await api.deleteExpense(item.id);setItems(current=>current.filter(record=>record.id!==item.id));setSelected(null);setEditing(null);refreshFinancialViews();onNotify({tone:'success',text:'تم حذف المصروف وتحديث التقارير المالية.'});}catch(error){onNotify({tone:'error',text:friendlyError(error)});}};
+  const remove=async(item:ExpenseRecord)=>{if(!window.confirm(`هل تريد حذف المصروف «${item.description}»؟ سيتم عكس جميع استقطاعات العمال المرتبطة به.`))return;try{await api.deleteExpense(item.id);setSelected(null);setEditing(null);await load();refreshFinancialViews();onNotify({tone:'success',text:'تم حذف المصروف وتحديث التقارير المالية.'});}catch(error){onNotify({tone:'error',text:friendlyError(error)});}};
   const saved=async(message:string)=>{setAdding(false);setEditing(null);setSelected(null);await load();refreshFinancialViews();onNotify({tone:'success',text:message});};
-  return <><SectionCard title="المصروفات" subtitle={`سجل المصروفات ليوم ${workingDateFormat(selectedDate)}؛ وهو السجل نفسه المستخدم في التقارير المالية.`} action={<Button onClick={()=>setAdding(true)} icon={<Plus size={17}/>}>تسجيل مصروف جديد</Button>}>{loading?<LoadingBlock/>:items.length===0?<EmptyState icon={<ReceiptText size={28}/>} title="لا توجد مصروفات في اليوم المحدد"/>:<div className="data-table-wrap"><table className="data-table expense-history-table"><thead><tr><th>التاريخ</th><th>نوع المصروف</th><th>الوصف</th><th>المبلغ</th><th>طريقة الدفع</th><th>التوزيع</th><th>إجراءات</th></tr></thead><tbody>{items.map(item=><tr key={item.id} className="clickable-row" onClick={()=>void openDetail(item)}><td>{dateFormat(item.spent_at)}</td><td>{item.category||'أخرى'}</td><td><strong>{item.description}</strong>{item.notes&&<small>{item.notes}</small>}</td><td className="money-cell">{money(item.amount)}</td><td>{item.payment_method==='bank'?'مصرفي':'نقدي'}</td><td>{item.allocation==='shared'?'المركز والعمال':'المركز فقط'}</td><td><div className="row-actions"><button type="button" onClick={e=>{e.stopPropagation();setEditing(item)}} aria-label="تعديل المصروف" title="تعديل المصروف"><Pencil size={15}/></button><button type="button" className="danger-action" onClick={e=>{e.stopPropagation();void remove(item)}} aria-label="حذف المصروف" title="حذف المصروف"><Trash2 size={15}/></button></div></td></tr>)}</tbody></table></div>}</SectionCard>{adding&&<ExpenseModal onClose={()=>setAdding(false)} onSaved={()=>{void saved('تم تسجيل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {editing&&<EditExpenseModal expense={editing} onClose={()=>setEditing(null)} onSaved={()=>{void saved('تم تعديل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {selected&&<ExpenseDetails expense={selected} onClose={()=>setSelected(null)} onEdit={()=>{setEditing(selected);setSelected(null)}} onDelete={()=>void remove(selected)}/>}</>;
+  return <><SectionCard title="المصروفات" subtitle={`سجل المصروفات ليوم ${workingDateFormat(selectedDate)}؛ وهو السجل نفسه المستخدم في التقارير المالية.`} action={<Button onClick={()=>setAdding(true)} icon={<Plus size={17}/>}>تسجيل مصروف جديد</Button>}>{loading?<LoadingBlock/>:items.length===0?<EmptyState icon={<ReceiptText size={28}/>} title="لا توجد مصروفات في اليوم المحدد"/>:<><div className="data-table-wrap"><table className="data-table expense-history-table"><thead><tr><th>التاريخ</th><th>نوع المصروف</th><th>الوصف</th><th>المبلغ</th><th>طريقة الدفع</th><th>التوزيع</th><th>إجراءات</th></tr></thead><WindowedTableBody items={items} getKey={(item)=>item.id} columnCount={7} label="المصروفات المحملة" renderRow={(item)=><tr className="clickable-row" onClick={()=>void openDetail(item)}><td>{dateFormat(item.spent_at)}</td><td>{item.category||'أخرى'}</td><td><strong>{item.description}</strong>{item.notes&&<small>{item.notes}</small>}</td><td className="money-cell">{money(item.amount)}</td><td>{item.payment_method==='bank'?'مصرفي':'نقدي'}</td><td>{item.allocation==='shared'?'المركز والعمال':'المركز فقط'}</td><td><div className="row-actions"><button type="button" onClick={e=>{e.stopPropagation();setEditing(item)}} aria-label="تعديل المصروف" title="تعديل المصروف"><Pencil size={15}/></button><button type="button" className="danger-action" onClick={e=>{e.stopPropagation();void remove(item)}} aria-label="حذف المصروف" title="حذف المصروف"><Trash2 size={15}/></button></div></td></tr>} /></table></div>{hasMore&&<div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={()=>void load(true)}>{loadingMore?'جارٍ التحميل...':'تحميل مصروفات أقدم'}</Button></div>}</>}</SectionCard>{adding&&<ExpenseModal onClose={()=>setAdding(false)} onSaved={()=>{void saved('تم تسجيل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {editing&&<EditExpenseModal expense={editing} onClose={()=>setEditing(null)} onSaved={()=>{void saved('تم تعديل المصروف وتحديث التقارير المالية.');}} onNotify={onNotify}/>} {selected&&<ExpenseDetails expense={selected} onClose={()=>setSelected(null)} onEdit={()=>{setEditing(selected);setSelected(null)}} onDelete={()=>void remove(selected)}/>}</>;
 }
 
 function EditExpenseModal({expense,onClose,onSaved,onNotify}:{expense:ExpenseRecord;onClose:()=>void;onSaved:()=>void;onNotify:(message:ToastMessage)=>void}){const[form,setForm]=useState({description:expense.description,category:expense.category||'أخرى',payment_method:expense.payment_method||'cash',amount:String(expense.amount),spent_at:(expense.spent_at??'').slice(0,10),notes:expense.notes??'',allocation:expense.allocation==='shared'?'shared':'business_only'});const[saving,setSaving]=useState(false);const submit=async(e:FormEvent)=>{e.preventDefault();setSaving(true);try{await api.updateExpense(expense.id,{...form,spent_at:new Date(`${form.spent_at}T12:00:00`).toISOString(),notes:form.notes.trim()||null});onSaved();}catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{setSaving(false);}};return <Modal title="تعديل المصروف" subtitle="يُحدّث السجل نفسه وتنعكس النتيجة في التقارير المالية دون إنشاء مصروف جديد." onClose={onClose}><form className="entry-form" onSubmit={submit}><div className="form-grid form-grid--two"><FormField label="المبلغ (د.ل)" required><input value={form.amount} onChange={e=>setForm(c=>({...c,amount:e.target.value}))} type="number" min="0.01" step="0.01" required/></FormField><FormField label="نوع المصروف / التصنيف" required><input list="edit-expense-category-options" value={form.category} onChange={e=>setForm(c=>({...c,category:e.target.value}))} required/><datalist id="edit-expense-category-options">{EXPENSE_CATEGORIES.map(category=><option key={category} value={category}/>)}</datalist></FormField><FormField label="التاريخ" required><input value={form.spent_at} onChange={e=>setForm(c=>({...c,spent_at:e.target.value}))} type="date" required/></FormField><FormField label="طريقة الدفع" required><select value={form.payment_method} onChange={e=>setForm(c=>({...c,payment_method:e.target.value as 'cash'|'bank'}))}><option value="cash">نقدي</option><option value="bank">مصرفي</option></select></FormField></div><FormField label="الوصف" required><input value={form.description} onChange={e=>setForm(c=>({...c,description:e.target.value}))} required/></FormField><FormField label="الملاحظات"><textarea value={form.notes} onChange={e=>setForm(c=>({...c,notes:e.target.value}))}/></FormField><FormField label="تخصيص المصروف"><select value={form.allocation} onChange={e=>setForm(c=>({...c,allocation:e.target.value}))}><option value="business_only">المركز فقط</option><option value="shared">المركز والعمال (50/50)</option></select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={<Save size={17}/>}>{saving?'جارٍ الحفظ...':'حفظ التعديل'}</Button></div></form></Modal>}
@@ -2058,24 +2200,40 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
   const cardOrderChanged = useRef(false);
   const cardOrderSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const pointerDragOrder = useRef<FinancialReportCardId[] | null>(null);
+  const pointerDragStartOrder = useRef<FinancialReportCardId[] | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMoreWashes, setLoadingMoreWashes] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const reportLoadSequence = useRef(0);
 
   const load = async (nextRange = range) => {
-    setLoading(true); setError(null);
+    const sequence = ++reportLoadSequence.current;
+    setLoading(true); setLoadingMoreWashes(false); setError(null);
     try {
-      const parameters = { from: nextRange.from, to: nextRange.to };
-      const operationalReport = await api.operationalReport(parameters);
-      setOperational(operationalReport);
-      if (isManager) setFinancial(await api.financialReport(parameters));
-      else setFinancial(null);
-    } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); }
+      const parameters = { from: nextRange.from, to: nextRange.to, limit: 50 };
+      const [operationalReport, financialReport] = await Promise.all([
+        api.operationalReport(parameters),
+        isManager ? api.financialReport(parameters) : Promise.resolve(null),
+      ]);
+      if(sequence===reportLoadSequence.current){setOperational(operationalReport);setFinancial(financialReport);}
+    } catch (requestError) {if(sequence===reportLoadSequence.current)setError(friendlyError(requestError)); } finally {if(sequence===reportLoadSequence.current)setLoading(false); }
   };
   useEffect(() => {
     const nextRange = selectedDateRange(selectedDate);
     setRange(nextRange);
+    setOperational(null); setFinancial(null);
     void load(nextRange);
   }, [isManager, selectedDate]);
+  const loadMoreReportWashes = async () => {
+    if(loadingMoreWashes||!operational?.washes_has_more||!operational.washes_next_cursor)return;
+    const sequence=reportLoadSequence.current;
+    setLoadingMoreWashes(true);
+    try {
+      const page = await api.operationalReport({ from: range.from, to: range.to, limit: 50, cursor: operational?.washes_next_cursor });
+      if(sequence===reportLoadSequence.current)setOperational((current) => current ? { ...current, washes: appendUnique(current.washes ?? [], page.washes ?? []), washes_has_more: page.washes_has_more, washes_next_cursor: page.washes_next_cursor } : page);
+    } catch (requestError) {if(sequence===reportLoadSequence.current)setError(friendlyError(requestError)); }
+    finally {if(sequence===reportLoadSequence.current)setLoadingMoreWashes(false); }
+  };
   useEffect(() => {
     if (!isManager) return;
     let active = true;
@@ -2088,10 +2246,10 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
   }, [isManager, userId]);
   useEffect(() => {
     if (!draggedCardId) return undefined;
-    const finishPointerDrag = () => {
-      pointerDragOrder.current = null;
-      setDraggedCardId(null);
-    };
+    // Window-level listeners remain the safety net for WebView2 pointer-capture loss, where the
+    // element's own pointerup never fires. They now commit the order rather than discarding it, so
+    // a capture-loss drag still persists exactly once.
+    const finishPointerDrag = () => { commitCardPointerDrag(); };
     window.addEventListener('pointerup', finishPointerDrag);
     window.addEventListener('pointercancel', finishPointerDrag);
     return () => {
@@ -2111,6 +2269,23 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
       .then(() => api.updateFinancialReportCardOrder(validOrder));
     void cardOrderSaveQueue.current.catch(() => setCardOrderStatus('تعذر حفظ ترتيب البطاقات؛ يمكنك المحاولة مرة أخرى.'));
   };
+  // Moves the card locally without persisting. Keeps the drag visually continuous while the write
+  // is deferred to the single commit at drag end.
+  const previewCardOrder = (nextOrder: FinancialReportCardId[]) => {
+    cardOrderChanged.current = true;
+    setCardOrder(validFinancialReportCardOrder(nextOrder));
+  };
+  // Single persistence point for a completed drag, whichever path ends it. Clearing the refs first
+  // makes it idempotent, so element pointerup and the window fallback cannot both write.
+  const commitCardPointerDrag = () => {
+    const nextOrder = pointerDragOrder.current;
+    const startOrder = pointerDragStartOrder.current;
+    pointerDragOrder.current = null;
+    pointerDragStartOrder.current = null;
+    setDraggedCardId(null);
+    if (!nextOrder || !startOrder) return;
+    if (nextOrder.length !== startOrder.length || nextOrder.some((id, index) => id !== startOrder[index])) applyCardOrder(nextOrder);
+  };
   const moveCardToIndex = (cardId: FinancialReportCardId, targetIndex: number) => {
     const currentIndex = cardOrder.indexOf(cardId);
     const boundedIndex = Math.max(0, Math.min(targetIndex, cardOrder.length - 1));
@@ -2123,6 +2298,7 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     pointerDragOrder.current = cardOrder;
+    pointerDragStartOrder.current = cardOrder;
     setDraggedCardId(cardId);
   };
   const moveCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>, cardId: FinancialReportCardId) => {
@@ -2133,14 +2309,15 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
     const currentOrder = pointerDragOrder.current;
     if (!targetId || targetId === cardId || !FINANCIAL_REPORT_CARD_IDS.includes(targetId)) return;
     const nextOrder = moveFinancialReportCard(currentOrder, cardId, currentOrder.indexOf(targetId));
+    // The ref carries the latest order across every intermediate move, so the commit below always
+    // persists the final arrangement rather than any stale intermediate one.
     pointerDragOrder.current = nextOrder;
-    applyCardOrder(nextOrder);
+    previewCardOrder(nextOrder);
   };
   const finishCardPointerDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (!pointerDragOrder.current) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    pointerDragOrder.current = null;
-    setDraggedCardId(null);
+    commitCardPointerDrag();
   };
   const financialCards: Record<FinancialReportCardId, Omit<MetricCardProps, 'reorder'>> | null = financial ? {
     totalRevenue: { label: 'إجمالي الإيراد', value: money(financial.revenue), icon: <ArrowUpLeft size={20} /> },
@@ -2189,7 +2366,7 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
               })}</tbody></table></div>}
             </SectionCard>
             <SectionCard title="عمليات الغسيل" subtitle="المركبات المسجلة خلال الفترة المحددة.">
-              {operational?.washes?.length ? <WashList washes={operational.washes.slice(0, 8)} compact /> : <EmptyState icon={<Car size={27} />} title="لا توجد عمليات ضمن هذه الفترة" />}
+              {operational?.washes?.length ? <><WashList washes={operational.washes} compact />{operational.washes_has_more && <div className="section-load-more"><Button variant="secondary" disabled={loadingMoreWashes} onClick={() => void loadMoreReportWashes()}>{loadingMoreWashes ? 'جارٍ التحميل...' : 'تحميل عمليات أقدم'}</Button></div>}</> : <EmptyState icon={<Car size={27} />} title="لا توجد عمليات ضمن هذه الفترة" />}
             </SectionCard>
           </div>
           {isManager && financial && <ManagerReportDetails report={financial} />}
@@ -2199,9 +2376,9 @@ function ReportsView({ userId, selectedDate, isManager }: { userId: string; sele
   );
 }
 
-function ManagerReportDetails({ report }: { report: FinancialReport }) {
+const ManagerReportDetails = memo(function ManagerReportDetails({ report }: { report: FinancialReport }) {
   return <section className="report-manager-details"><SectionCard title="تفاصيل ديون المعارض"><div className="finance-overview-list"><div><span><Building2 size={17} /> إيراد حسابات المعارض</span><strong>{money(report.showroom_revenue)}</strong></div><div><span><Banknote size={17} /> مدفوعات المعارض</span><strong>{money(report.showroom_payments?.reduce((total, payment) => total + safeNumber(payment.amount), 0))}</strong></div><div><span><AlertTriangle size={17} /> الدين المستحق</span><strong>{money(report.showroom_outstanding)}</strong></div></div></SectionCard><SectionCard title="توزيع المصروفات"><div className="finance-overview-list"><div><span><ReceiptText size={17} /> إجمالي المصروفات</span><strong>{money(report.total_expenses)}</strong></div><div><span><Banknote size={17} /> حصة الأعمال</span><strong>{money(report.business_expenses)}</strong></div><div><span><UsersRound size={17} /> حصة العمال</span><strong>{money(report.workers_expenses)}</strong></div></div></SectionCard></section>;
-}
+});
 
 function SettingsView({ user, canSettings, canUsers, onNotify }: { user: AuthUser; canSettings: boolean; canUsers: boolean; onNotify: (message: ToastMessage) => void }) {
   const [settings, setSettings] = useState<AppSettings>({ business_name: BUSINESS_NAME, currency: 'د.ل', default_worker_commission_percentage: 50 });
@@ -2277,7 +2454,7 @@ function CreateUserModal({ roles, onClose, onSaved, onNotify }: { roles: Role[];
   const [saving, setSaving] = useState(false);
   const update = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
   const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { onSaved(await api.createUser(form)); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); } };
-  return <Modal title="إضافة مستخدم" subtitle="لا يمكن للمستخدمين تغيير أدوارهم أو ترقيتها بأنفسهم." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الاسم الكامل" required><input value={form.full_name} onChange={(event) => update('full_name', event.target.value)} required /></FormField><FormField label="اسم المستخدم" required><input value={form.username} onChange={(event) => update('username', event.target.value)} required dir="ltr" /></FormField><FormField label="كلمة مرور أولية" required><input value={form.password} onChange={(event) => update('password', event.target.value)} type="password" minLength={8} required dir="ltr" /></FormField><FormField label="الدور" required><select value={form.role} onChange={(event) => update('role', event.target.value)}>{roles.map((role) => <option key={role.id} value={role.key}>{role.name}</option>)}</select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <UserPlus size={17} />}>{saving ? 'جارٍ الإنشاء...' : 'إنشاء المستخدم'}</Button></div></form></Modal>;
+  return <Modal title="إضافة مستخدم" subtitle="لا يمكن للمستخدمين تغيير أدوارهم أو ترقيتها بأنفسهم." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الاسم الكامل" required><input value={form.full_name} onChange={(event) => update('full_name', event.target.value)} required /></FormField><FormField label="اسم المستخدم" required><input value={form.username} onChange={(event) => update('username', event.target.value)} required dir="ltr" /></FormField><FormField label="كلمة مرور أولية" required><input value={form.password} onChange={(event) => update('password', event.target.value)} type="password" minLength={10} maxLength={128} required dir="ltr" /></FormField><FormField label="الدور" required><select value={form.role} onChange={(event) => update('role', event.target.value)}>{roles.map((role) => <option key={role.id} value={role.key}>{role.name}</option>)}</select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <UserPlus size={17} />}>{saving ? 'جارٍ الإنشاء...' : 'إنشاء المستخدم'}</Button></div></form></Modal>;
 }
 
 function EditUserModal({ user, roles, onClose, onSaved, onNotify }: { user: AuthUser; roles: Role[]; onClose: () => void; onSaved: (user: AuthUser) => void; onNotify: (message: ToastMessage) => void }) {
@@ -2290,7 +2467,7 @@ function EditUserModal({ user, roles, onClose, onSaved, onNotify }: { user: Auth
     setSaving(true);
     try { onSaved(await api.updateUser(user.id, { full_name: form.full_name.trim(), username: form.username.trim(), password: form.password || undefined, role: form.role === user.role ? undefined : form.role, status: form.status === user.status ? undefined : form.status })); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); }
   };
-  return <Modal title="تعديل حساب مستخدم" subtitle="اترك كلمة المرور فارغة إذا لم ترغب في تغييرها." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الاسم الكامل" required><input value={form.full_name} onChange={(event) => update('full_name', event.target.value)} required /></FormField><FormField label="اسم المستخدم" required><input value={form.username} onChange={(event) => update('username', event.target.value)} required dir="ltr" /></FormField><FormField label="كلمة مرور جديدة"><input value={form.password} onChange={(event) => update('password', event.target.value)} type="password" minLength={10} placeholder="اتركها فارغة دون تغيير" dir="ltr" /></FormField><FormField label="الدور" required><select value={form.role} onChange={(event) => update('role', event.target.value)}>{roles.map((role) => <option key={role.id} value={role.key}>{role.name}</option>)}</select></FormField><FormField label="حالة الحساب" required><select value={form.status} onChange={(event) => update('status', event.target.value)}><option value="active">نشط</option><option value="disabled">معطل</option></select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'حفظ التغييرات'}</Button></div></form></Modal>;
+  return <Modal title="تعديل حساب مستخدم" subtitle="اترك كلمة المرور فارغة إذا لم ترغب في تغييرها." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="الاسم الكامل" required><input value={form.full_name} onChange={(event) => update('full_name', event.target.value)} required /></FormField><FormField label="اسم المستخدم" required><input value={form.username} onChange={(event) => update('username', event.target.value)} required dir="ltr" /></FormField><FormField label="كلمة مرور جديدة"><input value={form.password} onChange={(event) => update('password', event.target.value)} type="password" minLength={10} maxLength={128} placeholder="اتركها فارغة دون تغيير" dir="ltr" /></FormField><FormField label="الدور" required><select value={form.role} onChange={(event) => update('role', event.target.value)}>{roles.map((role) => <option key={role.id} value={role.key}>{role.name}</option>)}</select></FormField><FormField label="حالة الحساب" required><select value={form.status} onChange={(event) => update('status', event.target.value)}><option value="active">نشط</option><option value="disabled">معطل</option></select></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : 'حفظ التغييرات'}</Button></div></form></Modal>;
 }
 
 function updatedPermissions(current: string[], code: PermissionCode) {
@@ -2334,20 +2511,28 @@ function RoleEditorModal({ role, onClose, onSaved, onNotify }: { role: Role; onC
 function AuditView({ selectedDate }: { selectedDate: string }) {
   const [records, setRecords] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const load = async () => { setLoading(true); setError(null); try { setRecords(await api.auditLogs({ date: selectedDate, limit: 500 })); } catch (requestError) { setError(friendlyError(requestError)); } finally { setLoading(false); } };
-  useEffect(() => { void load(); }, [selectedDate]);
-  return <><PageHeader eyebrow="وصول الإدارة فقط" title="سجل التدقيق" description={`الأفعال المسجلة ليوم ${workingDateFormat(selectedDate)}، مرتبطة بالمستخدم والسجل المتأثر.`} actions={<Button variant="secondary" onClick={() => void load()} icon={<RefreshCw size={17} />}>تحديث</Button>} />{loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : <SectionCard title="أحداث اليوم المحدد" subtitle="لا يمكن تعديل السجل من واجهة التشغيل.">{records.length === 0 ? <EmptyState icon={<History size={28} />} title="لا توجد أحداث في اليوم المحدد" /> : <div className="audit-list">{records.map((record) => <article className="audit-row" key={record.id}><div className="audit-row__dot"><History size={16} /></div><div><h3>{record.action}</h3><p>{record.description || record.affected_record || 'تم تنفيذ إجراء في النظام.'}</p><span>{record.user_name || 'مستخدم النظام'} <i>•</i> {dateFormat(record.created_at, true)}</span></div></article>)}</div>}</SectionCard>}</>;
+  const loadSequence = useRef(0);
+  const load = async (append = false) => { if(append&&(loadingMore||!hasMore||!nextCursor))return;const sequence=++loadSequence.current;if(append)setLoadingMore(true);else{setLoading(true);setLoadingMore(false);} setError(null); try { const page = await api.auditLogPage({ date: selectedDate, limit: 150, cursor: append ? nextCursor : null });if(sequence===loadSequence.current){setRecords((current) => append ? appendUnique(current, page.items) : page.items); setHasMore(page.has_more); setNextCursor(page.next_cursor);}} catch (requestError) {if(sequence===loadSequence.current)setError(friendlyError(requestError)); } finally {if(sequence===loadSequence.current){setLoading(false); setLoadingMore(false);}} };
+  useEffect(() => { setRecords([]); setHasMore(false); setNextCursor(null); void load(); }, [selectedDate]);
+  return <><PageHeader eyebrow="وصول الإدارة فقط" title="سجل التدقيق" description={`الأفعال المسجلة ليوم ${workingDateFormat(selectedDate)}، مرتبطة بالمستخدم والسجل المتأثر.`} actions={<Button variant="secondary" onClick={() => void load()} icon={<RefreshCw size={17} />}>تحديث</Button>} />{loading ? <LoadingBlock /> : error ? <InlineRetry error={error} onRetry={() => void load()} /> : <SectionCard title="أحداث اليوم المحدد" subtitle="لا يمكن تعديل السجل من واجهة التشغيل.">{records.length === 0 ? <EmptyState icon={<History size={28} />} title="لا توجد أحداث في اليوم المحدد" /> : <><VirtualizedList items={records} className="audit-list" estimateSize={84} getKey={(record) => record.id} ariaLabel="سجل التدقيق" renderItem={(record) => <article className="audit-row" key={record.id}><div className="audit-row__dot"><History size={16} /></div><div><h3>{record.action}</h3><p>{record.description || record.affected_record || 'تم تنفيذ إجراء في النظام.'}</p><span>{record.user_name || 'مستخدم النظام'} <i>•</i> {dateFormat(record.created_at, true)}</span></div></article>} />{hasMore && <div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={() => void load(true)}>{loadingMore ? 'جارٍ التحميل...' : 'تحميل أحداث أقدم'}</Button></div>}</>}</SectionCard>}</>;
 }
 
 function BackupView({ selectedDate, onNotify }: { selectedDate: string; onNotify: (message: ToastMessage) => void }) {
   const [records, setRecords] = useState<BackupRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const load = async () => { setLoading(true); try { setRecords(await api.backups({ date: selectedDate })); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setLoading(false); } };
-  useEffect(() => { void load(); }, [selectedDate]);
+  const loadSequence = useRef(0);
+  const load = async (append = false) => { if(append&&(loadingMore||!hasMore||!nextCursor))return;const sequence=++loadSequence.current;if(append)setLoadingMore(true);else{setLoading(true);setLoadingMore(false);} try { const page = await api.backupPage({ date: selectedDate, limit: 100, cursor: append ? nextCursor : null });if(sequence===loadSequence.current){setRecords((current) => append ? appendUnique(current, page.items) : page.items); setHasMore(page.has_more); setNextCursor(page.next_cursor);}} catch (error) {if(sequence===loadSequence.current)onNotify({ tone: 'error', text: friendlyError(error) }); } finally {if(sequence===loadSequence.current){setLoading(false); setLoadingMore(false);}} };
+  useEffect(() => { setRecords([]); setHasMore(false); setNextCursor(null); void load(); }, [selectedDate]);
   const create = async () => { setCreating(true); try { const created = await api.createBackup(); await api.downloadBackup(created); await load(); onNotify({ tone: 'success', text: 'تم إنشاء النسخة الاحتياطية وتنزيلها بنجاح.' }); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setCreating(false); } };
   const download = async (record: BackupRecord) => { try { await api.downloadBackup(record); onNotify({ tone: 'success', text: 'تم تنزيل النسخة الاحتياطية.' }); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } };
   const remove = async (record: BackupRecord) => { if (!window.confirm('هل أنت متأكد من حذف هذه النسخة الاحتياطية؟ لا يمكن التراجع عن هذا الإجراء.')) return; try { await api.deleteBackup(record.id); setRecords((current) => current.filter((item) => item.id !== record.id)); onNotify({ tone: 'success', text: 'تم حذف ملف النسخة الاحتياطية نهائيًا.' }); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } };
@@ -2360,5 +2545,5 @@ function BackupView({ selectedDate, onNotify }: { selectedDate: string; onNotify
     setRestoring(true);
     try { await api.restoreBackup(file); onNotify({ tone: 'success', text: 'تمت استعادة النسخة الاحتياطية. سجّل الدخول مجددًا لمتابعة العمل.' }); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setRestoring(false); }
   };
-  return <><PageHeader eyebrow="وصول الإدارة فقط" title="النسخ الاحتياطي والاستعادة" description="حافظ على نسخة آمنة من قاعدة البيانات المحلية، واستعدها فقط بعد التأكد." /><div className="backup-hero glass-card"><div className="backup-hero__icon"><DatabaseBackup size={29} /></div><div><h2>حماية بيانات مركزك</h2><p>تتضمن النسخة الاحتياطية قاعدة البيانات المحلية كاملة: العمليات والدفعات والمصروفات والإعدادات وسجل التدقيق.</p></div><Button onClick={() => void create()} disabled={creating} icon={creating ? <LoaderCircle size={18} className="spin" /> : <Download size={18} />}>{creating ? 'جارٍ إنشاء النسخة...' : 'إنشاء نسخة احتياطية'}</Button></div><div className="backup-grid"><SectionCard title="استعادة نسخة" subtitle="استخدم ملف قاعدة بيانات موثوقًا تم إنشاؤه من هذا النظام."><div className="restore-warning"><AlertTriangle size={22} /><div><strong>تنبيه مهم</strong><p>الاستعادة تستبدل البيانات الحالية بالكامل ولا يمكن التراجع عنها من داخل النظام.</p></div></div><input ref={fileRef} type="file" accept=".db,application/octet-stream" className="visually-hidden" onChange={(event) => void restore(event)} /><Button variant="danger" onClick={() => fileRef.current?.click()} disabled={restoring} icon={restoring ? <LoaderCircle size={17} className="spin" /> : <Upload size={17} />}>{restoring ? 'جارٍ الاستعادة...' : 'اختيار ملف للاستعادة'}</Button></SectionCard><SectionCard title="أفضل الممارسات"><div className="backup-tips"><span><CheckCircle2 size={17} /> أنشئ نسخة قبل أي استعادة.</span><span><CheckCircle2 size={17} /> احتفظ بنسخ في موقع آمن منفصل.</span><span><CheckCircle2 size={17} /> تحقق من تاريخ النسخة قبل استخدامها.</span></div></SectionCard></div><SectionCard title="سجل النسخ الاحتياطية" subtitle="النسخ المنشأة من النظام الحالي.">{loading ? <LoadingBlock /> : records.length === 0 ? <EmptyState icon={<DatabaseBackup size={28} />} title="لا توجد نسخ محفوظة بعد" description="أنشئ أول نسخة احتياطية الآن لحماية بياناتك." /> : <div className="backup-list">{records.map((record) => <div className="backup-row" key={record.id}><div className="backup-row__icon"><DatabaseBackup size={19} /></div><div><strong>{record.file_name || 'نسخة قاعدة بيانات'}</strong><span>{dateFormat(record.created_at, true)} {record.size_bytes ? `• ${formatNumber(record.size_bytes / 1024)} كيلوبايت` : ''}</span></div><div className="backup-row__actions"><button className="table-action" onClick={() => void download(record)}><Download size={15} /> تنزيل</button><button className="table-action danger-action" onClick={() => void remove(record)}><Trash2 size={15} /> حذف</button></div></div>)}</div>}</SectionCard></>;
+  return <><PageHeader eyebrow="وصول الإدارة فقط" title="النسخ الاحتياطي والاستعادة" description="حافظ على نسخة آمنة من قاعدة البيانات المحلية، واستعدها فقط بعد التأكد." /><div className="backup-hero glass-card"><div className="backup-hero__icon"><DatabaseBackup size={29} /></div><div><h2>حماية بيانات مركزك</h2><p>تتضمن النسخة الاحتياطية قاعدة البيانات المحلية كاملة: العمليات والدفعات والمصروفات والإعدادات وسجل التدقيق.</p></div><Button onClick={() => void create()} disabled={creating} icon={creating ? <LoaderCircle size={18} className="spin" /> : <Download size={18} />}>{creating ? 'جارٍ إنشاء النسخة...' : 'إنشاء نسخة احتياطية'}</Button></div><div className="backup-grid"><SectionCard title="استعادة نسخة" subtitle="استخدم ملف قاعدة بيانات موثوقًا تم إنشاؤه من هذا النظام."><div className="restore-warning"><AlertTriangle size={22} /><div><strong>تنبيه مهم</strong><p>الاستعادة تستبدل البيانات الحالية بالكامل ولا يمكن التراجع عنها من داخل النظام.</p></div></div><input ref={fileRef} type="file" accept=".db,application/octet-stream" className="visually-hidden" onChange={(event) => void restore(event)} /><Button variant="danger" onClick={() => fileRef.current?.click()} disabled={restoring} icon={restoring ? <LoaderCircle size={17} className="spin" /> : <Upload size={17} />}>{restoring ? 'جارٍ الاستعادة...' : 'اختيار ملف للاستعادة'}</Button></SectionCard><SectionCard title="أفضل الممارسات"><div className="backup-tips"><span><CheckCircle2 size={17} /> أنشئ نسخة قبل أي استعادة.</span><span><CheckCircle2 size={17} /> احتفظ بنسخ في موقع آمن منفصل.</span><span><CheckCircle2 size={17} /> تحقق من تاريخ النسخة قبل استخدامها.</span></div></SectionCard></div><SectionCard title="سجل النسخ الاحتياطية" subtitle="النسخ المنشأة من النظام الحالي.">{loading ? <LoadingBlock /> : records.length === 0 ? <EmptyState icon={<DatabaseBackup size={28} />} title="لا توجد نسخ محفوظة بعد" description="أنشئ أول نسخة احتياطية الآن لحماية بياناتك." /> : <><VirtualizedList items={records} className="backup-list" estimateSize={64} getKey={(record) => record.id} ariaLabel="سجل النسخ الاحتياطية" renderItem={(record) => <div className="backup-row" key={record.id}><div className="backup-row__icon"><DatabaseBackup size={19} /></div><div><strong>{record.file_name || 'نسخة قاعدة بيانات'}</strong><span>{dateFormat(record.created_at, true)} {record.size_bytes ? `• ${formatNumber(record.size_bytes / 1024)} كيلوبايت` : ''}</span></div><div className="backup-row__actions"><button className="table-action" onClick={() => void download(record)}><Download size={15} /> تنزيل</button><button className="table-action danger-action" onClick={() => void remove(record)}><Trash2 size={15} /> حذف</button></div></div>} />{hasMore && <div className="section-load-more"><Button variant="secondary" disabled={loadingMore} onClick={() => void load(true)}>{loadingMore ? 'جارٍ التحميل...' : 'تحميل نسخ أقدم'}</Button></div>}</>}</SectionCard></>;
 }

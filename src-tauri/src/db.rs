@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 pub const MONEY_SCALE: i64 = 1000;
 pub const DEFAULT_COMMISSION_BPS: i64 = 5000;
-const CURRENT_SCHEMA_VERSION: i64 = 25;
+const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 const REQUIRED_APPLICATION_TABLES: &[&str] = &[
     "schema_migrations",
@@ -43,6 +43,7 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
     "payroll_employees",
     "payroll_salary_rates",
     "worker_financial_resets",
+    "operation_requests",
 ];
 
 const REQUIRED_CURRENT_COLUMNS: &[(&str, &[&str])] = &[
@@ -155,27 +156,42 @@ impl Database {
         Ok(database)
     }
 
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             BEGIN;",
+        )?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn verify_backup(path: &Path) -> Result<()> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Self::verify_connection_integrity(&conn)?;
         Self::verify_application_identity(&conn)
     }
 
-    pub fn verify_backup_for_restore(path: &Path, validation_root: &Path) -> Result<()> {
-        Self::verify_backup(path)?;
-
-        let validation_dir = validation_root.join(format!("restore-validation-{}", new_id()));
-        fs::create_dir_all(&validation_dir)
-            .map_err(|_| rusqlite::Error::InvalidPath(validation_dir.clone()))?;
-        let validation_path = validation_dir.join("carwash.db");
-        let result = (|| {
-            fs::copy(path, &validation_path)
-                .map_err(|_| rusqlite::Error::InvalidPath(validation_path.clone()))?;
-            let database = Self::open(&validation_dir)?;
-            database.verify_runtime_database()
-        })();
-        let _ = fs::remove_dir_all(&validation_dir);
-        result
+    /// Opens, migrates and fully validates a restore candidate in its staging directory.
+    ///
+    /// The caller must place the candidate at `staging_dir/carwash.db`. Preparing the file in
+    /// place avoids the former second full-size validation copy. The final checkpoint converts
+    /// any migration WAL back into the main file so the prepared database can later be renamed
+    /// atomically while the live database is closed.
+    pub fn prepare_restore_candidate(staging_dir: &Path) -> Result<()> {
+        let path = staging_dir.join("carwash.db");
+        Self::verify_backup(&path)?;
+        let database = Self::open(staging_dir)?;
+        database.conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode = DELETE;",
+        )?;
+        database.verify_runtime_database()?;
+        drop(database);
+        Self::verify_backup(&path)
     }
 
     pub fn verify_runtime_database(&self) -> Result<()> {
@@ -208,15 +224,19 @@ impl Database {
     }
 
     fn verify_connection_integrity(conn: &Connection) -> Result<()> {
-        for pragma in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
-            let mut statement = conn.prepare(pragma)?;
-            let results = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>>>()?;
-            if results.as_slice() != ["ok"] {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
+        // `quick_check` is a strict subset of `integrity_check`: it performs the same page and
+        // b-tree walk but skips UNIQUE/NOT NULL constraint verification and the index-content
+        // versus table-content cross-check. Running both scanned the whole file twice while the
+        // second pass could never fail where the first one passed, so only the stronger check is
+        // kept. Detection strength is unchanged; the second full scan is removed.
+        let mut statement = conn.prepare("PRAGMA integrity_check")?;
+        let results = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        if results.as_slice() != ["ok"] {
+            return Err(rusqlite::Error::InvalidQuery);
         }
+        drop(statement);
         let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
         if statement.query([])?.next()?.is_some() {
             return Err(rusqlite::Error::InvalidQuery);
@@ -251,6 +271,26 @@ impl Database {
     }
 
     fn migrate(&mut self) -> Result<()> {
+        // A current database has already run every idempotent DDL/data-normalization step below.
+        // Returning here avoids reparsing the complete schema and re-running broad UPDATE/seed
+        // statements at every launch. New and older databases still follow the full migration path.
+        let migrations_table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if migrations_table_exists {
+            let (version, migration_count): (Option<i64>, i64) = self.conn.query_row(
+                "SELECT MAX(version),COUNT(*) FROM schema_migrations WHERE version BETWEEN 2 AND ?1",
+                [CURRENT_SCHEMA_VERSION],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if version == Some(CURRENT_SCHEMA_VERSION)
+                && migration_count == CURRENT_SCHEMA_VERSION - 1
+            {
+                return Ok(());
+            }
+        }
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 
@@ -635,6 +675,14 @@ impl Database {
                 wash_id TEXT NOT NULL UNIQUE REFERENCES wash_operations(id) ON DELETE RESTRICT,
                 marked_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
                 marked_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS operation_requests (
+                actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                operation_type TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(actor_id, operation_type, request_id)
              );
              CREATE INDEX IF NOT EXISTS idx_overnight_cars_marked_at ON overnight_cars(marked_at);",
         )?;
@@ -1104,7 +1152,8 @@ impl Database {
             |row| row.get(0),
         )?;
         if timestamps_normalized == 0 {
-            self.conn.execute_batch(
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
                 "UPDATE users SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at),deleted_at=strftime('%Y-%m-%dT%H:%M:%fZ',deleted_at);
                  UPDATE user_profile_pictures SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
                  UPDATE user_preferences SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);
@@ -1129,10 +1178,11 @@ impl Database {
                  UPDATE payroll_employees SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at),archived_at=strftime('%Y-%m-%dT%H:%M:%fZ',archived_at);
                  UPDATE payroll_salary_rates SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ',updated_at);",
             )?;
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(22, ?1)",
                 [now()],
             )?;
+            tx.commit()?;
         }
         let financial_report_card_order_added: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM schema_migrations WHERE version=23",
@@ -1186,6 +1236,119 @@ impl Database {
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(25, ?1)",
                 [now()],
             )?;
+        }
+        let performance_migrations: (i64, i64, i64) = self.conn.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM schema_migrations WHERE version=26),
+                EXISTS(SELECT 1 FROM schema_migrations WHERE version=27),
+                EXISTS(SELECT 1 FROM schema_migrations WHERE version=28)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if performance_migrations != (1, 1, 1) {
+            let tx = self.conn.transaction()?;
+            // Versions 26 and 27 were introduced together with 28 during the performance work.
+            // When an older installation upgrades directly to this current binary, installing
+            // their superseded index shapes first only to drop them in v28 doubles large-database
+            // index work. Apply the final shape once, inside the same atomic transaction that marks
+            // all missing performance migrations complete.
+            if performance_migrations.2 == 0 {
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS idx_washes_paid_owner;
+                 CREATE INDEX idx_washes_paid_owner
+                    ON wash_operations(is_paid, status, occurred_at DESC, id DESC, created_by);
+                 DROP INDEX IF EXISTS idx_washes_occured;
+                 CREATE INDEX idx_washes_occured
+                    ON wash_operations(occurred_at DESC, id DESC, status);
+                 DROP INDEX IF EXISTS idx_washes_worker;
+                 CREATE INDEX idx_washes_worker
+                    ON wash_operations(worker_id, status, occurred_at DESC, id DESC, commission_milli, price_milli);
+                 DROP INDEX IF EXISTS idx_washes_showroom_posted_summary;
+                 CREATE INDEX idx_washes_showroom_posted_summary
+                    ON wash_operations(showroom_id, occurred_at DESC, id DESC, price_milli)
+                    WHERE status='posted' AND payment_type='showroom';
+                 DROP INDEX IF EXISTS idx_washes_posted_report_cover;
+                 CREATE INDEX idx_washes_posted_report_cover
+                    ON wash_operations(
+                        occurred_at DESC,
+                        id DESC,
+                        created_by,
+                        worker_id,
+                        payment_type,
+                        is_paid,
+                        price_milli,
+                        commission_milli,
+                        business_share_milli
+                    )
+                    WHERE status='posted';
+                 DROP INDEX IF EXISTS idx_expenses_date;
+                 CREATE INDEX idx_expenses_date ON expenses(occurred_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_audit_time;
+                 CREATE INDEX idx_audit_time ON audit_logs(created_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_backup_history_status_time;
+                 CREATE INDEX idx_backup_history_status_time
+                    ON backup_history(status, created_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_showroom_payments_time_showroom;
+                 CREATE INDEX idx_showroom_payments_time_showroom
+                    ON showroom_payments(paid_at DESC, id DESC, showroom_id);
+                 CREATE INDEX IF NOT EXISTS idx_showroom_payments_showroom_history
+                    ON showroom_payments(showroom_id, paid_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_salary_withdrawals_time_employee;
+                 CREATE INDEX idx_salary_withdrawals_time_employee
+                    ON salary_withdrawals(withdrawn_at DESC, id DESC, employee_id);
+                 CREATE INDEX IF NOT EXISTS idx_salary_withdrawals_employee_history
+                    ON salary_withdrawals(employee_id, withdrawn_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_salary_deductions_time_employee;
+                 CREATE INDEX idx_salary_deductions_time_employee
+                    ON salary_deductions(deducted_at DESC, id DESC, employee_id);
+                 CREATE INDEX IF NOT EXISTS idx_salary_deductions_employee_history
+                    ON salary_deductions(employee_id, deducted_at DESC, id DESC);
+                 DROP INDEX IF EXISTS idx_worker_withdrawal_returns_worker;
+                 CREATE INDEX idx_worker_withdrawal_returns_worker
+                    ON worker_withdrawal_returns(worker_id, occurred_at DESC, id DESC)
+                    WHERE deleted_at IS NULL;
+                 DROP INDEX IF EXISTS idx_sessions_token;",
+                )?;
+            }
+            for (offset, present) in [
+                performance_migrations.0,
+                performance_migrations.1,
+                performance_migrations.2,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if present == 0 {
+                    tx.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES(?1, ?2)",
+                        (26 + offset as i64, now()),
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
+        let operation_requests_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=29",
+            [],
+            |row| row.get(0),
+        )?;
+        if operation_requests_added == 0 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS operation_requests (
+                    actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    operation_type TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(actor_id, operation_type, request_id)
+                 );",
+            )?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(29, ?1)",
+                [now()],
+            )?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -1750,6 +1913,136 @@ mod tests {
         };
         assert!(has_wash_type);
         drop(database);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn performance_migration_installs_targeted_indexes_without_duplicate_token_index() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-performance-index-tests")
+            .join(Uuid::new_v4().to_string());
+        let database = Database::open(&data_dir).unwrap();
+        let version: i64 = database
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        for index in [
+            "idx_washes_worker",
+            "idx_washes_showroom_posted_summary",
+            "idx_showroom_payments_time_showroom",
+            "idx_salary_withdrawals_time_employee",
+            "idx_salary_deductions_time_employee",
+            "idx_backup_history_status_time",
+            "idx_washes_posted_report_cover",
+            "idx_showroom_payments_showroom_history",
+            "idx_salary_withdrawals_employee_history",
+            "idx_salary_deductions_employee_history",
+        ] {
+            let exists: bool = database
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing performance index {index}");
+        }
+        let duplicate_token_index: bool = database
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sessions_token')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!duplicate_token_index);
+        drop(database);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn performance_index_upgrade_is_atomic_when_a_late_index_build_fails() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-performance-index-atomicity-tests")
+            .join(Uuid::new_v4().to_string());
+        let database = Database::open(&data_dir).unwrap();
+        database
+            .conn
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version BETWEEN 26 AND 28;
+                 DROP INDEX idx_washes_worker;
+                 CREATE INDEX idx_washes_worker ON wash_operations(worker_id,occurred_at);
+                 ALTER TABLE salary_deductions RENAME TO salary_deductions_unavailable;",
+            )
+            .unwrap();
+        drop(database);
+
+        assert!(Database::open(&data_dir).is_err());
+        let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 26 AND 28",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 0, "failed migration markers rolled back");
+        let worker_index_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_washes_worker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(worker_index_sql.contains("worker_id,occurred_at"));
+        assert!(!worker_index_sql.contains("status"));
+        drop(connection);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn timestamp_normalization_rolls_back_earlier_tables_on_failure() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-timestamp-normalization-atomicity-tests")
+            .join(Uuid::new_v4().to_string());
+        let database = Database::open(&data_dir).unwrap();
+        database.conn.execute_batch(
+            "INSERT INTO users(id,full_name,username_norm,password_hash,is_active,created_at,updated_at)
+             VALUES('atomic-user','Atomic User','atomic.user','unused',1,'2026-01-01T00:00:00+02:00','2026-01-01T00:00:00+02:00');
+             INSERT INTO expenses(id,description,category,payment_method,amount_milli,occurred_at,
+                allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,
+                created_by,created_at)
+             VALUES('atomic-expense','Atomic expense','test','cash',1000,'2026-01-01T00:00:00+02:00',
+                'business',10000,0,1000,0,'atomic-user','2026-01-01T00:00:00+02:00');
+             DELETE FROM schema_migrations WHERE version BETWEEN 22 AND 28;
+             CREATE TRIGGER fail_timestamp_normalization BEFORE UPDATE ON expenses
+             BEGIN SELECT RAISE(ABORT,'forced timestamp migration failure'); END;",
+        ).unwrap();
+        drop(database);
+
+        assert!(Database::open(&data_dir).is_err());
+        let connection = Connection::open(data_dir.join("carwash.db")).unwrap();
+        let user_timestamp: String = connection
+            .query_row(
+                "SELECT created_at FROM users WHERE id='atomic-user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user_timestamp, "2026-01-01T00:00:00+02:00");
+        let migration_present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=22)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!migration_present);
+        drop(connection);
         fs::remove_dir_all(data_dir).unwrap();
     }
 }

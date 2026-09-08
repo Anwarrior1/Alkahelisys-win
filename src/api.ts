@@ -32,6 +32,7 @@ const isTauri = typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in windo
 const API_ROOT = import.meta.env.VITE_API_URL ?? (isTauri ? 'http://127.0.0.1:8787/api' : '/api');
 
 type RecordValue = Record<string, unknown>;
+export type ResultPage<T> = { items: T[]; has_more: boolean; next_cursor: string | null };
 
 export class ApiError extends Error {
   readonly status: number;
@@ -359,11 +360,15 @@ class ApiClient {
     };
   }
 
-  async washes(params?: Record<string, string | number | boolean | undefined | null>): Promise<Wash[]> { return records(await this.get(`/washes${query(params)}`)).map(mapWash); }
+  async washPage(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<Wash>> {
+    const value = record(await this.get(`/washes${query(params)}`));
+    return { items: records(value.items).map(mapWash), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
+  }
+  async washes(params?: Record<string, string | number | boolean | undefined | null>): Promise<Wash[]> { return (await this.washPage(params)).items; }
 
   async paidCars(params?: Record<string, string | number | boolean | undefined | null>): Promise<PaidCarsData> {
     const value = record(await this.get(`/paid-cars${query(params)}`));
-    return { items: records(value.items).map(mapWash), settlement: money(value.settlementMilli) };
+    return { items: records(value.items).map(mapWash), total_count: number(value.totalCount), settlement: money(value.settlementMilli), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
   }
 
   async setWashPaid(id: string, isPaid: boolean, selectedDate?: string): Promise<{ wash: Wash; settlement: number }> {
@@ -384,7 +389,7 @@ class ApiClient {
       licensePlate: data.license_plate ?? null, price: text(data.price), workerId: text(data.worker_id),
       paymentType: data.payment_type === 'showroom_account' ? 'showroom' : 'cash', showroomId: data.showroom_id ?? null,
       showroomPaymentMethod: data.payment_type === 'showroom_account' ? data.showroom_payment_method ?? null : null,
-      occurredAt: data.performed_at ?? undefined, clientRequestId: crypto.randomUUID(),
+      occurredAt: data.performed_at ?? undefined, clientRequestId: text(data.client_request_id) || crypto.randomUUID(),
     };
     const saved = record(await this.post('/washes', input));
     const wash = record(saved.wash);
@@ -436,14 +441,16 @@ class ApiClient {
     };
   }
 
-  async overnightCars(params?: Record<string, string | number | boolean | undefined | null>): Promise<OvernightCar[]> {
-    return records(await this.get(`/overnight-cars${query(params)}`)).map((item) => ({
+  async overnightCarPage(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<OvernightCar>> {
+    const value = record(await this.get(`/overnight-cars${query(params)}`));
+    return { items: records(value.items).map((item) => ({
       id: text(item.id),
       wash: mapWash(item.wash),
       marked_at: text(item.markedAt),
       marked_by_name: text(item.markedBy) || undefined,
-    }));
+    })), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
   }
+  async overnightCars(params?: Record<string, string | number | boolean | undefined | null>): Promise<OvernightCar[]> { return (await this.overnightCarPage(params)).items; }
 
   async deleteOvernightCar(id: string): Promise<void> { await this.delete(`/overnight-cars/${encodeURIComponent(id)}`); }
 
@@ -480,15 +487,15 @@ class ApiClient {
     };
   }
   async deleteWorker(id: string): Promise<void> { await this.delete(`/workers/${encodeURIComponent(id)}`); }
-  async worker(id: string, includeFinancials: boolean, selectedDate?: string): Promise<Worker & { washes?: Wash[] }> {
-    const detail = record(await this.get(`/workers/${encodeURIComponent(id)}${query({ date: selectedDate })}`));
+  async worker(id: string, includeFinancials: boolean, selectedDate?: string): Promise<Worker & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null }> {
+    const detail = record(await this.get(`/workers/${encodeURIComponent(id)}${query({ date: selectedDate, limit: 100 })}`));
     const worker = mapWorker(detail.worker);
     const dailyValue = record(detail.dailyValue);
     if (Object.keys(dailyValue).length > 0) {
       worker.daily_value = dailyValue.amountMilli === null || dailyValue.amountMilli === undefined ? undefined : money(dailyValue.amountMilli);
       worker.daily_value_date = text(dailyValue.date) || selectedDate;
     }
-    const result: Worker & { washes?: Wash[] } = { ...worker, washes: records(detail.history).map(mapWash) };
+    const result: Worker & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null } = { ...worker, washes: records(detail.history).map(mapWash), washes_has_more: detail.historyHasMore === true, washes_next_cursor: text(detail.historyNextCursor) || null };
     if (includeFinancials) {
       const financial = record(await this.get(`/workers/${encodeURIComponent(id)}/financial${query({ date: selectedDate })}`));
       result.financials = {
@@ -501,6 +508,10 @@ class ApiClient {
       };
     }
     return result;
+  }
+  async workerHistoryPage(id: string, selectedDate: string, cursor: string): Promise<ResultPage<Wash>> {
+    const value = record(await this.get(`/workers/${encodeURIComponent(id)}${query({ date: selectedDate, limit: 100, cursor })}`));
+    return { items: records(value.history).map(mapWash), has_more: value.historyHasMore === true, next_cursor: text(value.historyNextCursor) || null };
   }
   async updateWorkerDailyValue(id: string, data: { value_date: string; amount: string }): Promise<{ amount: Money; date: string }> {
     const value = record(await this.put(`/workers/${encodeURIComponent(id)}/daily-value`, { valueDate: data.value_date, amount: data.amount }));
@@ -520,6 +531,8 @@ class ApiClient {
       remaining_returns: money(value.remainingReturnsMilli),
       remaining_withdrawal_debt: money(value.remainingWithdrawalDebtMilli),
       outstanding_deduction_balance: money(value.outstandingDeductionBalanceMilli),
+      has_more: value.hasMore === true,
+      next_cursor: text(value.nextCursor) || null,
       transactions: records(value.transactions).map((transaction) => ({
         id: text(transaction.id),
         type: transaction.type === 'deduction' ? 'deduction' : transaction.type === 'deduction_payment' ? 'deduction_payment' : transaction.type === 'settlement' ? 'settlement' : transaction.type === 'return' ? 'return' : 'withdrawal',
@@ -532,12 +545,13 @@ class ApiClient {
       })),
     };
   }
-  async createWorkerWithdrawalReturn(id: string, data: { type: 'withdrawal' | 'return' | 'deduction_payment'; amount: string; occurred_at: string; notes?: string | null }): Promise<void> {
+  async createWorkerWithdrawalReturn(id: string, data: { type: 'withdrawal' | 'return' | 'deduction_payment'; amount: string; occurred_at: string; notes?: string | null; client_request_id?: string }): Promise<void> {
     await this.post(`/workers/${encodeURIComponent(id)}/withdrawals-returns`, {
       transactionType: data.type,
       amount: data.amount,
       occurredAt: data.occurred_at,
       notes: data.notes ?? null,
+      clientRequestId: data.client_request_id,
     });
   }
   async updateWorkerDeductionPayment(workerId: string, movementId: string, data: { amount: string; occurred_at: string; notes?: string | null }): Promise<void> {
@@ -567,8 +581,8 @@ class ApiClient {
       latest_wash_at: text(item.latestWashAt) || null,
     }));
   }
-  async showroomDebt(id: string, range: DateRange): Promise<ShowroomDebtProfile> {
-    const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}${query({ from: range.from, to: range.to })}`));
+  async showroomDebt(id: string, range: DateRange, cursors: { operations?: string | null; payments?: string | null } = {}): Promise<ShowroomDebtProfile> {
+    const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}${query({ from: range.from, to: range.to, operationsLimit: 100, operationsCursor: cursors.operations, paymentsLimit: 100, paymentsCursor: cursors.payments })}`));
     return {
       showroom: mapShowroom(value.showroom),
       from: text(value.from),
@@ -578,7 +592,11 @@ class ApiClient {
       total_payments: money(value.totalPaymentsMilli),
       total_outstanding: money(value.totalOutstandingMilli),
       operations: records(value.operations).map(mapWash),
+      operations_has_more: value.operationsHasMore === true,
+      operations_next_cursor: text(value.operationsNextCursor) || null,
       payments: records(value.payments).map(mapPayment),
+      payments_has_more: value.paymentsHasMore === true,
+      payments_next_cursor: text(value.paymentsNextCursor) || null,
     };
   }
   async showroomStatistics(id: string, params: { from: string; to: string; paymentType: 'all' | 'cash' | 'debt' }): Promise<number> {
@@ -596,16 +614,26 @@ class ApiClient {
     return { id, name: payload.name, contact_name: payload.contactName === null ? null : text(payload.contactName), phone: payload.phone === null ? null : text(payload.phone), address: payload.notes === null ? null : text(payload.notes) };
   }
   async deleteShowroom(id: string): Promise<void> { await this.delete(`/showrooms/${encodeURIComponent(id)}`); }
-  async showroom(id: string, includeFinancials: boolean, selectedDate?: string): Promise<Showroom & { washes?: Wash[] }> {
-    const detail = record(await this.get(`/showrooms/${encodeURIComponent(id)}${query({ date: selectedDate })}`));
+  async showroom(id: string, includeFinancials: boolean, selectedDate?: string): Promise<Showroom & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null; payments_has_more?: boolean; payments_next_cursor?: string | null }> {
+    const detail = record(await this.get(`/showrooms/${encodeURIComponent(id)}${query({ date: selectedDate, limit: 100 })}`));
     const showroom = mapShowroom(detail.showroom);
-    const result: Showroom & { washes?: Wash[] } = { ...showroom, washes: records(detail.history).map(mapWash) };
+    const result: Showroom & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null; payments_has_more?: boolean; payments_next_cursor?: string | null } = { ...showroom, washes: records(detail.history).map(mapWash), washes_has_more: detail.historyHasMore === true, washes_next_cursor: text(detail.historyNextCursor) || null };
     if (includeFinancials) {
-      const financial = record(await this.get(`/showrooms/${encodeURIComponent(id)}/financial${query({ date: selectedDate })}`));
+      const financial = record(await this.get(`/showrooms/${encodeURIComponent(id)}/financial${query({ date: selectedDate, limit: 100 })}`));
       result.financials = { total_charges: money(financial.chargesMilli), total_payments: money(financial.paymentsMilli), outstanding_balance: money(financial.outstandingMilli) };
       result.payments = records(financial.payments).map((payment) => ({ ...mapPayment(payment), showroom_id: showroom.id, showroom_name: showroom.name }));
+      result.payments_has_more = financial.paymentsHasMore === true;
+      result.payments_next_cursor = text(financial.paymentsNextCursor) || null;
     }
     return result;
+  }
+  async showroomHistoryPage(id: string, selectedDate: string, cursor: string): Promise<ResultPage<Wash>> {
+    const value = record(await this.get(`/showrooms/${encodeURIComponent(id)}${query({ date: selectedDate, limit: 100, cursor })}`));
+    return { items: records(value.history).map(mapWash), has_more: value.historyHasMore === true, next_cursor: text(value.historyNextCursor) || null };
+  }
+  async showroomPaymentPage(id: string, selectedDate: string, cursor: string): Promise<ResultPage<PaymentRecord>> {
+    const value = record(await this.get(`/showrooms/${encodeURIComponent(id)}/financial${query({ date: selectedDate, limit: 100, cursor })}`));
+    return { items: records(value.payments).map(mapPayment), has_more: value.paymentsHasMore === true, next_cursor: text(value.paymentsNextCursor) || null };
   }
 
   async financeOverview(params?: Record<string, string | number | boolean | undefined | null>): Promise<FinanceOverview> { return mapFinance(await this.get(`/finance/overview${query(params)}`)); }
@@ -641,11 +669,12 @@ class ApiClient {
   async deletePayrollEmployee(employeeId: string): Promise<void> {
     await this.delete(`/payroll/employees/${encodeURIComponent(employeeId)}`);
   }
-  async salaryDeductions(month: string, selectedDate?: string): Promise<SalaryDeduction[]> {
-    return records(await this.get(`/payroll/deductions${query({ month, date: selectedDate })}`)).map(mapSalaryDeduction);
+  async salaryDeductions(month: string, selectedDate?: string, cursor?: string | null): Promise<ResultPage<SalaryDeduction>> {
+    const value = record(await this.get(`/payroll/deductions${query({ month, date: selectedDate, limit: 100, cursor })}`));
+    return { items: records(value.items).map(mapSalaryDeduction), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
   }
-  async createSalaryDeduction(data: { employee_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
-    return mapSalaryDeduction(await this.post('/payroll/deductions', { employeeId: data.employee_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
+  async createSalaryDeduction(data: { employee_id: string; amount: string; deducted_at: string; notes?: string | null; client_request_id?: string }): Promise<SalaryDeduction> {
+    return mapSalaryDeduction(await this.post('/payroll/deductions', { employeeId: data.employee_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null, clientRequestId: data.client_request_id }));
   }
   async updateSalaryDeduction(id: string, data: { employee_id: string; amount: string; deducted_at: string; notes?: string | null }): Promise<SalaryDeduction> {
     return mapSalaryDeduction(await this.patch(`/payroll/deductions/${encodeURIComponent(id)}`, { employeeId: data.employee_id, amount: data.amount, deductedAt: data.deducted_at, notes: data.notes ?? null }));
@@ -653,15 +682,17 @@ class ApiClient {
   async deleteSalaryDeduction(id: string): Promise<void> {
     await this.delete(`/payroll/deductions/${encodeURIComponent(id)}`);
   }
-  async salaryWithdrawals(month: string, selectedDate?: string): Promise<SalaryWithdrawal[]> {
-    return records(await this.get(`/payroll/withdrawals${query({ month, date: selectedDate })}`)).map(mapSalaryWithdrawal);
+  async salaryWithdrawals(month: string, selectedDate?: string, cursor?: string | null): Promise<ResultPage<SalaryWithdrawal>> {
+    const value = record(await this.get(`/payroll/withdrawals${query({ month, date: selectedDate, limit: 100, cursor })}`));
+    return { items: records(value.items).map(mapSalaryWithdrawal), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
   }
-  async createSalaryWithdrawal(data: { employee_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
+  async createSalaryWithdrawal(data: { employee_id: string; amount: string; withdrawn_at: string; notes?: string | null; client_request_id?: string }): Promise<SalaryWithdrawal> {
     return mapSalaryWithdrawal(await this.post('/payroll/withdrawals', {
       employeeId: data.employee_id,
       amount: data.amount,
       withdrawnAt: data.withdrawn_at,
       notes: data.notes ?? null,
+      clientRequestId: data.client_request_id,
     }));
   }
   async updateSalaryWithdrawal(id: string, data: { employee_id: string; amount: string; withdrawn_at: string; notes?: string | null }): Promise<SalaryWithdrawal> {
@@ -675,14 +706,14 @@ class ApiClient {
   async deleteSalaryWithdrawal(id: string): Promise<void> {
     await this.delete(`/payroll/withdrawals/${encodeURIComponent(id)}`);
   }
-  async showroomPayments(params?: Record<string, string | number | boolean | undefined | null>): Promise<PaymentRecord[]> { return records(await this.get(`/showroom-payments${query(params)}`)).map(mapPayment); }
+  async showroomPayments(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<PaymentRecord>> { const value=record(await this.get(`/showroom-payments${query(params)}`)); return {items:records(value.items).map(mapPayment),has_more:value.hasMore===true,next_cursor:text(value.nextCursor)||null}; }
   async createWorkerPayment(data: Record<string, unknown>): Promise<PaymentRecord> {
     const payload = { workerId: text(data.worker_id), amount: text(data.amount), paidAt: data.paid_at ?? undefined, notes: data.notes ?? null };
     const saved = record(await this.post('/worker-payments', payload));
     return { id: text(saved.id), worker_id: payload.workerId, amount: number(payload.amount), paid_at: text(payload.paidAt), notes: payload.notes === null ? null : text(payload.notes) };
   }
   async createShowroomPayment(data: Record<string, unknown>): Promise<PaymentRecord> {
-    const payload = { showroomId: text(data.showroom_id), amount: text(data.amount), paidAt: data.paid_at ?? undefined, notes: data.notes ?? null };
+    const payload = { showroomId: text(data.showroom_id), amount: text(data.amount), paidAt: data.paid_at ?? undefined, notes: data.notes ?? null, clientRequestId: data.client_request_id ?? undefined };
     const saved = record(await this.post('/showroom-payments', payload));
     return mapPayment(saved);
   }
@@ -697,11 +728,11 @@ class ApiClient {
   async deleteShowroomPayment(id: string): Promise<void> {
     await this.delete(`/showroom-payments/${encodeURIComponent(id)}`);
   }
-  async expenses(params?: Record<string, string | number | boolean | undefined | null>): Promise<ExpenseRecord[]> { return records(await this.get(`/expenses${query(params)}`)).map(mapExpense); }
+  async expenses(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<ExpenseRecord>> { const value=record(await this.get(`/expenses${query(params)}`)); return {items:records(value.items).map(mapExpense),has_more:value.hasMore===true,next_cursor:text(value.nextCursor)||null}; }
   async createExpense(data: Record<string, unknown>): Promise<ExpenseRecord> {
     const allocation = text(data.allocation);
     const paymentMethod: 'cash' | 'bank' = data.payment_method === 'bank' ? 'bank' : 'cash';
-    const payload = { description: text(data.description), category: text(data.category, 'أخرى'), paymentMethod, amount: text(data.amount), occurredAt: data.spent_at ?? undefined, notes: data.notes ?? null, allocationType: allocation === 'business_only' ? 'business' : allocation === 'workers_only' ? 'workers' : 'shared', businessBps: Math.round(number(data.business_percentage) * 100) };
+    const payload = { description: text(data.description), category: text(data.category, 'أخرى'), paymentMethod, amount: text(data.amount), occurredAt: data.spent_at ?? undefined, notes: data.notes ?? null, allocationType: allocation === 'business_only' ? 'business' : allocation === 'workers_only' ? 'workers' : 'shared', businessBps: Math.round(number(data.business_percentage) * 100), clientRequestId: data.client_request_id ?? undefined };
     const saved = record(await this.post('/expenses', payload));
     return { id: text(saved.id), description: payload.description, category: payload.category, payment_method: payload.paymentMethod, amount: number(payload.amount), spent_at: text(payload.occurredAt), notes: payload.notes === null ? null : text(payload.notes), allocation: allocation as ExpenseRecord['allocation'], business_percentage: payload.businessBps / 100, workers_percentage: 100 - payload.businessBps / 100, business_amount: money(saved.businessAmountMilli), workers_amount: money(saved.workersAmountMilli) };
   }
@@ -720,7 +751,7 @@ class ApiClient {
 
   async operationalReport(params?: Record<string, string | number | boolean | undefined | null>): Promise<OperationalReport> {
     const value = record(await this.get(`/reports/operational${query(params)}`));
-    return { cars_washed: number(value.carsWashed), washes: records(value.washes).map(mapWash), workers: records(value.workerPerformance).map((worker) => ({ worker_id: text(worker.workerId), worker_name: text(worker.workerName), cars_washed: number(worker.carsWashed) })) };
+    return { cars_washed: number(value.carsWashed), washes: records(value.washes).map(mapWash), washes_has_more: value.washesHasMore === true, washes_next_cursor: text(value.washesNextCursor) || null, workers: records(value.workerPerformance).map((worker) => ({ worker_id: text(worker.workerId), worker_name: text(worker.workerName), cars_washed: number(worker.carsWashed) })) };
   }
   async financialReport(params?: Record<string, string | number | boolean | undefined | null>): Promise<FinancialReport> {
     const value = record(await this.get(`/reports/financial${query(params)}`));
@@ -779,8 +810,16 @@ class ApiClient {
     return (await this.roles()).find((role) => role.id === id) ?? { id, key: '', name: '', permissions };
   }
 
-  async auditLogs(params?: Record<string, string | number | boolean | undefined | null>): Promise<AuditLog[]> { return records(await this.get(`/audit-logs${query(params)}`)).map((entry) => ({ id: text(entry.id), action: text(entry.action), description: text(entry.description) || undefined, affected_record: text(entry.entityId) || undefined, created_at: text(entry.createdAt), user_name: text(entry.userName) || undefined })); }
-  async backups(params?: Record<string, string | number | boolean | undefined | null>): Promise<BackupRecord[]> { return records(await this.get(`/backups${query(params)}`)).map((entry) => ({ id: text(entry.id), file_name: text(entry.path).split(/[\\/]/).pop(), created_at: text(entry.createdAt), path: text(entry.path) || undefined, size_bytes: number(entry.sizeBytes), download_url: text(entry.downloadUrl) || undefined })); }
+  async auditLogPage(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<AuditLog>> {
+    const value = record(await this.get(`/audit-logs${query(params)}`));
+    return { items: records(value.items).map((entry) => ({ id: text(entry.id), action: text(entry.action), description: text(entry.description) || undefined, affected_record: text(entry.entityId) || undefined, created_at: text(entry.createdAt), user_name: text(entry.userName) || undefined })), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
+  }
+  async auditLogs(params?: Record<string, string | number | boolean | undefined | null>): Promise<AuditLog[]> { return (await this.auditLogPage(params)).items; }
+  async backupPage(params?: Record<string, string | number | boolean | undefined | null>): Promise<ResultPage<BackupRecord>> {
+    const value = record(await this.get(`/backups${query(params)}`));
+    return { items: records(value.items).map((entry) => ({ id: text(entry.id), file_name: text(entry.path).split(/[\\/]/).pop(), created_at: text(entry.createdAt), path: text(entry.path) || undefined, size_bytes: number(entry.sizeBytes), download_url: text(entry.downloadUrl) || undefined })), has_more: value.hasMore === true, next_cursor: text(value.nextCursor) || null };
+  }
+  async backups(params?: Record<string, string | number | boolean | undefined | null>): Promise<BackupRecord[]> { return (await this.backupPage(params)).items; }
   async createBackup(path?: string): Promise<BackupRecord> {
     const saved = record(await this.post('/backups', path ? { path } : {}));
     return { id: text(saved.id), file_name: text(saved.path).split(/[\\/]/).pop(), path: text(saved.path), created_at: text(saved.createdAt, new Date().toISOString()), size_bytes: number(saved.sizeBytes), download_url: text(saved.downloadUrl) || undefined };
@@ -816,11 +855,36 @@ class ApiClient {
       : suppliedPath.startsWith('/api/')
         ? `${API_ROOT.replace(/\/api\/?$/, '')}${suppliedPath}`
         : `${API_ROOT}${suppliedPath.startsWith('/') ? suppliedPath : `/${suppliedPath}`}`;
+    const savePicker = (window as Window & {
+      showSaveFilePicker?: (options: {
+        suggestedName: string;
+        types: Array<{ description: string; accept: Record<string, string[]> }>;
+      }) => Promise<{ createWritable: () => Promise<WritableStream<Uint8Array>> }>;
+    }).showSaveFilePicker;
+    let fileHandle: Awaited<ReturnType<NonNullable<typeof savePicker>>> | undefined;
+    if (savePicker) {
+      try {
+        fileHandle = await savePicker.call(window, {
+          suggestedName: filename,
+          types: [{ description: 'قاعدة بيانات SQLite', accept: { 'application/octet-stream': ['.db'] } }],
+        });
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        throw error;
+      }
+    }
     const response = await fetch(downloadUrl, { headers });
     if (!response.ok) {
       const payload = record(await response.json().catch(() => undefined));
       throw new ApiError(text(payload.error, 'تعذر تنزيل النسخة الاحتياطية.'), response.status);
     }
+    if (fileHandle && response.body) {
+      const writable = await fileHandle.createWritable();
+      await response.body.pipeTo(writable);
+      return;
+    }
+    // Compatibility fallback for browsers without the File System Access API. The desktop path
+    // and supported Chromium browsers use direct-to-disk streaming above.
     const url = URL.createObjectURL(await response.blob());
     const link = document.createElement('a');
     link.href = url; link.download = filename; document.body.appendChild(link); link.click(); link.remove();

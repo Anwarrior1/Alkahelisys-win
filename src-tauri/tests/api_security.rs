@@ -7,7 +7,7 @@ use axum::{
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::mpsc, time::Duration as StdDuration};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -17,6 +17,26 @@ const ALL_TIME_RANGE: &str = "from=0000-01-01T00:00:00Z&to=9999-12-31T23:59:59Z"
 
 fn all_time_endpoint(path: &str) -> String {
     format!("{path}?{ALL_TIME_RANGE}")
+}
+
+fn encode_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn with_cursor(path: &str, key: &str, cursor: &Value) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!(
+        "{path}{separator}{key}={}",
+        encode_query_value(cursor.as_str().unwrap())
+    )
 }
 
 fn business_today_key() -> String {
@@ -2125,6 +2145,271 @@ async fn initial_manager_setup_and_login_work() {
 }
 
 #[tokio::test]
+async fn password_change_revokes_existing_sessions_and_rejects_oversized_login_input() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let (status, profile) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let manager_id = profile["data"]["id"].as_str().unwrap();
+    let replacement_password = "ReplacementManagerPassword456!";
+
+    let (status, updated) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/users/{manager_id}"),
+        Some(&manager_token),
+        Some(json!({"password": replacement_password})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["data"]["reauthenticationRequired"], true);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/auth/login",
+        None,
+        Some(json!({"username":"manager.test","password":MANAGER_PASSWORD})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        !login(&test_app.router, "manager.test", replacement_password)
+            .await
+            .is_empty()
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/auth/login",
+        None,
+        Some(json!({"username":"manager.test","password":"x".repeat(129)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn financial_create_requests_are_idempotent_at_the_authoritative_layer() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id =
+        create_worker(&test_app.router, &manager_token, "عامل اختبار منع التكرار").await;
+    let (status, showroom) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showrooms",
+        Some(&manager_token),
+        Some(json!({"name":"معرض اختبار منع التكرار","isActive":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let showroom_id = showroom["data"]["id"].as_str().unwrap().to_owned();
+    let (status, employee) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/employees",
+        Some(&manager_token),
+        Some(json!({"fullName":"موظف اختبار منع التكرار","month":"2026-09","salary":"1000"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let employee_id = employee["data"]["employee"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let requests = [
+        (
+            format!("/api/workers/{worker_id}/withdrawals-returns"),
+            json!({"transactionType":"withdrawal","amount":"10","occurredAt":"2026-09-01T10:00:00Z","clientRequestId":"duplicate-worker-movement"}),
+        ),
+        (
+            "/api/payroll/withdrawals".to_owned(),
+            json!({"employeeId":employee_id,"amount":"20","withdrawnAt":"2026-09-01T10:00:00Z","clientRequestId":"duplicate-salary-withdrawal"}),
+        ),
+        (
+            "/api/payroll/deductions".to_owned(),
+            json!({"employeeId":employee_id,"amount":"30","deductedAt":"2026-09-01T10:00:00Z","clientRequestId":"duplicate-salary-deduction"}),
+        ),
+        (
+            "/api/showroom-payments".to_owned(),
+            json!({"showroomId":showroom_id,"amount":"40","paidAt":"2026-09-01T10:00:00Z","clientRequestId":"duplicate-showroom-payment"}),
+        ),
+        (
+            "/api/expenses".to_owned(),
+            json!({"description":"مصروف اختبار منع التكرار","category":"اختبار","amount":"50","occurredAt":"2026-09-01T10:00:00Z","allocationType":"business","clientRequestId":"duplicate-expense"}),
+        ),
+    ];
+    for (path, body) in requests {
+        let (first_status, first) = request_json(
+            &test_app.router,
+            Method::POST,
+            &path,
+            Some(&manager_token),
+            Some(body.clone()),
+        )
+        .await;
+        let (second_status, second) = request_json(
+            &test_app.router,
+            Method::POST,
+            &path,
+            Some(&manager_token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "first request to {path}");
+        assert_eq!(second_status, StatusCode::OK, "retry request to {path}");
+        assert_eq!(
+            first["data"], second["data"],
+            "replayed response for {path}"
+        );
+    }
+
+    let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    for table in [
+        "worker_withdrawal_returns",
+        "salary_withdrawals",
+        "salary_deductions",
+        "showroom_payments",
+        "expenses",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "{table} must contain one authoritative write");
+    }
+    let request_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM operation_requests", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(request_count, 5);
+    drop(connection);
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn local_api_cors_allows_app_origins_but_not_arbitrary_websites() {
+    let test_app = TestApp::new();
+    let allowed = test_app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/auth/login")
+                .header(header::ORIGIN, "http://tauri.localhost")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "http://tauri.localhost"
+    );
+
+    let rejected = test_app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/auth/login")
+                .header(header::ORIGIN, "https://malicious.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(rejected
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn oversized_business_text_and_invalid_idempotency_keys_are_rejected() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل تحقق الحدود").await;
+
+    let (worker_status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/workers",
+        Some(&manager_token),
+        Some(json!({"fullName":"عامل","phone":"1".repeat(61)})),
+    )
+    .await;
+    assert_eq!(worker_status, StatusCode::BAD_REQUEST);
+
+    let (wash_status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Boundary","licensePlate":"أ".repeat(61),
+            "price":"10","workerId":worker_id,"paymentType":"cash",
+            "occurredAt":"2026-09-01T10:00:00Z","clientRequestId":"boundary-wash"
+        })),
+    )
+    .await;
+    assert_eq!(wash_status, StatusCode::BAD_REQUEST);
+
+    for (request_id, notes) in [
+        ("boundary-expense", "م".repeat(501)),
+        ("   ", "ملاحظة".to_owned()),
+    ] {
+        let (status, _) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/expenses",
+            Some(&manager_token),
+            Some(json!({
+                "description":"اختبار حدود النص","category":"اختبار","amount":"10",
+                "occurredAt":"2026-09-01T10:00:00Z","allocationType":"business",
+                "notes":notes,"clientRequestId":request_id
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn profile_pictures_are_isolated_persistent_and_removable() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
@@ -2243,6 +2528,10 @@ async fn manager_backup_and_restore_preserve_a_verified_snapshot() {
         .to_owned();
     assert!(std::path::Path::new(&path).is_file());
     let backup_id = backup["data"]["id"].as_str().unwrap().to_owned();
+    let backup_hash = backup["data"]["sha256"]
+        .as_str()
+        .expect("backup hash should be returned");
+    assert_eq!(backup_hash.len(), 64);
 
     let (status, history) = request_json(
         &test_app.router,
@@ -2279,6 +2568,10 @@ async fn manager_backup_and_restore_preserve_a_verified_snapshot() {
         .to_str()
         .unwrap()
         .contains("attachment"));
+    assert_eq!(
+        headers.get(header::ETAG).unwrap().to_str().unwrap(),
+        format!("\"{backup_hash}\"")
+    );
     let downloaded_path = test_app.data_dir.join("downloaded-backup.db");
     fs::write(&downloaded_path, &downloaded).unwrap();
     assert!(downloaded.len() > 1000);
@@ -2390,6 +2683,60 @@ async fn manager_backup_and_restore_preserve_a_verified_snapshot() {
 }
 
 #[tokio::test]
+async fn valid_but_hash_modified_managed_backup_is_rejected_by_consumers() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let (status, backup) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/backups",
+        Some(&manager_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["data"]["id"].as_str().unwrap();
+    let backup_path = PathBuf::from(backup["data"]["path"].as_str().unwrap());
+
+    let connection = Connection::open(&backup_path).unwrap();
+    connection
+        .execute_batch("PRAGMA user_version = 617;")
+        .unwrap();
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok", "the changed file remains valid SQLite");
+    drop(connection);
+
+    let (status, _, _) = request_bytes(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/backups/{backup_id}/download"),
+        &manager_token,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let export_path = test_app.data_dir.join("hash-mismatch-export.db");
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/backups/{backup_id}/export"),
+        Some(&manager_token),
+        Some(json!({"path": export_path})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        !export_path.exists(),
+        "failed export must not leave a partial file"
+    );
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn corrupt_backup_is_rejected_without_changing_the_live_database() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;
@@ -2473,6 +2820,16 @@ async fn incomplete_sqlite_backup_is_rejected_before_live_database_replacement()
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert!(
+        fs::read_dir(&data_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("restore-staged-")
+        }),
+        "a rejected restore must remove its full-size staging directory"
+    );
 
     let (status, workers) = request_json(
         &test_app.router,
@@ -3398,6 +3755,41 @@ async fn individual_employee_permissions_override_role_defaults() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    let (_, users) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/users",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let listed = users["data"]["items"].as_array().unwrap();
+    let first_listed = listed
+        .iter()
+        .find(|user| user["id"] == employees[0].0)
+        .unwrap();
+    assert_eq!(
+        first_listed["permissions"],
+        json!(["financial.manage", "section.finance.access"]),
+        "the batched user list must preserve an explicit permission profile"
+    );
+    let (_, second_me) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/auth/me",
+        Some(&employees[1].1),
+        None,
+    )
+    .await;
+    let second_listed = listed
+        .iter()
+        .find(|user| user["id"] == employees[1].0)
+        .unwrap();
+    assert_eq!(
+        second_listed["permissions"], second_me["data"]["permissions"],
+        "the batched user list must preserve inherited role permissions"
+    );
 
     let (first_status, _) = request_json(
         &test_app.router,
@@ -7684,4 +8076,1090 @@ async fn overnight_cars_are_unique_linked_and_manager_only() {
     assert_eq!(wash_after_delete["data"]["items"][0]["carColor"], "أزرق");
 
     test_app.cleanup();
+}
+
+/// Performance-fix regression guard.
+///
+/// Backup listing no longer opens each backup file as a SQLite database, so a corrupt file now
+/// survives in the list. This test pins the resulting contract: listing stays cheap and tolerant,
+/// while every path that actually consumes a backup still verifies it and still refuses a bad one.
+/// Missing files are omitted without turning a read request into a destructive cleanup operation.
+#[tokio::test]
+async fn backup_listing_is_metadata_only_while_consumers_still_reject_bad_backups() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+
+    let (status, backup) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/backups",
+        Some(&manager_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_id = backup["data"]["id"].as_str().unwrap().to_owned();
+    let backup_path = PathBuf::from(backup["data"]["path"].as_str().unwrap());
+
+    // Corrupt the file in place, leaving the history row and the file itself present.
+    fs::write(&backup_path, b"this is no longer a SQLite database").unwrap();
+
+    // Listing must still return it: it reports metadata and does not verify.
+    let (status, history) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/backups",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = history["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == backup_id)
+        .expect("a present file must remain listed without integrity verification");
+    assert_eq!(
+        listed["sizeBytes"].as_u64().unwrap(),
+        fs::metadata(&backup_path).unwrap().len(),
+        "listing must report real on-disk metadata"
+    );
+
+    // Download consumes the file, so it must still verify and refuse.
+    let (status, _, _) = request_bytes(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/backups/{backup_id}/download"),
+        &manager_token,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "download must still verify the backup before serving it"
+    );
+
+    // Export consumes the file, so it must still verify and refuse.
+    let export_target = test_app.data_dir.join("exported-copy.db");
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PUT,
+        &format!("/api/backups/{backup_id}/export"),
+        Some(&manager_token),
+        Some(json!({"path": export_target.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "export must still verify the backup before copying it"
+    );
+    assert!(
+        !export_target.exists(),
+        "a corrupt backup must never produce an exported copy"
+    );
+
+    // Restore must still refuse, and must leave the live database untouched.
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/backups/restore",
+        Some(&manager_token),
+        Some(json!({"path": backup_path.to_string_lossy(), "confirmation": "RESTORE"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "restore must still reject a corrupt backup"
+    );
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/workers",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rejected restore must keep the live database and session intact"
+    );
+
+    // Missing files are omitted without attempting to consume them.
+    fs::remove_file(&backup_path).unwrap();
+    let (status, history) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/backups",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !history["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == backup_id),
+        "a backup whose file has disappeared must be omitted from the listing"
+    );
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn optimized_reports_preserve_exact_financial_and_operational_aggregates() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_one = create_worker(&test_app.router, &manager_token, "عامل التقرير الأول").await;
+    let worker_two = create_worker(&test_app.router, &manager_token, "عامل التقرير الثاني").await;
+    let worker_zero = create_worker(&test_app.router, &manager_token, "عامل بلا عمليات").await;
+
+    let (status, showroom) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showrooms",
+        Some(&manager_token),
+        Some(json!({"name":"معرض مطابقة التقارير"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let showroom_id = showroom["data"]["id"].as_str().unwrap().to_owned();
+
+    let (status, employee) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/employees",
+        Some(&manager_token),
+        Some(json!({"fullName":"موظف مطابقة التقارير","month":"2026-08","salary":"1000"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let employee_id = employee["data"]["employee"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let paid_cash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_one,
+        "100",
+        "2026-08-29T10:00:00Z",
+    )
+    .await;
+    let _unpaid_cash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_two,
+        "200",
+        "2026-08-29T11:00:00Z",
+    )
+    .await;
+    let voided_cash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_two,
+        "400",
+        "2026-08-29T12:00:00Z",
+    )
+    .await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Report","vehicleModel":"Showroom","price":"300",
+            "workerId":worker_one,"paymentType":"showroom","showroomId":showroom_id,
+            "showroomPaymentMethod":"bank","occurredAt":"2026-08-29T13:00:00Z",
+            "clientRequestId":Uuid::new_v4().to_string()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{paid_cash}/paid"),
+        Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{voided_cash}/void"),
+        Some(&manager_token),
+        Some(json!({"reason":"استبعاد من مطابقة التقارير"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/expenses",
+        Some(&manager_token),
+        Some(json!({
+            "description":"مصروف مطابقة التقارير","category":"اختبار","amount":"90",
+            "occurredAt":"2026-08-29T14:00:00Z","allocationType":"shared","businessBps":5000
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showroom-payments",
+        Some(&manager_token),
+        Some(json!({
+            "showroomId":showroom_id,"amount":"40","paidAt":"2026-08-29T15:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/payroll/withdrawals",
+        Some(&manager_token),
+        Some(json!({
+            "employeeId":employee_id,"amount":"20","withdrawnAt":"2026-08-29T16:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let finance_endpoint = all_time_endpoint("/api/finance/overview");
+    let financial_endpoint = all_time_endpoint("/api/reports/financial");
+    let operational_endpoint = all_time_endpoint("/api/reports/operational");
+    let (status, finance) = request_json(
+        &test_app.router,
+        Method::GET,
+        &finance_endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, financial) = request_json(
+        &test_app.router,
+        Method::GET,
+        &financial_endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(financial["data"]["summary"], finance["data"]);
+    assert_eq!(
+        financial["data"]["summary"],
+        json!({
+            "totalWashRevenueMilli":600_000,
+            "cashRevenueMilli":300_000,
+            "paidCustomerRevenueMilli":100_000,
+            "paidCustomerRevenueAfterDeductionsMilli":-10_000,
+            "showroomRevenueMilli":300_000,
+            "showroomNetProfitMilli":150_000,
+            "businessShareMilli":300_000,
+            "paidCarsProfitMilli":50_000,
+            "workerCommissionsMilli":300_000,
+            "workerDeductionsMilli":45_000,
+            "workerWithdrawalsMilli":20_000,
+            "outstandingWorkerBalancesMilli":255_000,
+            "expensesMilli":90_000,
+            "businessExpensesMilli":45_000,
+            "workerExpensesMilli":45_000,
+            "showroomPaymentsMilli":40_000,
+            "outstandingShowroomDebtMilli":260_000,
+            "netProfitBeforeExpensesMilli":50_000,
+            "netProfitAfterExpensesMilli":-15_000,
+            "netBusinessProfitMilli":255_000
+        })
+    );
+
+    let worker_rows = financial["data"]["workerPerformance"].as_array().unwrap();
+    let row_for = |id: &str| {
+        worker_rows
+            .iter()
+            .find(|row| row["workerId"] == id)
+            .unwrap()
+    };
+    assert_eq!(row_for(&worker_one)["carsWashed"], 2);
+    assert_eq!(row_for(&worker_one)["revenueMilli"], 400_000);
+    assert_eq!(row_for(&worker_one)["commissionMilli"], 200_000);
+    assert_eq!(row_for(&worker_one)["deductionsMilli"], 15_000);
+    assert_eq!(row_for(&worker_one)["remainingMilli"], 185_000);
+    assert_eq!(row_for(&worker_two)["carsWashed"], 1);
+    assert_eq!(row_for(&worker_two)["revenueMilli"], 200_000);
+    assert_eq!(row_for(&worker_two)["commissionMilli"], 100_000);
+    assert_eq!(row_for(&worker_two)["deductionsMilli"], 15_000);
+    assert_eq!(row_for(&worker_zero)["carsWashed"], 0);
+    assert_eq!(row_for(&worker_zero)["deductionsMilli"], 15_000);
+    assert_eq!(row_for(&worker_zero)["remainingMilli"], 0);
+
+    let (status, operational) = request_json(
+        &test_app.router,
+        Method::GET,
+        &operational_endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(operational["data"]["carsWashed"], 3);
+    let operational_workers = operational["data"]["workerPerformance"].as_array().unwrap();
+    assert_eq!(
+        operational_workers
+            .iter()
+            .map(|row| row["carsWashed"].as_i64().unwrap())
+            .sum::<i64>(),
+        3
+    );
+    assert_eq!(
+        operational_workers
+            .iter()
+            .find(|row| row["workerId"] == worker_zero)
+            .unwrap()["carsWashed"],
+        0
+    );
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn overnight_history_is_bounded_complete_unique_and_date_scoped() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id =
+        create_worker(&test_app.router, &manager_token, "عامل صفحات سيارات المبيت").await;
+    let mut connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    let manager_id: String = connection
+        .query_row(
+            "SELECT id FROM users WHERE deleted_at IS NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = connection.transaction().unwrap();
+    for sequence in 0..302 {
+        let wash_id = format!("phase2-overnight-wash-{sequence:03}");
+        let overnight_id = format!("phase2-overnight-{sequence:03}");
+        tx.execute(
+            "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,price_milli,worker_id,payment_type,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,status,is_paid,created_at,updated_at)
+             VALUES(?1,'Pagination','Overnight',50000,?2,'cash','2026-09-07T12:00:00.000Z',5000,25000,25000,?3,?4,'posted',0,'2026-09-07T12:00:00.000Z','2026-09-07T12:00:00.000Z')",
+            params![
+                wash_id,
+                worker_id,
+                manager_id,
+                format!("phase2-overnight-request-{sequence:03}")
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES(?1,?2,?3,'2026-09-07T12:00:00.000Z')",
+            params![overnight_id, wash_id, manager_id],
+        )
+        .unwrap();
+    }
+    tx.execute(
+        "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,price_milli,worker_id,payment_type,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,status,is_paid,created_at,updated_at)
+         VALUES('phase2-overnight-other-wash','Pagination','Other date',50000,?1,'cash','2026-09-06T12:00:00.000Z',5000,25000,25000,?2,'phase2-overnight-other-request','posted',0,'2026-09-06T12:00:00.000Z','2026-09-06T12:00:00.000Z')",
+        params![worker_id, manager_id],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO overnight_cars(id,wash_id,marked_by,marked_at) VALUES('phase2-overnight-other','phase2-overnight-other-wash',?1,'2026-09-06T12:00:00.000Z')",
+        [manager_id],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(connection);
+
+    let (_, first) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/overnight-cars?date=2026-09-07",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(first["data"]["items"].as_array().unwrap().len(), 100);
+    assert_eq!(first["data"]["hasMore"], true);
+    assert!(first["data"]["nextCursor"].is_string());
+
+    let (_, maximum) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/overnight-cars?date=2026-09-07&limit=999",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(maximum["data"]["items"].as_array().unwrap().len(), 300);
+    assert_eq!(maximum["data"]["hasMore"], true);
+    assert!(maximum["data"]["nextCursor"].is_string());
+
+    let mut cursor: Option<Value> = None;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        let path = cursor.as_ref().map_or_else(
+            || "/api/overnight-cars?date=2026-09-07".to_owned(),
+            |value| with_cursor("/api/overnight-cars?date=2026-09-07", "cursor", value),
+        );
+        let (_, page) = request_json(
+            &test_app.router,
+            Method::GET,
+            &path,
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        for item in page["data"]["items"].as_array().unwrap() {
+            assert!(
+                visited.insert(item["id"].as_str().unwrap().to_owned()),
+                "overnight pagination returned a duplicate record"
+            );
+        }
+        if page["data"]["hasMore"] == false {
+            break;
+        }
+        assert!(page["data"]["nextCursor"].is_string());
+        cursor = Some(page["data"]["nextCursor"].clone());
+    }
+    assert_eq!(visited.len(), 302, "no selected-date record may be lost");
+    assert!(!visited.contains("phase2-overnight-other"));
+
+    let (_, other_date) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/overnight-cars?date=2026-09-06",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(other_date["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        other_date["data"]["items"][0]["id"],
+        "phase2-overnight-other"
+    );
+    assert_eq!(other_date["data"]["hasMore"], false);
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn wash_history_pagination_keeps_every_record_accessible() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل التصفح").await;
+    let mut created_ids = Vec::new();
+    for sequence in 0..3 {
+        let (status, payload) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&manager_token),
+            Some(json!({
+                "vehicleMake":"Pagination",
+                "vehicleModel":format!("Record {sequence}"),
+                "price":"20",
+                "workerId":worker_id,
+                "paymentType":"cash",
+                "occurredAt":format!("2026-09-01T10:0{sequence}:00Z"),
+                "clientRequestId":format!("pagination-{sequence}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        created_ids.push(payload["data"]["wash"]["id"].as_str().unwrap().to_owned());
+    }
+
+    let endpoint = "/api/washes?from=2026-09-01T00:00:00Z&to=2026-09-01T23:59:59Z&limit=2";
+    let (status, first) = request_json(
+        &test_app.router,
+        Method::GET,
+        endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["data"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(first["data"]["hasMore"], true);
+    assert!(first["data"]["nextCursor"].is_string());
+
+    let (status, second) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(endpoint, "cursor", &first["data"]["nextCursor"]),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(second["data"]["hasMore"], false);
+    let mut paged_ids = first["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second["data"]["items"].as_array().unwrap())
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    created_ids.sort();
+    paged_ids.sort();
+    assert_eq!(paged_ids, created_ids, "pagination must not hide history");
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn keyset_history_survives_newer_insert_and_page_one_delete() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &manager_token, "عامل ثبات المؤشر").await;
+    let mut original_ids = std::collections::HashSet::new();
+    for sequence in 0..5 {
+        let (status, payload) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&manager_token),
+            Some(json!({
+                "vehicleMake":"Keyset",
+                "vehicleModel":format!("Stable {sequence}"),
+                "price":"20",
+                "workerId":worker_id,
+                "paymentType":"cash",
+                "occurredAt":"2026-09-01T10:00:00.000Z",
+                "clientRequestId":format!("keyset-stable-{sequence}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        original_ids.insert(payload["data"]["wash"]["id"].as_str().unwrap().to_owned());
+    }
+
+    let endpoint = "/api/washes?from=2026-09-01T00:00:00Z&to=2026-09-01T23:59:59Z&limit=2";
+    let (_, first) = request_json(
+        &test_app.router,
+        Method::GET,
+        endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(first["data"]["items"].as_array().unwrap().len(), 2);
+    let cursor = first["data"]["nextCursor"].clone();
+    assert!(cursor.is_string());
+
+    let (_, inserted) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Keyset",
+            "vehicleModel":"Inserted later",
+            "price":"20",
+            "workerId":worker_id,
+            "paymentType":"cash",
+            "occurredAt":"2026-09-01T11:00:00.000Z",
+            "clientRequestId":"keyset-newer-between-pages"
+        })),
+    )
+    .await;
+    let inserted_id = inserted["data"]["wash"]["id"].as_str().unwrap();
+    let deleted_id = first["data"]["items"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{deleted_id}/void"),
+        Some(&manager_token),
+        Some(json!({"reason":"اختبار حذف سجل من الصفحة الأولى"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut traversed = first["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::HashSet<_>>();
+    let mut next_cursor = Some(cursor);
+    while let Some(current_cursor) = next_cursor {
+        let (_, page) = request_json(
+            &test_app.router,
+            Method::GET,
+            &with_cursor(endpoint, "cursor", &current_cursor),
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        for item in page["data"]["items"].as_array().unwrap() {
+            assert!(
+                traversed.insert(item["id"].as_str().unwrap().to_owned()),
+                "a mutation between requests must not duplicate a prior row"
+            );
+        }
+        next_cursor = if page["data"]["hasMore"] == true {
+            Some(page["data"]["nextCursor"].clone())
+        } else {
+            None
+        };
+    }
+    assert_eq!(traversed, original_ids);
+    assert!(!traversed.contains(inserted_id));
+
+    let (scope_status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(
+            "/api/washes?from=2026-09-02T00:00:00Z&to=2026-09-02T23:59:59Z&limit=2",
+            "cursor",
+            &first["data"]["nextCursor"],
+        ),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(scope_status, StatusCode::BAD_REQUEST);
+
+    let mut malformed: Value =
+        serde_json::from_str(first["data"]["nextCursor"].as_str().unwrap()).unwrap();
+    malformed["timestamp"] = json!("not-a-timestamp");
+    let malformed = Value::String(serde_json::to_string(&malformed).unwrap());
+    let (malformed_status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(endpoint, "cursor", &malformed),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
+
+    let (range_status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/washes?from=2026-09-02T00:00:00Z&to=2026-09-01T00:00:00Z",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(range_status, StatusCode::BAD_REQUEST);
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn backup_keyset_advances_over_missing_files_without_deleting_history() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let mut valid_ids = Vec::new();
+    for _ in 0..3 {
+        let (status, backup) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/backups",
+            Some(&manager_token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        valid_ids.push(backup["data"]["id"].as_str().unwrap().to_owned());
+    }
+    let missing_id = "phase3-missing-backup";
+    let missing_path = test_app.data_dir.join("backups").join("missing-phase3.db");
+    let connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    for (id, timestamp) in valid_ids.iter().zip([
+        "2026-09-01T10:04:00.000Z",
+        "2026-09-01T10:02:00.000Z",
+        "2026-09-01T10:01:00.000Z",
+    ]) {
+        connection
+            .execute(
+                "UPDATE backup_history SET created_at=?1 WHERE id=?2",
+                params![timestamp, id],
+            )
+            .unwrap();
+    }
+    connection.execute(
+        "INSERT INTO backup_history(id,backup_path,status,created_by,created_at) VALUES(?1,?2,'completed',NULL,'2026-09-01T10:03:00.000Z')",
+        params![missing_id, missing_path.to_string_lossy()],
+    ).unwrap();
+    drop(connection);
+
+    let endpoint = "/api/backups?date=2026-09-01&limit=2";
+    let (_, first) = request_json(
+        &test_app.router,
+        Method::GET,
+        endpoint,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(first["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["data"]["hasMore"], true);
+    assert!(first["data"]["nextCursor"].is_string());
+
+    let (_, second) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(endpoint, "cursor", &first["data"]["nextCursor"]),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(second["data"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(second["data"]["hasMore"], false);
+    let displayed = first["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second["data"]["items"].as_array().unwrap())
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(displayed, valid_ids.into_iter().collect());
+    let row_still_exists: bool = Connection::open(test_app.data_dir.join("carwash.db"))
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM backup_history WHERE id=?1)",
+            [missing_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(row_still_exists, "GET must not delete missing-file history");
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn remaining_history_endpoints_are_bounded_complete_and_keep_full_totals() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(
+        &test_app.router,
+        &manager_token,
+        "عامل قوائم المرحلة الثانية",
+    )
+    .await;
+    let mut connection = Connection::open(test_app.data_dir.join("carwash.db")).unwrap();
+    let manager_id: String = connection
+        .query_row(
+            "SELECT id FROM users WHERE deleted_at IS NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = connection.transaction().unwrap();
+    tx.execute("INSERT INTO showrooms(id,name,is_active,created_at,updated_at) VALUES('phase2-showroom','معرض المرحلة الثانية',1,'2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z')",[]).unwrap();
+    tx.execute("INSERT INTO payroll_employees(id,full_name,is_active,created_at,updated_at) VALUES('phase2-employee','موظف المرحلة الثانية',1,'2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z')",[]).unwrap();
+    tx.execute("INSERT INTO payroll_salary_rates(employee_id,effective_month,salary_milli,set_by,created_at,updated_at) VALUES('phase2-employee','2026-09',1000000,?1,'2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z')",[manager_id.clone()]).unwrap();
+    for sequence in 0..302 {
+        let timestamp = format!(
+            "2026-09-07T12:{:02}:{:02}.{:03}Z",
+            (sequence / 60) % 60,
+            sequence % 60,
+            sequence
+        );
+        tx.execute("INSERT INTO expenses(id,description,category,payment_method,amount_milli,occurred_at,notes,allocation_type,business_bps,workers_bps,business_amount_milli,workers_amount_milli,created_by,created_at) VALUES(?1,?2,'اختبار','cash',3000,?3,NULL,'business',10000,0,3000,0,?4,?3)",params![format!("phase2-expense-{sequence:03}"),format!("مصروف {sequence}"),timestamp,manager_id]).unwrap();
+    }
+    for sequence in 0..4 {
+        let timestamp = format!("2026-09-07T13:00:0{sequence}.000Z");
+        tx.execute("INSERT INTO wash_operations(id,vehicle_make,vehicle_model,price_milli,worker_id,payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,status,is_paid,created_at,updated_at) VALUES(?1,'Pagination','History',50000,?2,'showroom','phase2-showroom','cash',?3,5000,25000,25000,?4,?5,'posted',0,?3,?3)",params![format!("phase2-wash-{sequence}"),worker_id,timestamp,manager_id,format!("phase2-request-{sequence}")]).unwrap();
+        tx.execute("INSERT INTO showroom_payments(id,showroom_id,amount_milli,paid_at,notes,created_by,created_at) VALUES(?1,'phase2-showroom',1000,?2,'pagination',?3,?2)",params![format!("phase2-payment-{sequence}"),timestamp,manager_id]).unwrap();
+        tx.execute("INSERT INTO salary_withdrawals(id,employee_id,amount_milli,withdrawn_at,notes,created_by,created_at,updated_at) VALUES(?1,'phase2-employee',1000,?2,'pagination',?3,?2,?2)",params![format!("phase2-salary-w-{sequence}"),timestamp,manager_id]).unwrap();
+        tx.execute("INSERT INTO salary_deductions(id,employee_id,amount_milli,deduction_month,deducted_at,notes,created_by,created_at,updated_at) VALUES(?1,'phase2-employee',1000,'2026-09',?2,'pagination',?3,?2,?2)",params![format!("phase2-salary-d-{sequence}"),timestamp,manager_id]).unwrap();
+        tx.execute("INSERT INTO worker_withdrawal_returns(id,worker_id,transaction_type,amount_milli,occurred_at,notes,created_by,created_at) VALUES(?1,?2,'withdrawal',1000,?3,'pagination',?4,?3)",params![format!("phase2-movement-{sequence}"),worker_id,timestamp,manager_id]).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(connection);
+
+    let range = "date=2026-09-07&limit=2";
+    for path in [
+        "/api/showroom-payments",
+        "/api/payroll/withdrawals",
+        "/api/payroll/deductions",
+    ] {
+        let (_, first) = request_json(
+            &test_app.router,
+            Method::GET,
+            &format!("{path}?{range}"),
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        let (_, second) = request_json(
+            &test_app.router,
+            Method::GET,
+            &with_cursor(
+                &format!("{path}?{range}"),
+                "cursor",
+                &first["data"]["nextCursor"],
+            ),
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            first["data"]["items"].as_array().unwrap().len(),
+            2,
+            "{path}"
+        );
+        assert_eq!(first["data"]["hasMore"], true, "{path}");
+        assert!(first["data"]["nextCursor"].is_string(), "{path}");
+        assert_eq!(
+            second["data"]["items"].as_array().unwrap().len(),
+            2,
+            "{path}"
+        );
+        assert_eq!(second["data"]["hasMore"], false, "{path}");
+        let ids = first["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["data"]["items"].as_array().unwrap())
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            4,
+            "all records from {path} must remain reachable"
+        );
+    }
+
+    let (_, expense_first) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/expenses?date=2026-09-07&limit=999",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        expense_first["data"]["items"].as_array().unwrap().len(),
+        300
+    );
+    assert_eq!(expense_first["data"]["hasMore"], true);
+    let (_, finance) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/finance/overview?date=2026-09-07",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(finance["data"]["expensesMilli"], 906000);
+    let (_, expense_final) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(
+            "/api/expenses?date=2026-09-07&limit=999",
+            "cursor",
+            &expense_first["data"]["nextCursor"],
+        ),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(expense_final["data"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(expense_final["data"]["hasMore"], false);
+
+    for path in [
+        format!("/api/workers/{worker_id}"),
+        "/api/showrooms/phase2-showroom".to_owned(),
+    ] {
+        let (_, first) = request_json(
+            &test_app.router,
+            Method::GET,
+            &format!("{path}?{range}"),
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        let (_, second) = request_json(
+            &test_app.router,
+            Method::GET,
+            &with_cursor(
+                &format!("{path}?{range}"),
+                "cursor",
+                &first["data"]["historyNextCursor"],
+            ),
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        assert_eq!(first["data"]["history"].as_array().unwrap().len(), 2);
+        assert_eq!(first["data"]["historyHasMore"], true);
+        assert_eq!(second["data"]["history"].as_array().unwrap().len(), 2);
+        assert_eq!(second["data"]["historyHasMore"], false);
+    }
+
+    let ledger_path = format!("/api/workers/{worker_id}/withdrawals-returns");
+    let (_, ledger_first) = request_json(
+        &test_app.router,
+        Method::GET,
+        &format!("{ledger_path}?{range}"),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let (_, ledger_second) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(
+            &format!("{ledger_path}?{range}"),
+            "cursor",
+            &ledger_first["data"]["nextCursor"],
+        ),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        ledger_first["data"]["transactions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(ledger_first["data"]["hasMore"], true);
+    assert_eq!(
+        ledger_second["data"]["transactions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(ledger_first["data"]["totalWithdrawalsMilli"], 4000);
+
+    let (_, financial_first) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/showrooms/phase2-showroom/financial?date=2026-09-07&limit=2",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let (_, financial_second) = request_json(
+        &test_app.router,
+        Method::GET,
+        &with_cursor(
+            "/api/showrooms/phase2-showroom/financial?date=2026-09-07&limit=2",
+            "cursor",
+            &financial_first["data"]["paymentsNextCursor"],
+        ),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        financial_first["data"]["payments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(financial_first["data"]["paymentsHasMore"], true);
+    assert_eq!(financial_second["data"]["paymentsHasMore"], false);
+    assert_eq!(financial_first["data"]["paymentsMilli"], 4000);
+
+    let debt_base =
+        "/api/showroom-debts/phase2-showroom?date=2026-09-07&operationsLimit=2&paymentsLimit=2";
+    let (_, debt_first) = request_json(
+        &test_app.router,
+        Method::GET,
+        debt_base,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    let debt_second_path = with_cursor(
+        &with_cursor(
+            debt_base,
+            "operationsCursor",
+            &debt_first["data"]["operationsNextCursor"],
+        ),
+        "paymentsCursor",
+        &debt_first["data"]["paymentsNextCursor"],
+    );
+    let (_, debt_second) = request_json(
+        &test_app.router,
+        Method::GET,
+        &debt_second_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        debt_first["data"]["operations"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(debt_first["data"]["payments"].as_array().unwrap().len(), 2);
+    assert_eq!(debt_first["data"]["operationsHasMore"], true);
+    assert_eq!(debt_first["data"]["paymentsHasMore"], true);
+    assert_eq!(debt_second["data"]["operationsHasMore"], false);
+    assert_eq!(debt_second["data"]["paymentsHasMore"], false);
+    assert_eq!(debt_first["data"]["outstandingWashCount"], 4);
+    assert_eq!(debt_first["data"]["totalChargesMilli"], 200000);
+    assert_eq!(debt_first["data"]["totalPaymentsMilli"], 4000);
+
+    let (_, empty) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/expenses?date=2026-09-06&limit=2",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert!(empty["data"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(empty["data"]["hasMore"], false);
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn independent_read_request_does_not_wait_for_writer_mutex_owner() {
+    let data_dir = std::env::temp_dir()
+        .join("alkaheli-independent-read-tests")
+        .join(Uuid::new_v4().to_string());
+    let state = create_state(data_dir.clone()).unwrap();
+    let router = build_router(state.clone());
+    let manager_token = bootstrap_manager(&router).await;
+    let blocking_state = state.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let _writer_guard = blocking_state.db.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(StdDuration::from_millis(600));
+    });
+    ready_rx.recv().unwrap();
+
+    let response = tokio::time::timeout(
+        StdDuration::from_millis(300),
+        request_json(
+            &router,
+            Method::GET,
+            "/api/settings",
+            Some(&manager_token),
+            None,
+        ),
+    )
+    .await
+    .expect("a read-only screen must not queue behind an unrelated writer-mutex owner");
+    assert_eq!(response.0, StatusCode::OK);
+    blocker.join().unwrap();
+    drop(router);
+    drop(state);
+    fs::remove_dir_all(data_dir).unwrap();
 }
