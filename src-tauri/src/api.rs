@@ -6650,7 +6650,10 @@ async fn create_backup(
                 .map_err(ApiError::internal)?
                 .len();
             let hash = sha256_file(&verify_path)?;
-            fs::File::open(&verify_path)
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&verify_path)
                 .and_then(|file| file.sync_all())
                 .map_err(ApiError::internal)?;
             finalize_new_file(&verify_path, &final_path)?;
