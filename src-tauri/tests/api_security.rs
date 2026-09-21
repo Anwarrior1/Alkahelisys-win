@@ -1477,7 +1477,7 @@ async fn dashboard_separates_paid_customer_showroom_and_withdrawal_totals() {
     );
     assert_eq!(
         before_withdrawals["data"]["financial"]["todayNetProfit"],
-        550_000
+        405_000
     );
     assert_eq!(
         before_withdrawals["data"]["financial"]["todayShowroomRevenue"],
@@ -1487,6 +1487,42 @@ async fn dashboard_separates_paid_customer_showroom_and_withdrawal_totals() {
         before_withdrawals["data"]["financial"]["todayShowroomNetProfit"],
         145_000
     );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showroom-payments",
+        Some(&manager_token),
+        Some(json!({
+            "showroomId": showroom_id,
+            "amount": "290",
+            "paidAt": "2026-09-04T10:00:00Z",
+            "notes": "اختبار عدم تكرار خصم العمولة"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_showroom_settlement) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-03",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after_showroom_settlement["data"]["financial"]["todayNetProfit"], 405_000,
+        "settling showroom debt later must not deduct its commission again"
+    );
+    let (_, settlement_day) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-04",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(settlement_day["data"]["financial"]["todayNetProfit"], 0);
 
     let mut withdrawal_ids = Vec::new();
     for hour in 13..=15 {
@@ -1539,7 +1575,7 @@ async fn dashboard_separates_paid_customer_showroom_and_withdrawal_totals() {
         1_190_000
     );
     assert_eq!(dashboard["data"]["financial"]["todayRevenue"], 1_145_000);
-    assert_eq!(dashboard["data"]["financial"]["todayNetProfit"], 505_000);
+    assert_eq!(dashboard["data"]["financial"]["todayNetProfit"], 360_000);
     assert_eq!(
         dashboard["data"]["financial"]["todayShowroomRevenue"],
         290_000
@@ -1578,7 +1614,7 @@ async fn dashboard_separates_paid_customer_showroom_and_withdrawal_totals() {
     )
     .await;
     assert_eq!(after_delete["data"]["financial"]["todayRevenue"], 1_160_000);
-    assert_eq!(after_delete["data"]["financial"]["todayNetProfit"], 520_000);
+    assert_eq!(after_delete["data"]["financial"]["todayNetProfit"], 375_000);
     assert_eq!(
         after_delete["data"]["financial"]["todayShowroomRevenue"],
         290_000
@@ -1600,6 +1636,381 @@ async fn dashboard_separates_paid_customer_showroom_and_withdrawal_totals() {
         payroll_after_delete["data"]["totalWithdrawalsMilli"],
         30_000
     );
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn dashboard_deducts_exact_showroom_and_overnight_commissions_from_reported_scenario() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(
+        &test_app.router,
+        &manager_token,
+        "عامل مطابقة عمولات 2026-09-21",
+    )
+    .await;
+    let (_, showroom) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showrooms",
+        Some(&manager_token),
+        Some(json!({"name":"معرض مطابقة 2026-09-21","isActive":true})),
+    )
+    .await;
+    let showroom_id = showroom["data"]["id"].as_str().unwrap();
+    let dashboard_path = "/api/dashboard?date=2026-09-21";
+
+    for (price, occurred_at) in [
+        ("55", "2026-09-21T16:28:00Z"),
+        ("40", "2026-09-21T16:28:01Z"),
+        ("45", "2026-09-21T16:29:00Z"),
+    ] {
+        let wash_id = create_cash_wash_at(
+            &test_app.router,
+            &manager_token,
+            &worker_id,
+            price,
+            occurred_at,
+        )
+        .await;
+        let (status, _) = request_json(
+            &test_app.router,
+            Method::PATCH,
+            &format!("/api/washes/{wash_id}/paid"),
+            Some(&manager_token),
+            Some(json!({"isPaid":true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, paid_only) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(paid_only["data"]["financial"]["todayNetProfit"], 70_000);
+
+    for (price, occurred_at, expected_net_profit) in [
+        ("80", "2026-09-21T17:19:00Z", 30_000),
+        ("40", "2026-09-21T17:20:00Z", 10_000),
+    ] {
+        let (status, created) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&manager_token),
+            Some(json!({
+                "vehicleMake":"Toyota","vehicleModel":"Showroom reconciliation",
+                "price":price,"workerId":worker_id,"paymentType":"showroom",
+                "showroomId":showroom_id,"showroomPaymentMethod":"bank",
+                "occurredAt":occurred_at,"clientRequestId":Uuid::new_v4().to_string()
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            created["data"]["wash"]["commissionMilli"],
+            price.parse::<i64>().unwrap() * 500
+        );
+        let (_, dashboard) = request_json(
+            &test_app.router,
+            Method::GET,
+            dashboard_path,
+            Some(&manager_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            dashboard["data"]["financial"]["todayNetProfit"], expected_net_profit,
+            "each showroom commission must reduce net profit exactly once"
+        );
+    }
+
+    let overnight_wash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_id,
+        "50",
+        "2026-09-21T17:21:00Z",
+    )
+    .await;
+    let (status, overnight) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{overnight_wash}/overnight"),
+        Some(&manager_token),
+        Some(json!({"isOvernight":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overnight["data"]["wash"]["commissionMilli"], 25_000);
+
+    let (_, combined) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        combined["data"]["financial"]["todayNetProfit"], -15_000,
+        "70 LYD paid profit - 40 - 20 showroom commissions - 25 overnight commission"
+    );
+
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn dashboard_net_profit_tracks_showroom_and_overnight_commission_lifecycle() {
+    let test_app = TestApp::new();
+    let manager_token = bootstrap_manager(&test_app.router).await;
+    let mut worker_ids = Vec::new();
+    for (name, commission_bps) in [
+        ("عامل السيارات الخالصة", 5_000),
+        ("عامل المعارض", 7_500),
+        ("عامل المبيت", 2_500),
+    ] {
+        let (status, worker) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/workers",
+            Some(&manager_token),
+            Some(json!({
+                "fullName": name,
+                "isActive": true,
+                "commissionBpsOverride": commission_bps
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        worker_ids.push(worker["data"]["id"].as_str().unwrap().to_owned());
+    }
+
+    let (_, showroom) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showrooms",
+        Some(&manager_token),
+        Some(json!({"name":"معرض دورة صافي اليوم","isActive":true})),
+    )
+    .await;
+    let showroom_id = showroom["data"]["id"].as_str().unwrap().to_owned();
+    let dashboard_path = "/api/dashboard?date=2026-09-05";
+
+    let paid_wash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_ids[0],
+        "1000",
+        "2026-09-05T09:00:00Z",
+    )
+    .await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{paid_wash}/paid"),
+        Some(&manager_token),
+        Some(json!({"isPaid":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, paid_only) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(paid_only["data"]["financial"]["todayNetProfit"], 500_000);
+
+    let (status, showroom_wash) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Showroom funded","price":"100",
+            "workerId":worker_ids[1],"paymentType":"showroom","showroomId":showroom_id,
+            "showroomPaymentMethod":"bank","occurredAt":"2026-09-05T10:00:00Z",
+            "clientRequestId":Uuid::new_v4().to_string()
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let showroom_wash_id = showroom_wash["data"]["id"].as_str().unwrap().to_owned();
+    let (_, with_showroom) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        with_showroom["data"]["financial"]["todayNetProfit"],
+        425_000
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{showroom_wash_id}/overnight"),
+        Some(&manager_token),
+        Some(json!({"isOvernight":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, showroom_also_overnight) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        showroom_also_overnight["data"]["financial"]["todayNetProfit"], 425_000,
+        "one wash matching both classifications must still contribute one commission"
+    );
+
+    let overnight_wash = create_cash_wash_at(
+        &test_app.router,
+        &manager_token,
+        &worker_ids[2],
+        "100",
+        "2026-09-05T11:00:00Z",
+    )
+    .await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{overnight_wash}/overnight"),
+        Some(&manager_token),
+        Some(json!({"isOvernight":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, combined) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        combined["data"]["financial"]["todayNetProfit"], 400_000,
+        "500 LYD paid profit minus 75 LYD showroom and 25 LYD overnight commissions"
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{overnight_wash}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Overnight reassigned","price":"100",
+            "workerId":worker_ids[1],"paymentType":"cash","occurredAt":"2026-09-05T11:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_reassignment) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after_reassignment["data"]["financial"]["todayNetProfit"], 350_000,
+        "the current snapshotted commission must follow worker reassignment"
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::PATCH,
+        &format!("/api/washes/{overnight_wash}"),
+        Some(&manager_token),
+        Some(json!({
+            "vehicleMake":"Toyota","vehicleModel":"Overnight moved","price":"100",
+            "workerId":worker_ids[1],"paymentType":"cash","occurredAt":"2026-09-06T11:00:00Z"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, original_day_after_move) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        original_day_after_move["data"]["financial"]["todayNetProfit"],
+        425_000
+    );
+    let (_, moved_day) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-06",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(moved_day["data"]["financial"]["todayNetProfit"], -75_000);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{showroom_wash_id}/void"),
+        Some(&manager_token),
+        Some(json!({"reason":"اختبار عكس عمولة المعرض"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_showroom_void) = request_json(
+        &test_app.router,
+        Method::GET,
+        dashboard_path,
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after_showroom_void["data"]["financial"]["todayNetProfit"],
+        500_000
+    );
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{overnight_wash}/void"),
+        Some(&manager_token),
+        Some(json!({"reason":"اختبار عكس عمولة المبيت"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after_overnight_void) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/dashboard?date=2026-09-06",
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after_overnight_void["data"]["financial"]["todayNetProfit"],
+        0
+    );
+
     test_app.cleanup();
 }
 
@@ -3948,7 +4359,10 @@ async fn daily_revenue_permission_controls_dashboard_card_data_per_employee() {
         manager_dashboard["data"]["financial"]["todayCustomerRevenue"],
         0
     );
-    assert_eq!(manager_dashboard["data"]["financial"]["todayNetProfit"], 0);
+    assert_eq!(
+        manager_dashboard["data"]["financial"]["todayNetProfit"],
+        -50_000
+    );
     assert_eq!(
         manager_dashboard["data"]["financial"]["todayShowroomRevenue"],
         100_000
@@ -4120,7 +4534,7 @@ async fn dashboard_revenue_uses_local_today_and_recalculates_after_wash_mutation
     assert_eq!(initial["data"]["financial"]["todayRevenue"], 50_000);
     assert_eq!(initial["data"]["financial"]["todayCustomerRevenue"], 0);
     assert_eq!(initial["data"]["financial"]["todayShowroomRevenue"], 50_000);
-    assert_eq!(initial["data"]["financial"]["todayNetProfit"], 0);
+    assert_eq!(initial["data"]["financial"]["todayNetProfit"], -25_000);
     assert_eq!(
         initial["data"]["financial"]["todayShowroomNetProfit"],
         25_000
@@ -4657,7 +5071,7 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     .await;
     assert_eq!(dashboard["data"]["todayWashes"], 3);
     assert_eq!(dashboard["data"]["financial"]["todayRevenue"], 70_000);
-    assert_eq!(dashboard["data"]["financial"]["todayNetProfit"], -5_000);
+    assert_eq!(dashboard["data"]["financial"]["todayNetProfit"], -32_500);
     let (_, washes) = request_json(
         &test_app.router,
         Method::GET,
@@ -4966,7 +5380,7 @@ async fn global_working_date_filters_all_daily_endpoints_without_mutating_record
     );
     assert_eq!(
         following_dashboard["data"]["financial"]["todayNetProfit"],
-        -35_000
+        -67_500
     );
     let (_, selected_again) = request_json(
         &test_app.router,
@@ -6956,6 +7370,10 @@ async fn overnight_completion_preserves_original_operation_and_financial_date() 
     )
     .await;
     assert_eq!(dashboard_after_mark["data"]["todayWashes"], 1);
+    assert_eq!(
+        dashboard_after_mark["data"]["financial"]["todayNetProfit"], -25_000,
+        "an unpaid overnight commission is funded by the owner on the wash day"
+    );
     assert!(dashboard_after_mark["data"]["recentWashes"]
         .as_array()
         .unwrap()
@@ -7021,6 +7439,19 @@ async fn overnight_completion_preserves_original_operation_and_financial_date() 
         canonical_utc_millis(&operation_at)
     );
     assert_eq!(paid_original_day["data"]["settlementMilli"], 50_000);
+    let (_, dashboard_after_paid) = request_json(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/dashboard?{selected_query}"),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        dashboard_after_paid["data"]["financial"]["todayNetProfit"],
+        25_000,
+        "the paid wash business share already contains the commission, so it must not be deducted again"
+    );
     let (_, paid_following_day) = request_json(
         &test_app.router,
         Method::GET,
@@ -7034,6 +7465,18 @@ async fn overnight_completion_preserves_original_operation_and_financial_date() 
         .unwrap()
         .is_empty());
     assert_eq!(paid_following_day["data"]["settlementMilli"], 0);
+    let (_, following_dashboard) = request_json(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/dashboard?date={following_key}"),
+        Some(&manager_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        following_dashboard["data"]["financial"]["todayNetProfit"], 0,
+        "overnight settlement must remain attributed to the original wash date"
+    );
 
     let (_, finance_original_day) = request_json(
         &test_app.router,

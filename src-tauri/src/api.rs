@@ -1347,6 +1347,7 @@ async fn dashboard(
         today_paid_customer_profit: i64,
         today_showroom_revenue: i64,
         today_showroom_profit: i64,
+        today_owner_funded_commissions: i64,
     }
     let metrics = db.conn.query_row(
         "WITH wash AS (
@@ -1361,7 +1362,11 @@ async fn dashboard(
                 COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='cash' AND is_paid=1 THEN price_milli ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='cash' AND is_paid=1 THEN business_share_milli ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='showroom' THEN price_milli ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='showroom' THEN business_share_milli ELSE 0 END),0)
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4 AND payment_type='showroom' THEN business_share_milli ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN occurred_at BETWEEN ?3 AND ?4
+                    AND (payment_type='showroom' OR (payment_type='cash' AND is_paid=0 AND EXISTS(
+                        SELECT 1 FROM overnight_cars overnight WHERE overnight.wash_id=wash_operations.id
+                    ))) THEN commission_milli ELSE 0 END),0)
              FROM wash_operations
              WHERE status='posted' AND occurred_at BETWEEN ?1 AND ?2
                AND (?5=1 OR created_by=?6)
@@ -1388,8 +1393,9 @@ async fn dashboard(
             month_showroom_revenue: row.get(6)?, month_business_share: row.get(7)?,
             today_paid_customer_revenue: row.get(8)?, today_paid_customer_profit: row.get(9)?,
             today_showroom_revenue: row.get(10)?, today_showroom_profit: row.get(11)?,
-            month_expenses: row.get(12)?, month_business_expenses: row.get(13)?,
-            month_worker_deductions: row.get(14)?, month_showroom_payments: row.get(15)?,
+            today_owner_funded_commissions: row.get(12)?,
+            month_expenses: row.get(13)?, month_business_expenses: row.get(14)?,
+            month_worker_deductions: row.get(15)?, month_showroom_payments: row.get(16)?,
         }),
     ).map_err(ApiError::internal)?;
     let mut recent = Vec::new();
@@ -1444,8 +1450,11 @@ async fn dashboard(
     if principal.is_manager() {
         let revenue_before_withdrawals =
             metrics.today_paid_customer_revenue + metrics.today_showroom_revenue;
-        let today_net_profit =
-            metrics.today_paid_customer_profit - metrics.today_salary_withdrawals;
+        let today_net_profit = metrics
+            .today_paid_customer_profit
+            .checked_sub(metrics.today_owner_funded_commissions)
+            .and_then(|value| value.checked_sub(metrics.today_salary_withdrawals))
+            .ok_or_else(|| ApiError::internal("dashboard net-profit arithmetic overflow"))?;
         if response.get("financial").is_none() {
             response["financial"] = json!({});
         }
