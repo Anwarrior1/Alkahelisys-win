@@ -596,8 +596,19 @@ html[data-theme='dark'] .topbar__utility .theme-toggle:hover { color: #1059ad; b
 .showroom-debt-summary .mini-metric { padding: 14px; }
 .showroom-debt-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .showroom-debt-print-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; }
+.showroom-debt-profile .section-card__header { flex-wrap: wrap; }
+.showroom-debt-print-controls .button { white-space: normal; text-align: center; }
 .showroom-debt-print-controls label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .showroom-debt-print-controls input { width: 132px; min-height: 38px; padding-inline: 7px; font-size: 13px; }
+.showroom-debt-views { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 17px; padding: 5px; width: fit-content; max-width: 100%; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); }
+.showroom-debt-views button { min-height: 38px; padding: 7px 16px; color: var(--muted-strong); border: 0; border-radius: 9px; background: transparent; font: inherit; font-size: 13px; font-weight: 800; cursor: pointer; }
+.showroom-debt-views button:hover, .showroom-debt-views button:focus-visible { color: var(--blue-deep); background: var(--blue-tint); }
+.showroom-debt-views button.is-active { color: var(--blue-deep); background: var(--surface-strong); box-shadow: var(--shadow-soft); }
+.bank-invoice-controls { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.bank-invoice-controls label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.bank-invoice-controls label:first-child { flex: 1 1 220px; }
+.bank-invoice-controls select, .bank-invoice-controls input { width: 100%; min-height: 40px; padding-inline: 9px; color: var(--text); border: 1px solid var(--border); border-radius: 9px; background: var(--surface-strong); font: inherit; font-size: 13px; }
+.bank-invoice-controls .button { min-height: 40px; }
 .showroom-debt-table { min-width: 720px; }
 .showroom-debt-print { display: none; }
 .profile-operational-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 15px; }
@@ -1127,6 +1138,19 @@ html[data-platform='windows-desktop'] .exhibition-profile-card-stack > .profile-
   .showroom-debt-print__aging-list strong { color: #17355e; font-size: 15px; font-weight: 900; white-space: nowrap; }
   .showroom-debt-print__balance { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 13px; padding: 10px 11px; color: #0b2a59; border-radius: 6px; background: #eef4fd !important; font-size: 16px; font-weight: 900; }
   .showroom-debt-print__balance strong { font-size: 18px; }
+  .showroom-debt-print--invoice .showroom-debt-print__header { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
+  .modal-layer:has(.showroom-debt-print--invoice) .modal > :not(.showroom-debt-print--invoice) { display: none !important; }
+  .showroom-debt-print--invoice .showroom-debt-print__header::after { left: 42%; }
+  .showroom-debt-print--invoice .showroom-debt-print__period { margin: 20px 0 22px; padding: 14px 18px; color: #0b2a59; border: 1px solid #c9d6e8; border-radius: 9px; background: #eef4fd !important; font-size: 18px; font-weight: 800; text-align: center; break-inside: avoid; }
+  .showroom-debt-print--invoice .showroom-debt-print__period strong { color: #0877ec; white-space: nowrap; }
+  .showroom-debt-print--invoice table { overflow: visible; border-radius: 0; }
+  .showroom-debt-print--invoice thead th:nth-child(1) { width: 6%; }
+  .showroom-debt-print--invoice thead th:nth-child(2) { width: 31%; }
+  .showroom-debt-print--invoice thead th:nth-child(3) { width: 25%; }
+  .showroom-debt-print--invoice thead th:nth-child(4) { width: 19%; }
+  .showroom-debt-print--invoice thead th:nth-child(5) { width: 19%; }
+  .showroom-debt-print--invoice tbody td { height: auto; min-height: 52px; overflow-wrap: anywhere; white-space: normal; }
+  .showroom-debt-print--invoice tfoot th { overflow-wrap: anywhere; }
 }
 
 /* Dark theme balance: neutral surfaces with blue reserved for emphasis. */

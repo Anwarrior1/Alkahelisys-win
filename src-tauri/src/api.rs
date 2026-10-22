@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufReader, BufWriter, Read, Write},
     ops::Deref,
@@ -297,7 +297,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/showrooms/:id/financial", get(showroom_financial))
         .route("/api/showrooms/:id/statistics", get(showroom_statistics))
         .route("/api/showroom-debts", get(list_showroom_debts))
+        .route(
+            "/api/showroom-debts/bank-accounts",
+            get(list_bank_invoice_accounts),
+        )
         .route("/api/showroom-debts/:id", get(showroom_debt_detail))
+        .route(
+            "/api/showroom-debts/:id/final-invoice",
+            get(showroom_final_invoice),
+        )
         .route("/api/payroll", get(payroll_summary))
         .route("/api/payroll/employees", post(create_payroll_employee))
         .route(
@@ -3437,6 +3445,41 @@ struct ShowroomInput {
     phone: Option<String>,
     notes: Option<String>,
     is_active: Option<bool>,
+    is_bank_account: Option<bool>,
+}
+
+async fn list_bank_invoice_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.showroom_debts.access",
+        "financial.manage",
+    )?;
+    let db = state.read_db()?;
+    let mut statement = db
+        .conn
+        .prepare(
+            "SELECT id,name,phone,notes FROM showrooms
+         WHERE is_bank_account=1 AND is_active=1 ORDER BY name,id",
+        )
+        .map_err(ApiError::internal)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,
+                "phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,
+                "isBankAccount":true,"isActive":true
+            }))
+        })
+        .map_err(ApiError::internal)?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(ApiError::internal)?);
+    }
+    Ok(ok(json!({"items":items})))
 }
 
 async fn list_showroom_debts(
@@ -3466,7 +3509,7 @@ async fn list_showroom_debts(
          SELECT showroom.id,showroom.name,showroom.contact_name,showroom.phone,showroom.notes,showroom.is_active,
                 wash_totals.wash_count,
                 wash_totals.charges-COALESCE(payment_totals.payments,0),
-                wash_totals.latest_wash_at
+                wash_totals.latest_wash_at,showroom.is_bank_account
          FROM wash_totals
          JOIN showrooms showroom ON showroom.id=wash_totals.showroom_id
          LEFT JOIN payment_totals ON payment_totals.showroom_id=showroom.id
@@ -3482,7 +3525,8 @@ async fn list_showroom_debts(
                     "contactName": row.get::<_,Option<String>>(2)?,
                     "phone": row.get::<_,Option<String>>(3)?,
                     "notes": row.get::<_,Option<String>>(4)?,
-                    "isActive": row.get::<_,i64>(5)?==1
+                    "isActive": row.get::<_,i64>(5)?==1,
+                    "isBankAccount": row.get::<_,i64>(9)?==1
                 },
                 "outstandingWashCount": row.get::<_,i64>(6)?,
                 "totalOutstandingMilli": row.get::<_,i64>(7)?,
@@ -3524,13 +3568,13 @@ async fn showroom_debt_detail(
     let (payments_cursor_timestamp, payments_cursor_id) = cursor_boundary(payments_cursor.as_ref());
     let db = state.read_db()?;
     let showroom: Option<Value> = db.conn.query_row(
-        "SELECT id,name,contact_name,phone,notes,is_active,created_at FROM showrooms WHERE id=?1",
+        "SELECT id,name,contact_name,phone,notes,is_active,created_at,is_bank_account FROM showrooms WHERE id=?1",
         [id.clone()],
         |row| Ok(json!({
             "id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,
             "contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,
             "notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,
-            "createdAt":row.get::<_,String>(6)?
+            "createdAt":row.get::<_,String>(6)?,"isBankAccount":row.get::<_,i64>(7)?==1
         })),
     ).optional().map_err(ApiError::internal)?;
     let showroom = showroom.ok_or_else(ApiError::not_found)?;
@@ -3628,6 +3672,99 @@ async fn showroom_debt_detail(
     })))
 }
 
+async fn showroom_final_invoice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let _principal = authorize_section(
+        &state,
+        &headers,
+        "section.showroom_debts.access",
+        "financial.manage",
+    )?;
+    let (from, to) = date_range(&query)?;
+    const MAX_INVOICE_WASHES: i64 = 5_000;
+    let db = state.read_db()?;
+    let showroom: Option<Value> = db
+        .conn
+        .query_row(
+            "SELECT id,name,phone,notes,created_at,is_bank_account FROM showrooms WHERE id=?1",
+            [&id],
+            |row| {
+                Ok(json!({
+                    "id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,
+                    "phone":row.get::<_,Option<String>>(2)?,"notes":row.get::<_,Option<String>>(3)?,
+                    "createdAt":row.get::<_,String>(4)?,"isBankAccount":row.get::<_,i64>(5)?==1
+                }))
+            },
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let showroom = showroom.ok_or_else(ApiError::not_found)?;
+    if showroom["isBankAccount"] != true {
+        return Err(ApiError::forbidden());
+    }
+    let (wash_count, total_amount_milli): (i64, i64) = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(price_milli),0) FROM wash_operations
+         WHERE showroom_id=?1 AND payment_type='showroom'
+           AND status='posted' AND occurred_at BETWEEN ?2 AND ?3",
+            params![id, from, to],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(ApiError::internal)?;
+    if wash_count > MAX_INVOICE_WASHES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("تتجاوز الفاتورة الحد الأقصى ({MAX_INVOICE_WASHES} غسلة). اختر فترة أقصر."),
+        ));
+    }
+    let mut statement = db.conn.prepare(
+        "SELECT id,vehicle_make,vehicle_model,wash_type,occurred_at,price_milli,license_plate,car_color
+         FROM wash_operations
+         WHERE showroom_id=?1 AND payment_type='showroom'
+           AND status='posted' AND occurred_at BETWEEN ?2 AND ?3
+         ORDER BY occurred_at DESC,id DESC LIMIT ?4",
+    ).map_err(ApiError::internal)?;
+    let rows = statement.query_map(
+        params![id,from,to,MAX_INVOICE_WASHES+1],
+        |row| Ok(json!({
+            "id":row.get::<_,String>(0)?,"vehicleMake":row.get::<_,String>(1)?,
+            "vehicleModel":row.get::<_,String>(2)?,"washType":row.get::<_,Option<String>>(3)?,
+            "occurredAt":row.get::<_,String>(4)?,"priceMilli":row.get::<_,i64>(5)?.to_string(),
+            "licensePlate":row.get::<_,Option<String>>(6)?,"carColor":row.get::<_,Option<String>>(7)?
+        })),
+    ).map_err(ApiError::internal)?;
+    let mut operations = Vec::new();
+    let mut seen = HashSet::new();
+    let mut row_total = 0_i128;
+    for row in rows {
+        let row = row.map_err(ApiError::internal)?;
+        let row_id = row["id"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("معرف غسلة مفقود"))?;
+        if !seen.insert(row_id.to_owned()) {
+            return Err(ApiError::internal("معرف غسلة مكرر"));
+        }
+        row_total += row["priceMilli"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("قيمة غسلة مفقودة"))?
+            .parse::<i128>()
+            .map_err(ApiError::internal)?;
+        operations.push(row);
+    }
+    if operations.len() as i64 != wash_count || row_total != i128::from(total_amount_milli) {
+        return Err(ApiError::internal("تعذر مطابقة صفوف الفاتورة وإجماليها"));
+    }
+    Ok(ok(json!({
+        "showroom":showroom,"from":from,"to":to,"washCount":wash_count,
+        "totalAmountMilli":total_amount_milli.to_string(),"operations":operations
+    })))
+}
+
 async fn list_showrooms(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3643,14 +3780,14 @@ async fn list_showrooms(
     let db = state.read_db()?;
     let mut items = Vec::new();
     if principal.has_permission("financial.manage") {
-        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id),COALESCE(SUM(w.price_milli),0),COALESCE((SELECT SUM(amount_milli) FROM showroom_payments sp WHERE sp.showroom_id=s.id AND sp.paid_at BETWEEN ?1 AND ?2),0) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
-        let rows=statement.query_map(params![from,to],|row|{let charges:i64=row.get(7)?;let payments:i64=row.get(8)?;Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?,"financial":{"chargesMilli":charges,"paymentsMilli":payments,"outstandingMilli":(charges-payments).max(0)}}))}).map_err(ApiError::internal)?;
+        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id),COALESCE(SUM(w.price_milli),0),COALESCE((SELECT SUM(amount_milli) FROM showroom_payments sp WHERE sp.showroom_id=s.id AND sp.paid_at BETWEEN ?1 AND ?2),0),s.is_bank_account FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
+        let rows=statement.query_map(params![from,to],|row|{let charges:i64=row.get(7)?;let payments:i64=row.get(8)?;Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?,"isBankAccount":row.get::<_,i64>(9)?==1,"financial":{"chargesMilli":charges,"paymentsMilli":payments,"outstandingMilli":(charges-payments).max(0)}}))}).map_err(ApiError::internal)?;
         for row in rows {
             items.push(row.map_err(ApiError::internal)?);
         }
     } else {
-        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id) FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
-        let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?}))).map_err(ApiError::internal)?;
+        let mut statement=db.conn.prepare("SELECT s.id,s.name,s.contact_name,s.phone,s.notes,s.is_active,COUNT(w.showroom_id),s.is_bank_account FROM showrooms s LEFT JOIN wash_operations w ON w.showroom_id=s.id AND w.status='posted' AND w.payment_type='showroom' AND w.occurred_at BETWEEN ?1 AND ?2 GROUP BY s.id ORDER BY s.is_active DESC,s.name").map_err(ApiError::internal)?;
+        let rows=statement.query_map(params![from,to],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"washCount":row.get::<_,i64>(6)?,"isBankAccount":row.get::<_,i64>(7)?==1}))).map_err(ApiError::internal)?;
         for row in rows {
             items.push(row.map_err(ApiError::internal)?);
         }
@@ -3678,7 +3815,7 @@ async fn create_showroom(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    db.conn.execute("INSERT INTO showrooms(id,name,contact_name,phone,notes,is_active,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id,name,contact_name,phone,notes,if input.is_active.unwrap_or(true){1}else{0},now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المعرض: {error}")))?;
+    db.conn.execute("INSERT INTO showrooms(id,name,contact_name,phone,notes,is_active,is_bank_account,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",params![id,name,contact_name,phone,notes,if input.is_active.unwrap_or(true){1}else{0},if input.is_bank_account.unwrap_or(false){1}else{0},now()]).map_err(|error|ApiError::new(StatusCode::CONFLICT,format!("تعذر إنشاء المعرض: {error}")))?;
     insert_audit(
         &db.conn,
         Some(&principal.id),
@@ -3712,12 +3849,12 @@ async fn update_showroom(
         .db
         .lock()
         .map_err(|_| ApiError::internal("قفل قاعدة البيانات"))?;
-    let previous_active: i64 = db
+    let (previous_active, previous_bank): (i64, i64) = db
         .conn
         .query_row(
-            "SELECT is_active FROM showrooms WHERE id=?1",
+            "SELECT is_active,is_bank_account FROM showrooms WHERE id=?1",
             params![id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(ApiError::internal)?
@@ -3726,7 +3863,11 @@ async fn update_showroom(
         .is_active
         .map(|value| if value { 1 } else { 0 })
         .unwrap_or(previous_active);
-    let count=db.conn.execute("UPDATE showrooms SET name=?1,contact_name=?2,phone=?3,notes=?4,is_active=?5,updated_at=?6 WHERE id=?7",params![name,contact_name,phone,notes,is_active,now(),id]).map_err(ApiError::internal)?;
+    let is_bank_account = input
+        .is_bank_account
+        .map(|value| if value { 1 } else { 0 })
+        .unwrap_or(previous_bank);
+    let count=db.conn.execute("UPDATE showrooms SET name=?1,contact_name=?2,phone=?3,notes=?4,is_active=?5,is_bank_account=?6,updated_at=?7 WHERE id=?8",params![name,contact_name,phone,notes,is_active,is_bank_account,now(),id]).map_err(ApiError::internal)?;
     if count == 0 {
         return Err(ApiError::not_found());
     }
@@ -3840,7 +3981,7 @@ async fn showroom_detail(
     let cursor = history_cursor(&query, "cursor", &scope)?;
     let (cursor_timestamp, cursor_id) = cursor_boundary(cursor.as_ref());
     let db = state.read_db()?;
-    let showroom:Option<Value>=db.conn.query_row("SELECT id,name,contact_name,phone,notes,is_active FROM showrooms WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1}))).optional().map_err(ApiError::internal)?;
+    let showroom:Option<Value>=db.conn.query_row("SELECT id,name,contact_name,phone,notes,is_active,is_bank_account FROM showrooms WHERE id=?1",[id.clone()],|row|Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?,"contactName":row.get::<_,Option<String>>(2)?,"phone":row.get::<_,Option<String>>(3)?,"notes":row.get::<_,Option<String>>(4)?,"isActive":row.get::<_,i64>(5)?==1,"isBankAccount":row.get::<_,i64>(6)?==1}))).optional().map_err(ApiError::internal)?;
     let showroom = showroom.ok_or_else(ApiError::not_found)?;
     let mut history = Vec::new();
     let mut statement=db.conn.prepare("SELECT w.id,w.vehicle_make,w.vehicle_model,w.manufacture_year,w.license_plate,w.price_milli,w.occurred_at,w.status,worker.full_name FROM wash_operations w JOIN workers worker ON worker.id=w.worker_id WHERE w.showroom_id=?1 AND w.occurred_at BETWEEN ?2 AND ?3 AND (?4=1 OR w.created_by=?5) AND (w.occurred_at<?6 OR (w.occurred_at=?6 AND w.id<?7)) ORDER BY w.occurred_at DESC,w.id DESC LIMIT ?8").map_err(ApiError::internal)?;
@@ -7268,6 +7409,83 @@ mod paid_cars_tests {
             round_percentage(amount, 5_000),
             (((amount as i128) * 5_000 + 5_000) / 10_000) as i64
         );
+    }
+
+    #[test]
+    fn final_invoice_read_transaction_keeps_one_snapshot_during_wash_changes() {
+        let changes = [
+            "UPDATE wash_operations SET status='voided' WHERE id IN ('A','C');
+             INSERT INTO wash_operations VALUES('X','bank','showroom','posted','2026-09-04T10:00:00.000Z',10000,'New X');
+             INSERT INTO wash_operations VALUES('Y','bank','showroom','posted','2026-09-01T10:00:00.000Z',10000,'New Y');",
+            "INSERT INTO wash_operations VALUES('D','bank','showroom','posted','2026-09-04T10:00:00.000Z',10000,'New D');",
+            "UPDATE wash_operations SET status='voided' WHERE id='C';",
+            "UPDATE wash_operations SET price_milli=20000 WHERE id='C';",
+            "UPDATE wash_operations SET occurred_at='2026-10-01T10:00:00.000Z' WHERE id='C';",
+            "UPDATE wash_operations SET showroom_id='other' WHERE id='C';",
+            "UPDATE wash_operations SET vehicle_model='Edited' WHERE id='C';",
+        ];
+        for (index, change) in changes.into_iter().enumerate() {
+            let directory =
+                std::env::temp_dir().join(format!("invoice-snapshot-{index}-{}", new_id()));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("carwash.db");
+            let writer = Connection::open(&path).unwrap();
+            writer.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE wash_operations(id TEXT PRIMARY KEY,showroom_id TEXT,payment_type TEXT,status TEXT,occurred_at TEXT,price_milli INTEGER,vehicle_model TEXT);
+                 INSERT INTO wash_operations VALUES('A','bank','showroom','posted','2026-09-03T10:00:00.000Z',10000,'Old A');
+                 INSERT INTO wash_operations VALUES('B','bank','showroom','posted','2026-09-02T10:00:00.000Z',10000,'Old B');
+                 INSERT INTO wash_operations VALUES('C','bank','showroom','posted','2026-09-01T10:00:00.000Z',10000,'Old C');",
+            ).unwrap();
+            let read = Database::open_read_only(&path).unwrap();
+            let summary: (i64, i64) = read.conn.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(price_milli),0) FROM wash_operations WHERE showroom_id='bank' AND payment_type='showroom' AND status='posted' AND occurred_at BETWEEN '2026-09-01' AND '2026-09-30'",
+                [], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(summary, (3, 30_000));
+            writer
+                .execute_batch(&format!("BEGIN; {change} COMMIT;"))
+                .unwrap();
+            let query = "SELECT id,vehicle_model,price_milli FROM wash_operations WHERE showroom_id='bank' AND payment_type='showroom' AND status='posted' AND occurred_at BETWEEN '2026-09-01' AND '2026-09-30' ORDER BY occurred_at DESC,id DESC";
+            let old: Vec<(String, String, i64)> = read
+                .conn
+                .prepare(query)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                old,
+                vec![
+                    ("A".into(), "Old A".into(), 10_000),
+                    ("B".into(), "Old B".into(), 10_000),
+                    ("C".into(), "Old C".into(), 10_000)
+                ]
+            );
+            let latest = Database::open_read_only(&path).unwrap();
+            let current: Vec<(String, String, i64)> = latest
+                .conn
+                .prepare(query)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_ne!(old, current);
+            if index == 0 {
+                assert_eq!(
+                    current.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+                    ["X", "B", "Y"]
+                );
+                assert_eq!(current.len(), old.len());
+                assert_eq!(current.iter().map(|row| row.2).sum::<i64>(), summary.1);
+            }
+            drop(latest);
+            drop(read);
+            drop(writer);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

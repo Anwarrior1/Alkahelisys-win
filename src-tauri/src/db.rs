@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 pub const MONEY_SCALE: i64 = 1000;
 pub const DEFAULT_COMMISSION_BPS: i64 = 5000;
-const CURRENT_SCHEMA_VERSION: i64 = 29;
+const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 const REQUIRED_APPLICATION_TABLES: &[&str] = &[
     "schema_migrations",
@@ -47,6 +47,7 @@ const REQUIRED_CURRENT_TABLES: &[&str] = &[
 ];
 
 const REQUIRED_CURRENT_COLUMNS: &[(&str, &[&str])] = &[
+    ("showrooms", &["id", "is_bank_account"]),
     (
         "users",
         &[
@@ -383,6 +384,7 @@ impl Database {
                 contact_name TEXT,
                 phone TEXT,
                 notes TEXT,
+                is_bank_account INTEGER NOT NULL DEFAULT 0 CHECK(is_bank_account IN (0,1)),
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -1350,6 +1352,22 @@ impl Database {
             )?;
             tx.commit()?;
         }
+        let bank_accounts_added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=30",
+            [],
+            |row| row.get(0),
+        )?;
+        if bank_accounts_added == 0 {
+            self.ensure_column(
+                "showrooms",
+                "is_bank_account",
+                "is_bank_account INTEGER NOT NULL DEFAULT 0 CHECK(is_bank_account IN (0,1))",
+            )?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(30, ?1)",
+                [now()],
+            )?;
+        }
         Ok(())
     }
 
@@ -1573,6 +1591,34 @@ pub fn default_commission_bps(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bank_account_migration_preserves_existing_showrooms_as_ordinary() {
+        let data_dir = std::env::temp_dir()
+            .join("alkaheli-bank-account-migration-tests")
+            .join(Uuid::new_v4().to_string());
+        let database = Database::open(&data_dir).unwrap();
+        database.conn.execute_batch(
+            "INSERT INTO showrooms(id,name,is_active,created_at,updated_at)
+             VALUES('legacy-showroom','Existing showroom',1,'2026-08-01T00:00:00Z','2026-08-01T00:00:00Z');
+             DELETE FROM schema_migrations WHERE version=30;
+             ALTER TABLE showrooms DROP COLUMN is_bank_account;",
+        ).unwrap();
+        drop(database);
+        let reopened = Database::open(&data_dir).unwrap();
+        let (name, is_bank_account): (String, i64) = reopened
+            .conn
+            .query_row(
+                "SELECT name,is_bank_account FROM showrooms WHERE id='legacy-showroom'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Existing showroom");
+        assert_eq!(is_bank_account, 0);
+        drop(reopened);
+        fs::remove_dir_all(data_dir).unwrap();
+    }
 
     #[test]
     fn expense_payment_method_migration_preserves_existing_expenses() {

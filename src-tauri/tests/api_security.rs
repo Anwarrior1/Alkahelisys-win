@@ -939,6 +939,469 @@ async fn showroom_debt_report_range_filters_operation_dates_and_recalculates_tot
 }
 
 #[tokio::test]
+async fn bank_final_invoice_is_bounded_exact_and_read_only() {
+    let test_app = TestApp::new();
+    let token = bootstrap_manager(&test_app.router).await;
+    let worker_id = create_worker(&test_app.router, &token, "عامل الفاتورة").await;
+    let mut showroom_ids = Vec::new();
+    for (name, is_bank_account) in [("حساب مصرفي", true), ("معرض عادي", false)] {
+        let (status, created) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/showrooms",
+            Some(&token),
+            Some(json!({"name":name,"isBankAccount":is_bank_account})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        showroom_ids.push(created["data"]["id"].as_str().unwrap().to_owned());
+    }
+    let bank_id = &showroom_ids[0];
+    let ordinary_id = &showroom_ids[1];
+    for index in 0..102 {
+        let occurred_at = if index == 0 {
+            "2026-08-01T00:00:00.000Z"
+        } else if index == 101 {
+            "2026-08-31T23:59:59.999Z"
+        } else {
+            "2026-08-15T12:00:00.000Z"
+        };
+        let wash_type = if index == 0 {
+            Value::Null
+        } else {
+            json!("غسيل كامل")
+        };
+        let (status, _) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&token),
+            Some(
+                json!({"vehicleMake":"Toyota","vehicleModel":format!("Car {index}"),
+                "washType":wash_type,"price":"1.001","workerId":worker_id,
+                "paymentType":"showroom","showroomId":bank_id,"showroomPaymentMethod":"bank",
+                "occurredAt":occurred_at,"clientRequestId":Uuid::new_v4().to_string()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let mut cash_wash_id = None;
+    for (showroom_id, method, occurred_at) in [
+        (bank_id, "cash", "2026-08-15T12:00:00.000Z"),
+        (bank_id, "bank", "2026-09-01T00:00:00.000Z"),
+        (bank_id, "bank", "2026-07-31T23:59:59.999Z"),
+        (ordinary_id, "bank", "2026-08-15T12:00:00.000Z"),
+    ] {
+        let (status, created) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&token),
+            Some(
+                json!({"vehicleMake":"Ford","vehicleModel":"Excluded","price":"9",
+                "workerId":worker_id,"paymentType":"showroom","showroomId":showroom_id,
+                "showroomPaymentMethod":method,"occurredAt":occurred_at,
+                "clientRequestId":Uuid::new_v4().to_string()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if showroom_id == bank_id && method == "cash" {
+            cash_wash_id = Some(created["data"]["id"].as_str().unwrap().to_owned());
+        }
+    }
+    let (status, created) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&token),
+        Some(
+            json!({"vehicleMake":"Ford","vehicleModel":"Voided","price":"7",
+                "workerId":worker_id,"paymentType":"showroom","showroomId":bank_id,
+                "showroomPaymentMethod":"cash","occurredAt":"2026-08-15T12:00:00.000Z",
+                "clientRequestId":Uuid::new_v4().to_string()}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let voided_id = created["data"]["id"].as_str().unwrap();
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        &format!("/api/washes/{voided_id}/void"),
+        Some(&token),
+        Some(json!({"reason":"اختبار استبعاد العملية الملغاة"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showroom-payments",
+        Some(&token),
+        Some(json!({"showroomId":bank_id,"amount":"111.102",
+            "paidAt":"2026-08-20T12:00:00.000Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let range = "from=2026-08-01T00:00:00.000Z&to=2026-08-31T23:59:59.999Z";
+    let ordinary_url = format!("/api/showroom-debts/{ordinary_id}/final-invoice?{range}");
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        &ordinary_url,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let db_path = test_app.data_dir.join("carwash.db");
+    let snapshot = || {
+        let conn = Connection::open(&db_path).unwrap();
+        let counts = [
+            "wash_operations",
+            "showroom_payments",
+            "financial_transactions",
+            "ledger_entries",
+        ]
+        .map(|table| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        });
+        let amounts = [
+            "SELECT COALESCE(SUM(price_milli + commission_milli + business_share_milli),0) FROM wash_operations",
+            "SELECT COALESCE(SUM(amount_milli),0) FROM showroom_payments",
+            "SELECT COALESCE(SUM(amount_milli),0) FROM ledger_entries",
+        ]
+        .map(|sql| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap());
+        (counts, amounts)
+    };
+    let before = snapshot();
+    let invoice_url = format!("/api/showroom-debts/{bank_id}/final-invoice?{range}");
+    let (status, _) = request_json(&test_app.router, Method::GET, &invoice_url, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut ids = std::collections::HashSet::new();
+    let mut sum = 0;
+    let mut bank_method_rows = 0;
+    let (status, payload) = request_json(
+        &test_app.router,
+        Method::GET,
+        &invoice_url,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &payload["data"];
+    assert_eq!(data["showroom"]["isBankAccount"], true);
+    assert_eq!(data["washCount"], 103);
+    assert_eq!(data["totalAmountMilli"], "111102");
+    let rows = data["operations"].as_array().unwrap();
+    assert_eq!(rows.len(), 103);
+    for row in rows {
+        assert!(ids.insert(row["id"].as_str().unwrap().to_owned()));
+        if row["vehicleModel"] == "Excluded" {
+            assert_eq!(row["priceMilli"], "9000");
+        } else {
+            bank_method_rows += 1;
+            assert_eq!(row["priceMilli"], "1001");
+        }
+        assert_eq!(
+            row["washType"],
+            if row["vehicleModel"] == "Car 0" || row["vehicleModel"] == "Excluded" {
+                Value::Null
+            } else {
+                json!("غسيل كامل")
+            }
+        );
+        sum += row["priceMilli"].as_str().unwrap().parse::<i64>().unwrap();
+    }
+    assert!(data.get("nextCursor").is_none());
+    assert_eq!(ids.len(), 103);
+    assert_eq!(bank_method_rows, 102);
+    assert!(ids.contains(cash_wash_id.as_ref().unwrap()));
+    assert!(!ids.contains(voided_id));
+    assert_eq!(sum, 111_102);
+    assert_eq!(before, snapshot());
+    let debt_url = format!("/api/showroom-debts/{bank_id}?{range}");
+    let (status, debt) =
+        request_json(&test_app.router, Method::GET, &debt_url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(debt["data"]["outstandingWashCount"], 103);
+    assert_eq!(debt["data"]["totalChargesMilli"], 111_102);
+    assert_eq!(debt["data"]["totalPaymentsMilli"], 111_102);
+    assert_eq!(debt["data"]["totalOutstandingMilli"], 0);
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn bank_final_invoice_enforces_complete_export_limit() {
+    let test_app = TestApp::new();
+    let token = bootstrap_manager(&test_app.router).await;
+    let worker = create_worker(&test_app.router, &token, "عامل حد الفاتورة").await;
+    let (status, created) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showrooms",
+        Some(&token),
+        Some(json!({"name":"مصرف حد الفاتورة","isBankAccount":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bank = created["data"]["id"].as_str().unwrap();
+    let url = format!("/api/showroom-debts/{bank}/final-invoice?from=2026-09-01T00:00:00.000Z&to=2026-09-30T23:59:59.999Z");
+    let (status, empty) =
+        request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["data"]["washCount"], 0);
+    assert_eq!(empty["data"]["operations"].as_array().unwrap().len(), 0);
+
+    let db_path = test_app.data_dir.join("carwash.db");
+    let mut conn = Connection::open(&db_path).unwrap();
+    let manager: String = conn
+        .query_row(
+            "SELECT id FROM users WHERE username_norm='manager.test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let insert = |conn: &mut Connection, start: usize, end: usize| {
+        let tx = conn.transaction().unwrap();
+        for index in start..end {
+            tx.execute(
+                "INSERT INTO wash_operations(id,vehicle_make,vehicle_model,price_milli,worker_id,payment_type,showroom_id,showroom_payment_method,occurred_at,commission_bps,commission_milli,business_share_milli,created_by,client_request_id,created_at)
+                 VALUES(?1,'Toyota','Camry',1000,?2,'showroom',?3,'bank','2026-09-10T10:00:00.000Z',5000,500,500,?4,?1,'2026-09-10T10:00:00.000Z')",
+                params![format!("invoice-limit-{index}"), worker, bank, manager],
+            ).unwrap();
+        }
+        tx.commit().unwrap();
+    };
+    insert(&mut conn, 0, 1);
+    let (status, one) = request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["data"]["washCount"], 1);
+    insert(&mut conn, 1, 100);
+    let started = std::time::Instant::now();
+    let (status, hundred) =
+        request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    if std::env::var_os("INVOICE_BENCHMARK").is_some() {
+        eprintln!(
+            "invoice export 100 rows: {:?}, {} response bytes",
+            started.elapsed(),
+            hundred.to_string().len()
+        );
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hundred["data"]["operations"].as_array().unwrap().len(), 100);
+    insert(&mut conn, 100, 1_000);
+    let started = std::time::Instant::now();
+    let (status, thousand) =
+        request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    if std::env::var_os("INVOICE_BENCHMARK").is_some() {
+        eprintln!(
+            "invoice export 1000 rows: {:?}, {} response bytes",
+            started.elapsed(),
+            thousand.to_string().len()
+        );
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        thousand["data"]["operations"].as_array().unwrap().len(),
+        1_000
+    );
+    insert(&mut conn, 1_000, 5_000);
+    let started = std::time::Instant::now();
+    let (status, maximum) =
+        request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    if std::env::var_os("INVOICE_BENCHMARK").is_some() {
+        eprintln!(
+            "invoice export 5000 rows: {:?}, {} response bytes",
+            started.elapsed(),
+            maximum.to_string().len()
+        );
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(maximum["data"]["washCount"], 5_000);
+    assert_eq!(
+        maximum["data"]["operations"].as_array().unwrap().len(),
+        5_000
+    );
+    insert(&mut conn, 5_000, 5_001);
+    let (status, oversized) =
+        request_json(&test_app.router, Method::GET, &url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(oversized.get("data").is_none());
+    assert!(oversized["error"]
+        .as_str()
+        .unwrap()
+        .contains("اختر فترة أقصر"));
+    drop(conn);
+    test_app.cleanup();
+}
+
+#[tokio::test]
+async fn bank_invoice_accounts_include_settled_accounts_without_changing_debts() {
+    let test_app = TestApp::new();
+    let manager = bootstrap_manager(&test_app.router).await;
+    let worker = create_worker(&test_app.router, &manager, "عامل فواتير الحسابات").await;
+    let mut ids = Vec::new();
+    for (name, bank, active) in [
+        ("مصرف مستحق", true, true),
+        ("مصرف الجمهورية", true, true),
+        ("مصرف بلا عمليات", true, true),
+        ("مصرف مؤرشف", true, false),
+        ("معرض عادي", false, true),
+    ] {
+        let (status, body) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/showrooms",
+            Some(&manager),
+            Some(json!({"name":name,"isBankAccount":bank,"isActive":active})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        ids.push(body["data"]["id"].as_str().unwrap().to_owned());
+    }
+    for index in 0..22 {
+        let (status, _) = request_json(
+            &test_app.router,
+            Method::POST,
+            "/api/washes",
+            Some(&manager),
+            Some(
+                json!({"vehicleMake":"Toyota","vehicleModel":format!("Wash {index}"),"price":"25",
+                "workerId":worker,"paymentType":"showroom","showroomId":ids[1],
+                "showroomPaymentMethod":if index % 2 == 0 { "cash" } else { "bank" },
+                "occurredAt":format!("2026-09-{:02}T10:00:00.000Z", index + 1),
+                "clientRequestId":Uuid::new_v4().to_string()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/washes",
+        Some(&manager),
+        Some(
+            json!({"vehicleMake":"Ford","vehicleModel":"Outstanding","price":"10",
+            "workerId":worker,"paymentType":"showroom","showroomId":ids[0],
+            "showroomPaymentMethod":"bank","occurredAt":"2026-09-10T10:00:00.000Z",
+            "clientRequestId":Uuid::new_v4().to_string()}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/showroom-payments",
+        Some(&manager),
+        Some(json!({"showroomId":ids[1],"amount":"550","paidAt":"2026-09-23T12:00:00.000Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/showroom-debts/bank-accounts",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::POST,
+        "/api/users",
+        Some(&manager),
+        Some(
+            json!({"fullName":"موظف الفواتير","username":"bank.invoice.employee",
+            "password":EMPLOYEE_PASSWORD,"roleCode":"employee","isActive":true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let employee = login(&test_app.router, "bank.invoice.employee", EMPLOYEE_PASSWORD).await;
+    let (status, _) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/showroom-debts/bank-accounts",
+        Some(&employee),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let db_path = test_app.data_dir.join("carwash.db");
+    let before: (i64, i64, i64) = Connection::open(&db_path).unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM wash_operations),(SELECT COUNT(*) FROM showroom_payments),(SELECT COUNT(*) FROM ledger_entries)",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+    let (status, bank_list) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/showroom-debts/bank-accounts",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<&str> = bank_list["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|account| account["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![ids[1].as_str(), ids[2].as_str(), ids[0].as_str()]
+    );
+    assert!(!listed.contains(&ids[3].as_str()));
+    assert!(!listed.contains(&ids[4].as_str()));
+    let (status, debts) = request_json(
+        &test_app.router,
+        Method::GET,
+        "/api/showroom-debts?date=2026-09-23",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let outstanding: Vec<&str> = debts["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["showroom"]["id"].as_str().unwrap())
+        .collect();
+    assert!(outstanding.contains(&ids[0].as_str()));
+    assert!(!outstanding.contains(&ids[1].as_str()));
+    let range = "from=2026-09-01T00:00:00.000Z&to=2026-09-23T23:59:59.999Z";
+    let (status, invoice) = request_json(
+        &test_app.router,
+        Method::GET,
+        &format!("/api/showroom-debts/{}/final-invoice?{range}", ids[1]),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(invoice["data"]["washCount"], 22);
+    assert_eq!(invoice["data"]["totalAmountMilli"], "550000");
+    assert_eq!(invoice["data"]["operations"].as_array().unwrap().len(), 22);
+    let after: (i64, i64, i64) = Connection::open(&db_path).unwrap().query_row(
+        "SELECT (SELECT COUNT(*) FROM wash_operations),(SELECT COUNT(*) FROM showroom_payments),(SELECT COUNT(*) FROM ledger_entries)",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+    assert_eq!(before, after);
+    test_app.cleanup();
+}
+
+#[tokio::test]
 async fn payroll_tracks_effective_month_salaries_and_recalculates_withdrawal_history() {
     let test_app = TestApp::new();
     let manager_token = bootstrap_manager(&test_app.router).await;

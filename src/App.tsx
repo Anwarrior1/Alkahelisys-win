@@ -63,6 +63,7 @@ import type {
   DateRange,
   ExpenseAllocation,
   ExpenseRecord,
+  FinalInvoicePage,
   FinancialReport,
   OperationalReport,
   OvernightCar,
@@ -1551,6 +1552,7 @@ function CreateWorkerModal({ onClose, onSaved, onNotify }: { onClose: () => void
 }
 
 function ShowroomDebtsView({ selectedDate, reportIssuer, onNotify }: { selectedDate: string; reportIssuer: string; onNotify: (message: ToastMessage) => void }) {
+  const [activeView, setActiveView] = useState<'debts' | 'invoices'>('debts');
   const [items, setItems] = useState<ShowroomDebtSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
@@ -1572,10 +1574,17 @@ function ShowroomDebtsView({ selectedDate, reportIssuer, onNotify }: { selectedD
     return items.filter((item) => item.showroom.name.toLowerCase().includes(normalizedQuery));
   }, [items, query]);
   return <>
-    <PageHeader eyebrow="الحسابات المالية" title="ديون المعارض" description={`أرصدة المعارض كما كانت حتى نهاية ${workingDateFormat(selectedDate)}، مستمدة مباشرة من العمليات والدفعات المسجلة.`} actions={<Button variant="secondary" onClick={() => void load()} icon={<RefreshCw size={17} />}>تحديث</Button>} />
+    <PageHeader eyebrow="الحسابات المالية" title="ديون المعارض" description={activeView === 'debts' ? `أرصدة المعارض كما كانت حتى نهاية ${workingDateFormat(selectedDate)}، مستمدة مباشرة من العمليات والدفعات المسجلة.` : 'الفواتير الأصلية للحسابات المصرفية النشطة، بما فيها الحسابات المسددة بالكامل.'} actions={<Button variant="secondary" onClick={() => { if (activeView === 'debts') void load(); else window.dispatchEvent(new Event(FINANCIAL_REFRESH_EVENT)); }} icon={<RefreshCw size={17} />}>تحديث</Button>} />
+    <div className="showroom-debt-views" role="group" aria-label="عرض ديون المعارض">
+      <button type="button" className={activeView === 'debts' ? 'is-active' : ''} aria-pressed={activeView === 'debts'} onClick={() => setActiveView('debts')}>الديون الحالية</button>
+      <button type="button" className={activeView === 'invoices' ? 'is-active' : ''} aria-pressed={activeView === 'invoices'} onClick={() => setActiveView('invoices')}>الفواتير المصرفية</button>
+    </div>
+    <div hidden={activeView !== 'debts'}>
     <SectionCard className="filter-card"><div className="filter-bar"><div className="search-box"><Search size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="ابحث باسم المعرض" /></div><span className="filter-hint"><Building2 size={17} /> تظهر المعارض التي لديها عمليات غسيل آجلة قائمة فقط.</span></div></SectionCard>
     {loading ? <LoadingBlock label="جارٍ تحميل ديون المعارض..." /> : filtered.length === 0 ? <EmptyState icon={<Building2 size={29} />} title="لا توجد ديون معارض قائمة" description="ستظهر هنا تلقائيًا أي عملية غسيل جديدة مسجلة على حساب معرض." /> : <div className="showroom-grid">{filtered.map((item) => <ShowroomDebtCard key={item.showroom.id} item={item} onClick={() => setSelectedId(item.showroom.id)} />)}</div>}
     {selectedId && <ShowroomDebtProfileView showroomId={selectedId} selectedDate={selectedDate} reportIssuer={reportIssuer} onClose={() => setSelectedId(null)} onNotify={onNotify} />}
+    </div>
+    <div hidden={activeView !== 'invoices'}><BankInvoiceAccountsView selectedDate={selectedDate} active={activeView === 'invoices'} onNotify={onNotify} /></div>
   </>;
 }
 
@@ -1587,6 +1596,101 @@ function ShowroomDebtCard({ item, onClick }: { item: ShowroomDebtSummary; onClic
   </article>;
 }
 
+export function ShowroomDebtPrintControls({ range, onRangeChange, onDebtPrint, onInvoicePrint, isBankAccount, loading, preparingPrint, disabled }: { range: DateRange; onRangeChange: (range: DateRange) => void; onDebtPrint: () => void; onInvoicePrint: () => void; isBankAccount: boolean; loading: boolean; preparingPrint: boolean; disabled: boolean }) {
+  return <div className="showroom-debt-print-controls">
+    <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => onRangeChange({ ...range, from: event.target.value })} /></label>
+    <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => onRangeChange({ ...range, to: event.target.value })} /></label>
+    <Button onClick={onDebtPrint} disabled={disabled} icon={loading || preparingPrint ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>{preparingPrint ? 'جارٍ تجهيز السجل الكامل...' : 'طباعة تقرير الدين'}</Button>
+    {isBankAccount && <Button variant="secondary" onClick={onInvoicePrint} disabled={disabled} icon={preparingPrint ? <LoaderCircle size={17} className="spin" /> : <ReceiptText size={17} />}>طباعة الفاتورة النهائية</Button>}
+  </div>;
+}
+
+export async function loadCompleteFinalInvoice(showroomId: string, range: DateRange): Promise<FinalInvoicePage> {
+  const invoice = await api.finalInvoice(showroomId, range);
+  const operations = invoice.operations;
+  if (new Set(operations.map((item) => item.id)).size !== operations.length || operations.length !== invoice.wash_count || operations.reduce((total, item) => total + BigInt(item.price_milli), 0n) !== BigInt(invoice.total_amount_milli)) {
+    throw new Error('تعذر التحقق من اكتمال الفاتورة. أعد المحاولة.');
+  }
+  return invoice;
+}
+
+export function BankInvoiceAccountsView({ selectedDate, active, onNotify }: { selectedDate: string; active: boolean; onNotify: (message: ToastMessage) => void }) {
+  const [accounts, setAccounts] = useState<Showroom[]>([]);
+  const [selectedId, setSelectedId] = useState('');
+  const [range, setRange] = useState<DateRange>(() => selectedDateRange(selectedDate));
+  const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [preparingPrint, setPreparingPrint] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [periodMessage, setPeriodMessage] = useState<string | null>(null);
+  const [printData, setPrintData] = useState<{ data: FinalInvoicePage; range: DateRange; generatedAt: Date } | null>(null);
+  const printing = useRef(false);
+  const requestKey = useRef('');
+  requestKey.current = `${active}:${selectedId}:${range.from}:${range.to}`;
+  const rangeIsValid = Boolean(range.from && range.to && range.from <= range.to);
+  useEffect(() => { setRange(selectedDateRange(selectedDate)); }, [selectedDate]);
+  useEffect(() => {
+    if (!active) return;
+    let mounted = true;
+    const load = () => {
+      setLoading(true);
+      api.bankInvoiceAccounts().then((items) => {
+        if (!mounted) return;
+        setAccounts(items);
+        setSelectedId((current) => items.some((item) => item.id === current) ? current : '');
+        setError(null);
+      }).catch((requestError) => {
+        if (mounted) { setError(friendlyError(requestError)); setAccounts([]); }
+      }).finally(() => { if (mounted) setLoading(false); });
+    };
+    load();
+    window.addEventListener(FINANCIAL_REFRESH_EVENT, load);
+    return () => { mounted = false; window.removeEventListener(FINANCIAL_REFRESH_EVENT, load); };
+  }, [active, refreshKey]);
+  useEffect(() => {
+    const clearPrint = () => setPrintData(null);
+    window.addEventListener('afterprint', clearPrint);
+    return () => window.removeEventListener('afterprint', clearPrint);
+  }, []);
+  const printInvoice = async () => {
+    if (printing.current || !selectedId || !rangeIsValid || loading) return;
+    printing.current = true;
+    setPreparingPrint(true);
+    setPeriodMessage(null);
+    setPrintData(null);
+    const key = requestKey.current;
+    const invoiceRange = { ...range };
+    try {
+      const data = await loadCompleteFinalInvoice(selectedId, invoiceRange);
+      if (key !== requestKey.current) return;
+      if (data.wash_count === 0) {
+        setPeriodMessage('لا توجد عمليات غسيل مؤهلة لهذا الحساب ضمن الفترة المحددة.');
+        return;
+      }
+      setPrintData({ data, range: invoiceRange, generatedAt: new Date() });
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => window.print()));
+    } catch (requestError) {
+      if (key === requestKey.current) onNotify({ tone: 'error', text: friendlyError(requestError) });
+    } finally {
+      printing.current = false;
+      setPreparingPrint(false);
+    }
+  };
+  return <>
+    <SectionCard title="الفواتير المصرفية" subtitle="اختر حسابًا مصرفيًا وفترة الغسيل لطباعة قيم العمليات الأصلية، حتى لو سُدّد الحساب بالكامل.">
+      {loading ? <LoadingBlock label="جارٍ تحميل الحسابات المصرفية..." /> : error ? <InlineRetry error={error} onRetry={() => setRefreshKey((current) => current + 1)} /> : accounts.length === 0 ? <EmptyState icon={<Building2 size={29} />} title="لا توجد حسابات مصرفية نشطة" description="ستظهر هنا الحسابات المصنفة كمصرفية والنشطة، بغض النظر عن رصيد الدين." /> : <div className="bank-invoice-controls">
+        <label><span>الحساب المصرفي</span><select value={selectedId} onChange={(event) => { setSelectedId(event.target.value); setPeriodMessage(null); setPrintData(null); }} disabled={preparingPrint}><option value="">اختر الحساب المصرفي</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label>
+        <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => { setRange((current) => ({ ...current, from: event.target.value })); setPeriodMessage(null); setPrintData(null); }} disabled={preparingPrint} /></label>
+        <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => { setRange((current) => ({ ...current, to: event.target.value })); setPeriodMessage(null); setPrintData(null); }} disabled={preparingPrint} /></label>
+        <Button onClick={() => void printInvoice()} disabled={!selectedId || !rangeIsValid || preparingPrint} icon={preparingPrint ? <LoaderCircle size={17} className="spin" /> : <ReceiptText size={17} />}>طباعة الفاتورة النهائية</Button>
+      </div>}
+      {accounts.length > 0 && !rangeIsValid && <div className="inline-alert inline-alert--error">يرجى تحديد فترة صحيحة للفاتورة.</div>}
+      {periodMessage && <div className="inline-alert">{periodMessage}</div>}
+    </SectionCard>
+    {active && printData && <ShowroomFinalInvoice {...printData} />}
+  </>;
+}
+
 function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClose, onNotify }: { showroomId: string; selectedDate: string; reportIssuer: string; onClose: () => void; onNotify: (message: ToastMessage) => void }) {
   const [range, setRange] = useState<DateRange>(() => selectedDateRange(selectedDate));
   const [profile, setProfile] = useState<ShowroomDebtProfile | null>(null);
@@ -1596,6 +1700,7 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
   const [editingPayment, setEditingPayment] = useState<PaymentRecord | null>(null);
   const [reportGeneratedAt, setReportGeneratedAt] = useState(() => new Date());
   const [printProfile, setPrintProfile] = useState<ShowroomDebtProfile | null>(null);
+  const [finalInvoice, setFinalInvoice] = useState<{ data: FinalInvoicePage; range: DateRange; generatedAt: Date } | null>(null);
   const [loadingMoreOperations,setLoadingMoreOperations]=useState(false);const[loadingMoreDebtPayments,setLoadingMoreDebtPayments]=useState(false);const[preparingPrint,setPreparingPrint]=useState(false);
   const requestKey=useRef('');requestKey.current=`${showroomId}:${range.from}:${range.to}:${refreshKey}`;
   const rangeIsComplete = Boolean(range.from && range.to);
@@ -1607,6 +1712,20 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
       while(morePayments&&paymentsCursor){const page=await api.showroomDebt(showroomId,range,{payments:paymentsCursor});if(key!==requestKey.current)return;payments=appendUnique(payments,page.payments);paymentsCursor=page.payments_next_cursor;morePayments=page.payments_has_more;}
       const complete={...profile,operations,payments,operations_has_more:false,payments_has_more:false,operations_next_cursor:operationsCursor,payments_next_cursor:paymentsCursor};setPrintProfile(complete);setReportGeneratedAt(new Date());window.requestAnimationFrame(()=>window.print());
     }catch(error){onNotify({tone:'error',text:friendlyError(error)});}finally{if(key===requestKey.current)setPreparingPrint(false);}
+  };
+  const printFinalInvoice = async () => {
+    if (!profile?.showroom.is_bank_account || preparingPrint || !rangeIsValid) return;
+    setPreparingPrint(true);
+    const key = requestKey.current;
+    const invoiceRange = { ...range };
+    try {
+      const data = await loadCompleteFinalInvoice(showroomId, invoiceRange);
+      if (key !== requestKey.current) return;
+      setPrintProfile(null);
+      setFinalInvoice({ data, range: invoiceRange, generatedAt: new Date() });
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => window.print()));
+    } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); }
+    finally { if (key === requestKey.current) setPreparingPrint(false); }
   };
   useEffect(() => { setRange(selectedDateRange(selectedDate)); }, [selectedDate]);
   useEffect(() => {
@@ -1627,7 +1746,7 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
     return () => window.removeEventListener(FINANCIAL_REFRESH_EVENT, handleRefresh);
   }, []);
   useEffect(() => {
-    const clearPrintData = () => setPrintProfile(null);
+    const clearPrintData = () => { setPrintProfile(null); setFinalInvoice(null); };
     window.addEventListener('afterprint', clearPrintData);
     return () => window.removeEventListener('afterprint', clearPrintData);
   }, []);
@@ -1640,11 +1759,7 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
     <div className="showroom-debt-profile">
       <div className="profile-heading"><div className="profile-heading__avatar profile-heading__avatar--showroom"><Building2 size={26} /></div><div><h2>{profile.showroom.name}</h2><span>{profile.showroom.contact_name || 'معرض شريك'}</span></div></div>
       <div className="mini-metric-grid showroom-debt-summary"><div className="mini-metric"><span>عدد السيارات القائمة</span><strong>{formatNumber(profile.outstanding_wash_count)} سيارة</strong></div><MiniMetric label="إجمالي قيمة الغسيل" value={profile.total_charges} /><MiniMetric label="إجمالي الدفعات" value={profile.total_payments} tone="success" /><MiniMetric label="الرصيد المتبقي" value={profile.total_outstanding} tone="warning" /></div>
-      <SectionCard title="فترة تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تعتمد على تاريخ عملية الغسيل الفعلي." action={<div className="showroom-debt-print-controls">
-        <label><span>من تاريخ</span><input type="date" value={range.from} onChange={(event) => setRange((current) => ({ ...current, from: event.target.value }))} /></label>
-        <label><span>إلى تاريخ</span><input type="date" value={range.to} onChange={(event) => setRange((current) => ({ ...current, to: event.target.value }))} /></label>
-        <Button onClick={()=>void printDebtReport()} disabled={loading || preparingPrint || !rangeIsValid} icon={loading||preparingPrint ? <LoaderCircle size={17} className="spin" /> : <Printer size={17} />}>{preparingPrint?'جارٍ تجهيز السجل الكامل...':'طباعة تقرير الدين'}</Button>
-      </div>}>
+      <SectionCard title="فترة تقرير الدين" subtitle="القائمة والإجماليات والتقرير المطبوع تعتمد على تاريخ عملية الغسيل الفعلي." action={<ShowroomDebtPrintControls range={range} onRangeChange={setRange} onDebtPrint={() => void printDebtReport()} onInvoicePrint={() => void printFinalInvoice()} isBankAccount={profile.showroom.is_bank_account === true} loading={loading} preparingPrint={preparingPrint} disabled={loading || preparingPrint || !rangeIsValid} />}>
         {!rangeIsComplete ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> يرجى تحديد تاريخ البداية وتاريخ النهاية.</div> : range.from > range.to ? <div className="inline-alert inline-alert--error"><AlertTriangle size={17} /> تاريخ البداية يجب أن يسبق تاريخ النهاية.</div> : <div className="date-filter"><CalendarDays size={17} /><span>الفترة المختارة:</span><strong>{workingDateFormat(range.from)} — {workingDateFormat(range.to)}</strong></div>}
       </SectionCard>
       <SectionCard title="عمليات الغسيل الآجلة" subtitle={`${formatNumber(profile.outstanding_wash_count)} عملية ضمن الفترة المحددة.`}>
@@ -1655,11 +1770,12 @@ function ShowroomDebtProfileView({ showroomId, selectedDate, reportIssuer, onClo
       </SectionCard>
     </div>
     {printProfile && <ShowroomDebtPrintReport profile={printProfile} range={range} reportIssuer={reportIssuer} generatedAt={reportGeneratedAt} />}
+    {finalInvoice && <ShowroomFinalInvoice {...finalInvoice} />}
     {editingPayment && <ShowroomPaymentModal payment={editingPayment} showrooms={[profile.showroom]} onClose={() => setEditingPayment(null)} onNotify={onNotify} onSaved={() => { setEditingPayment(null); refreshFinancialViews(); onNotify({ tone: 'success', text: 'تم تعديل الدفعة وإعادة احتساب رصيد المعرض.' }); }} />}
   </Modal>;
 }
 
-function ShowroomDebtPrintReport({ profile, range, reportIssuer, generatedAt }: { profile: ShowroomDebtProfile; range: DateRange; reportIssuer: string; generatedAt: Date }) {
+export function ShowroomDebtPrintReport({ profile, range, reportIssuer, generatedAt }: { profile: ShowroomDebtProfile; range: DateRange; reportIssuer: string; generatedAt: Date }) {
   let unappliedPayments = Math.max(0, safeNumber(profile.total_payments));
   const paidByOperation = new Map<string, number>();
   [...profile.operations]
@@ -1743,6 +1859,44 @@ function ShowroomDebtPrintReport({ profile, range, reportIssuer, generatedAt }: 
     <section className="showroom-debt-print__bottom">
       <div className="showroom-debt-print__notes"><h2>ملاحظات</h2><p>يغطي هذا التقرير الفترة من {dateFormat(range.from)} إلى {dateFormat(range.to)}.</p></div>
       <div className="showroom-debt-print__aging"><h2>ملخص أعمار الدين</h2><div className="showroom-debt-print__aging-content"><div className="showroom-debt-print__donut" style={{ background: agingChart }}><i /></div><div className="showroom-debt-print__aging-list">{agingBuckets.map((bucket) => <div key={bucket.label}><i style={{ background: bucket.color }} /><span>{bucket.label}</span><strong>{money(bucket.amount)}</strong></div>)}</div></div><div className="showroom-debt-print__balance"><span>إجمالي المتبقي</span><strong>{money(profile.total_outstanding)}</strong></div></div>
+    </section>
+  </section>;
+}
+
+export function ShowroomFinalInvoice({ data, range, generatedAt }: { data: FinalInvoicePage; range: DateRange; generatedAt: Date }) {
+  const invoiceMoney = (milli: string) => {
+    const amount = BigInt(milli);
+    const fraction = (amount % 1000n).toString().padStart(3, '0');
+    return `${(amount / 1000n).toLocaleString('en-US')}.${fraction.endsWith('0') ? fraction.slice(0, 2) : fraction}`;
+  };
+  return <section className="showroom-debt-print showroom-debt-print--invoice" dir="rtl">
+    <header className="showroom-debt-print__header">
+      <div className="showroom-debt-print__title"><h1>الفاتورة النهائية</h1><p><CalendarDays size={15} /> تاريخ إصدار الفاتورة: <strong>{workingDateFormat(businessDateKey(generatedAt))}</strong></p></div>
+      <div className="showroom-debt-print__business"><strong>{DEBT_REPORT_BUSINESS_NAME}</strong></div>
+    </header>
+    <section className="showroom-debt-print__showroom">
+      <h2>بيانات الحساب المصرفي</h2>
+      <div className="showroom-debt-print__info-grid">
+        <div className="showroom-debt-print__info"><span><Building2 size={17} /> اسم الحساب</span><strong>{data.showroom.name}</strong></div>
+        {data.showroom.phone && <div className="showroom-debt-print__info"><span><Phone size={17} /> رقم الهاتف</span><strong dir="ltr">{data.showroom.phone}</strong></div>}
+        {data.showroom.address && <div className="showroom-debt-print__info"><span><MapPin size={17} /> العنوان</span><strong>{data.showroom.address}</strong></div>}
+        {data.showroom.created_at && <div className="showroom-debt-print__info"><span><CalendarDays size={17} /> تاريخ بداية الحساب</span><strong>{dateFormat(data.showroom.created_at)}</strong></div>}
+      </div>
+    </section>
+    <section className="showroom-debt-print__period">الفاتورة من تاريخ <strong>{workingDateFormat(range.from)}</strong> إلى تاريخ <strong>{workingDateFormat(range.to)}</strong></section>
+    <section className="showroom-debt-print__details">
+      <h2><FileText size={17} /> تفاصيل الفاتورة</h2>
+      <table>
+        <thead><tr><th>م</th><th>نوع السيارة</th><th>نوع الغسيل</th><th>تاريخ الغسيل</th><th>قيمة الغسيل (د.ل)</th></tr></thead>
+        <tbody>{data.operations.length ? data.operations.map((operation, index) => <tr key={operation.id}>
+          <td>{formatNumber(index + 1)}</td>
+          <td><strong>{operation.vehicle_make} {operation.vehicle_model}</strong><small>{[operation.license_plate, operation.car_color].filter(Boolean).join(' · ') || '—'}</small></td>
+          <td>{operation.wash_type?.trim() || 'غير محدد'}</td>
+          <td>{dateFormat(operation.performed_at)}</td>
+          <td>{invoiceMoney(operation.price_milli)}</td>
+        </tr>) : <tr><td colSpan={5}>لا توجد عمليات غسيل مصرفية ضمن الفترة المحددة.</td></tr>}</tbody>
+        <tfoot><tr><th colSpan={4}>إجمالي قيمة الفاتورة</th><th>{invoiceMoney(data.total_amount_milli)} د.ل</th></tr></tfoot>
+      </table>
     </section>
   </section>;
 }
@@ -1847,14 +2001,14 @@ function ShowroomProfile({ showroomId, selectedDate, isManager, onClose, onNotif
 }
 
 function CreateShowroomModal({ showroom, onClose, onSaved, onNotify }: { showroom?: Showroom; onClose: () => void; onSaved: (showroom: Showroom) => void; onNotify: (message: ToastMessage) => void }) {
-  const [form, setForm] = useState({ name: showroom?.name ?? '', contact_name: showroom?.contact_name ?? '', phone: showroom?.phone ?? '', address: showroom?.address ?? '' });
+  const [form, setForm] = useState({ name: showroom?.name ?? '', contact_name: showroom?.contact_name ?? '', phone: showroom?.phone ?? '', address: showroom?.address ?? '', is_bank_account: showroom?.is_bank_account ? 'bank' : 'showroom' });
   const [saving, setSaving] = useState(false);
   const update = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setSaving(true);
-    try { const data = { name: form.name.trim(), contact_name: form.contact_name.trim() || null, phone: form.phone.trim() || null, address: form.address.trim() || null }; onSaved(showroom ? await api.updateShowroom(showroom.id, data) : await api.createShowroom(data)); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); }
+    try { const data = { name: form.name.trim(), contact_name: form.contact_name.trim() || null, phone: form.phone.trim() || null, address: form.address.trim() || null, is_bank_account: form.is_bank_account === 'bank' }; onSaved(showroom ? await api.updateShowroom(showroom.id, data) : await api.createShowroom(data)); } catch (error) { onNotify({ tone: 'error', text: friendlyError(error) }); } finally { setSaving(false); }
   };
-  return <Modal title={showroom ? 'تعديل بيانات المعرض' : 'إضافة معرض جديد'} subtitle="أدخل بيانات الجهة التي ترسل المركبات للحساب." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="اسم المعرض" required><input value={form.name} onChange={(event) => update('name', event.target.value)} placeholder="اسم المعرض أو الوكالة" required /></FormField><FormField label="اسم جهة الاتصال"><input value={form.contact_name} onChange={(event) => update('contact_name', event.target.value)} placeholder="اختياري" /></FormField><FormField label="رقم الاتصال"><input value={form.phone} onChange={(event) => update('phone', event.target.value)} placeholder="اختياري" dir="ltr" /></FormField><FormField label="العنوان"><input value={form.address} onChange={(event) => update('address', event.target.value)} placeholder="اختياري" /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : showroom ? 'حفظ التعديلات' : 'حفظ المعرض'}</Button></div></form></Modal>;
+  return <Modal title={showroom ? 'تعديل بيانات المعرض' : 'إضافة معرض جديد'} subtitle="أدخل بيانات الجهة التي ترسل المركبات للحساب." onClose={onClose}><form className="entry-form" onSubmit={submit}><FormField label="اسم المعرض" required><input value={form.name} onChange={(event) => update('name', event.target.value)} placeholder="اسم المعرض أو الوكالة" required /></FormField><FormField label="نوع الحساب" required><select value={form.is_bank_account} onChange={(event) => update('is_bank_account', event.target.value)}><option value="showroom">معرض عادي</option><option value="bank">حساب مصرفي</option></select></FormField><FormField label="اسم جهة الاتصال"><input value={form.contact_name} onChange={(event) => update('contact_name', event.target.value)} placeholder="اختياري" /></FormField><FormField label="رقم الاتصال"><input value={form.phone} onChange={(event) => update('phone', event.target.value)} placeholder="اختياري" dir="ltr" /></FormField><FormField label="العنوان"><input value={form.address} onChange={(event) => update('address', event.target.value)} placeholder="اختياري" /></FormField><div className="modal-actions"><Button variant="ghost" onClick={onClose}>إلغاء</Button><Button type="submit" disabled={saving} icon={saving ? <LoaderCircle size={17} className="spin" /> : <Save size={17} />}>{saving ? 'جارٍ الحفظ...' : showroom ? 'حفظ التعديلات' : 'حفظ المعرض'}</Button></div></form></Modal>;
 }
 
 function SidePanel({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {

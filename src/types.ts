@@ -61,10 +61,29 @@ export interface Showroom {
   phone?: string | null;
   address?: string | null;
   created_at?: string | null;
+  is_bank_account?: boolean;
   washes_count?: number;
   latest_wash_at?: string | null;
   financials?: ShowroomFinancials;
   payments?: PaymentRecord[];
+}
+
+export interface FinalInvoiceOperation {
+  id: string;
+  vehicle_make: string;
+  vehicle_model: string;
+  wash_type: string | null;
+  performed_at: string;
+  price_milli: string;
+  license_plate: string | null;
+  car_color: string | null;
+}
+
+export interface FinalInvoicePage {
+  showroom: Showroom;
+  operations: FinalInvoiceOperation[];
+  wash_count: number;
+  total_amount_milli: string;
 }
 
 export interface ShowroomDebtSummary {

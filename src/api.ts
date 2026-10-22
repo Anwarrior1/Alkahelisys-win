@@ -6,6 +6,7 @@ import type {
   DashboardData,
   DateRange,
   ExpenseRecord,
+  FinalInvoicePage,
   FinanceOverview,
   FinancialReport,
   LoginResult,
@@ -173,6 +174,7 @@ function mapShowroom(raw: unknown): Showroom {
     phone: value.phone === null || value.phone === undefined ? null : text(value.phone),
     address: value.address === null || value.address === undefined ? (value.notes === null || value.notes === undefined ? null : text(value.notes)) : text(value.address),
     created_at: value.createdAt === null || value.createdAt === undefined ? null : text(value.createdAt),
+    is_bank_account: value.isBankAccount === true,
     washes_count: number(value.washCount),
     financials: hasFinance ? {
       total_charges: money(finance.chargesMilli),
@@ -581,6 +583,9 @@ class ApiClient {
       latest_wash_at: text(item.latestWashAt) || null,
     }));
   }
+  async bankInvoiceAccounts(): Promise<Showroom[]> {
+    return records(await this.get('/showroom-debts/bank-accounts')).map(mapShowroom);
+  }
   async showroomDebt(id: string, range: DateRange, cursors: { operations?: string | null; payments?: string | null } = {}): Promise<ShowroomDebtProfile> {
     const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}${query({ from: range.from, to: range.to, operationsLimit: 100, operationsCursor: cursors.operations, paymentsLimit: 100, paymentsCursor: cursors.payments })}`));
     return {
@@ -599,19 +604,33 @@ class ApiClient {
       payments_next_cursor: text(value.paymentsNextCursor) || null,
     };
   }
+  async finalInvoice(id: string, range: DateRange): Promise<FinalInvoicePage> {
+    const value = record(await this.get(`/showroom-debts/${encodeURIComponent(id)}/final-invoice${query({ from: range.from, to: range.to })}`));
+    return {
+      showroom: mapShowroom(value.showroom),
+      operations: records(value.operations).map((operation) => ({
+        id: text(operation.id), vehicle_make: text(operation.vehicleMake), vehicle_model: text(operation.vehicleModel),
+        wash_type: operation.washType === null || operation.washType === undefined ? null : text(operation.washType),
+        performed_at: text(operation.occurredAt), price_milli: text(operation.priceMilli),
+        license_plate: operation.licensePlate === null || operation.licensePlate === undefined ? null : text(operation.licensePlate),
+        car_color: operation.carColor === null || operation.carColor === undefined ? null : text(operation.carColor),
+      })),
+      wash_count: number(value.washCount), total_amount_milli: text(value.totalAmountMilli),
+    };
+  }
   async showroomStatistics(id: string, params: { from: string; to: string; paymentType: 'all' | 'cash' | 'debt' }): Promise<number> {
     const value = record(await this.get(`/showrooms/${encodeURIComponent(id)}/statistics${query(params)}`));
     return number(value.carCount);
   }
   async createShowroom(data: Record<string, unknown>): Promise<Showroom> {
-    const payload = { name: text(data.name), contactName: data.contact_name ?? null, phone: data.phone ?? null, notes: data.address ?? null };
+    const payload = { name: text(data.name), contactName: data.contact_name ?? null, phone: data.phone ?? null, notes: data.address ?? null, isBankAccount: data.is_bank_account === true };
     const saved = record(await this.post('/showrooms', payload));
-    return { id: text(saved.id), name: payload.name, contact_name: payload.contactName === null ? null : text(payload.contactName), phone: payload.phone === null ? null : text(payload.phone), washes_count: 0 };
+    return { id: text(saved.id), name: payload.name, contact_name: payload.contactName === null ? null : text(payload.contactName), phone: payload.phone === null ? null : text(payload.phone), is_bank_account: payload.isBankAccount, washes_count: 0 };
   }
   async updateShowroom(id: string, data: Record<string, unknown>): Promise<Showroom> {
-    const payload = { name: text(data.name), contactName: data.contact_name ?? null, phone: data.phone ?? null, notes: data.address ?? null };
+    const payload = { name: text(data.name), contactName: data.contact_name ?? null, phone: data.phone ?? null, notes: data.address ?? null, isBankAccount: data.is_bank_account === true };
     await this.patch(`/showrooms/${encodeURIComponent(id)}`, payload);
-    return { id, name: payload.name, contact_name: payload.contactName === null ? null : text(payload.contactName), phone: payload.phone === null ? null : text(payload.phone), address: payload.notes === null ? null : text(payload.notes) };
+    return { id, name: payload.name, contact_name: payload.contactName === null ? null : text(payload.contactName), phone: payload.phone === null ? null : text(payload.phone), address: payload.notes === null ? null : text(payload.notes), is_bank_account: payload.isBankAccount };
   }
   async deleteShowroom(id: string): Promise<void> { await this.delete(`/showrooms/${encodeURIComponent(id)}`); }
   async showroom(id: string, includeFinancials: boolean, selectedDate?: string): Promise<Showroom & { washes?: Wash[]; washes_has_more: boolean; washes_next_cursor: string | null; payments_has_more?: boolean; payments_next_cursor?: string | null }> {

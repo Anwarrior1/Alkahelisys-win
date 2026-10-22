@@ -12,7 +12,7 @@
     "build": "tauri build --bundles nsis,msi",
     "dist:win": "tauri build --ci --bundles nsis --target x86_64-pc-windows-msvc && node scripts/stage-windows-installer.mjs",
     "test:api": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "test:frontend": "node --test scripts/frontend-performance.test.mjs",
+    "test:frontend": "node --test scripts/*.test.mjs",
     "benchmark:frontend": "node scripts/frontend-performance-benchmark.mjs optimized",
     "benchmark:performance": "node scripts/performance-benchmark.mjs src-tauri/target/release/carwash-api",
     "verify:fonts": "node scripts/verify-arabic-font-assets.mjs",
